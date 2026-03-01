@@ -1,0 +1,12 @@
+build/
+deploy/
+xquic/third_party/boringssl/
+signaling-server/signaling-server
+.vscode/
+.idea/
+.claude/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
