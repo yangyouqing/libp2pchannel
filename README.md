@@ -123,9 +123,10 @@ SIGNALING_ADDR=192.168.1.100:8080 ./scripts/deploy_peer.sh --start
 ## Performance Targets
 
 - First frame load: < 1 second
-- End-to-end latency: < 500ms
+- End-to-end latency: < 200ms
 - Video codec: H.264 (zerolatency tuning)
 - Audio codec: Opus
+- p2p directly connect rate: > 95%
 
 ## License
 
