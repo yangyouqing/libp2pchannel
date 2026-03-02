@@ -15,10 +15,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "p2p_platform.h"
+#ifndef _WIN32
 #include <signal.h>
-#include <unistd.h>
-#include <getopt.h>
-#include <pthread.h>
+#endif
 #include <libavutil/log.h>
 
 /* Reassembly buffer for fragmented frames */
@@ -61,7 +61,7 @@ typedef struct {
     /* Reassembly */
     reasm_buf_t          video_reasm;
     reasm_buf_t          audio_reasm;
-    pthread_mutex_t      reasm_mutex;
+    p2p_mutex_t          reasm_mutex;
 
     /* Frame queue for main-thread rendering */
     struct {
@@ -75,7 +75,7 @@ typedef struct {
         int count;
         int ready;
     } aframe;
-    pthread_mutex_t      frame_mutex;
+    p2p_mutex_t          frame_mutex;
 
     /* Frame loss tracking */
     uint32_t             last_video_seq;
@@ -122,7 +122,7 @@ static void process_complete_frame(peer_ctx_t *ctx, reasm_buf_t *rb)
                 fprintf(stderr, "[peer] first video frame decoded: %dx%d\n", w, h);
             }
 
-            pthread_mutex_lock(&ctx->frame_mutex);
+            p2p_mutex_lock(&ctx->frame_mutex);
             int y_size = lsy * h;
             int uv_h = h / 2;
             int u_size = lsu * uv_h;
@@ -140,7 +140,7 @@ static void process_complete_frame(peer_ctx_t *ctx, reasm_buf_t *rb)
             ctx->vframe.w = w;
             ctx->vframe.h = h;
             ctx->vframe.ready = 1;
-            pthread_mutex_unlock(&ctx->frame_mutex);
+            p2p_mutex_unlock(&ctx->frame_mutex);
         }
     } else if (rb->type == P2P_FRAME_TYPE_AUDIO) {
         if (!ctx->adec_open) {
@@ -155,14 +155,14 @@ static void process_complete_frame(peer_ctx_t *ctx, reasm_buf_t *rb)
             &samples, &num_samples);
 
         if (ret > 0 && samples && num_samples > 0) {
-            pthread_mutex_lock(&ctx->frame_mutex);
+            p2p_mutex_lock(&ctx->frame_mutex);
             ctx->aframe.samples = realloc(ctx->aframe.samples,
                                           num_samples * sizeof(int16_t));
             if (ctx->aframe.samples)
                 memcpy(ctx->aframe.samples, samples, num_samples * sizeof(int16_t));
             ctx->aframe.count = num_samples;
             ctx->aframe.ready = 1;
-            pthread_mutex_unlock(&ctx->frame_mutex);
+            p2p_mutex_unlock(&ctx->frame_mutex);
         }
     }
 }
@@ -202,7 +202,7 @@ static void on_data_recv(p2p_peer_ctx_t *peer, const p2p_frame_header_t *hdr,
                     ? &ctx->video_reasm
                     : &ctx->audio_reasm;
 
-    pthread_mutex_lock(&ctx->reasm_mutex);
+    p2p_mutex_lock(&ctx->reasm_mutex);
 
     if (hdr->type == P2P_FRAME_TYPE_VIDEO) {
         ctx->rx_frag_total++;
@@ -238,7 +238,7 @@ static void on_data_recv(p2p_peer_ctx_t *peer, const p2p_frame_header_t *hdr,
                 ctx->waiting_for_keyframe = 0;
                 fprintf(stderr, "[RX] got IDR seq=%u, resuming\n", hdr->seq);
             } else if (hdr->frag_offset == 0) {
-                pthread_mutex_unlock(&ctx->reasm_mutex);
+                p2p_mutex_unlock(&ctx->reasm_mutex);
                 return;
             }
         }
@@ -251,7 +251,7 @@ static void on_data_recv(p2p_peer_ctx_t *peer, const p2p_frame_header_t *hdr,
         /* Stale fragment from an older frame -> discard */
         if (rb->active && hdr->type == rb->type && hdr->seq < rb->seq) {
             ctx->rx_frag_dup++;
-            pthread_mutex_unlock(&ctx->reasm_mutex);
+            p2p_mutex_unlock(&ctx->reasm_mutex);
             return;
         }
         rb->type = hdr->type;
@@ -265,7 +265,7 @@ static void on_data_recv(p2p_peer_ctx_t *peer, const p2p_frame_header_t *hdr,
             fprintf(stderr, "[RX] frame seq=%u too large %u > %d\n",
                     hdr->seq, rb->total_len, REASM_MAX_SIZE);
             rb->active = 0;
-            pthread_mutex_unlock(&ctx->reasm_mutex);
+            p2p_mutex_unlock(&ctx->reasm_mutex);
             return;
         }
     }
@@ -276,7 +276,7 @@ static void on_data_recv(p2p_peer_ctx_t *peer, const p2p_frame_header_t *hdr,
         frag_end > rb->total_len) {
         fprintf(stderr, "[RX] OOB seq=%u off=%u len=%u total=%u\n",
                 hdr->seq, hdr->frag_offset, hdr->frag_len, rb->total_len);
-        pthread_mutex_unlock(&ctx->reasm_mutex);
+        p2p_mutex_unlock(&ctx->reasm_mutex);
         return;
     }
 
@@ -298,7 +298,7 @@ static void on_data_recv(p2p_peer_ctx_t *peer, const p2p_frame_header_t *hdr,
         rb->received = 0;
     }
 
-    pthread_mutex_unlock(&ctx->reasm_mutex);
+    p2p_mutex_unlock(&ctx->reasm_mutex);
 }
 
 /* ---- Adapter callbacks ---- */
@@ -426,7 +426,7 @@ int main(int argc, char *argv[])
     strcpy(ctx->stun_host, "127.0.0.1");
     ctx->stun_port = 3478;
 
-    static struct option long_opts[] = {
+    static struct p2p_option long_opts[] = {
         {"signaling", required_argument, NULL, 's'},
         {"room",      required_argument, NULL, 'r'},
         {"peer-id",   required_argument, NULL, 'p'},
@@ -436,14 +436,14 @@ int main(int argc, char *argv[])
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "s:r:p:t:h", long_opts, NULL)) != -1) {
+    while ((opt = p2p_getopt_long(argc, argv, "s:r:p:t:h", long_opts, NULL)) != -1) {
         switch (opt) {
-        case 's': snprintf(ctx->signaling_addr, sizeof(ctx->signaling_addr), "%s", optarg); break;
-        case 'r': snprintf(ctx->room_id, sizeof(ctx->room_id), "%s", optarg); break;
-        case 'p': snprintf(ctx->peer_id, sizeof(ctx->peer_id), "%s", optarg); break;
+        case 's': snprintf(ctx->signaling_addr, sizeof(ctx->signaling_addr), "%s", p2p_optarg); break;
+        case 'r': snprintf(ctx->room_id, sizeof(ctx->room_id), "%s", p2p_optarg); break;
+        case 'p': snprintf(ctx->peer_id, sizeof(ctx->peer_id), "%s", p2p_optarg); break;
         case 't': {
             char tmp[256];
-            snprintf(tmp, sizeof(tmp), "%s", optarg);
+            snprintf(tmp, sizeof(tmp), "%s", p2p_optarg);
             char *colon = strrchr(tmp, ':');
             if (colon) {
                 *colon = '\0';
@@ -459,10 +459,15 @@ int main(int argc, char *argv[])
         }
     }
 
+#ifdef _WIN32
+    p2p_net_init();
+    p2p_set_ctrl_handler(&ctx->running);
+#else
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
-    pthread_mutex_init(&ctx->reasm_mutex, NULL);
-    pthread_mutex_init(&ctx->frame_mutex, NULL);
+#endif
+    p2p_mutex_init(&ctx->reasm_mutex);
+    p2p_mutex_init(&ctx->frame_mutex);
 
     fprintf(stderr, "[peer] P2P AV Subscriber starting\n");
     fprintf(stderr, "[peer] signaling=%s room=%s peer=%s stun=%s:%d\n",
@@ -543,7 +548,7 @@ int main(int argc, char *argv[])
         }
 
         /* Render decoded video frame if available */
-        pthread_mutex_lock(&ctx->frame_mutex);
+        p2p_mutex_lock(&ctx->frame_mutex);
         if (ctx->vframe.ready) {
             p2p_sdl_video_display(&ctx->sdl_video,
                 ctx->vframe.y, ctx->vframe.u, ctx->vframe.v,
@@ -556,9 +561,9 @@ int main(int argc, char *argv[])
                 ctx->aframe.samples, ctx->aframe.count);
             ctx->aframe.ready = 0;
         }
-        pthread_mutex_unlock(&ctx->frame_mutex);
+        p2p_mutex_unlock(&ctx->frame_mutex);
 
-        usleep(5000); /* ~5ms poll to keep CPU low while maintaining responsiveness */
+        p2p_sleep_ms(5);
     }
 
     fprintf(stderr, "[peer] shutting down...\n");
@@ -577,15 +582,19 @@ int main(int argc, char *argv[])
         p2p_sdl_quit();
     }
 
-    pthread_mutex_lock(&ctx->frame_mutex);
+    p2p_mutex_lock(&ctx->frame_mutex);
     free(ctx->vframe.y);
     free(ctx->vframe.u);
     free(ctx->vframe.v);
     free(ctx->aframe.samples);
-    pthread_mutex_unlock(&ctx->frame_mutex);
+    p2p_mutex_unlock(&ctx->frame_mutex);
 
-    pthread_mutex_destroy(&ctx->reasm_mutex);
-    pthread_mutex_destroy(&ctx->frame_mutex);
+    p2p_mutex_destroy(&ctx->reasm_mutex);
+    p2p_mutex_destroy(&ctx->frame_mutex);
+
+#ifdef _WIN32
+    p2p_net_cleanup();
+#endif
 
     fprintf(stderr, "[peer] done\n");
     return 0;

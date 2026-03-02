@@ -36,12 +36,11 @@ static void pub_on_quic_connected(p2p_peer_ctx_t *peer, void *user_data)
     fprintf(stderr, "[pub] QUIC connected with subscriber %s\n", peer->peer_id);
 
     /* Send cached IDR frame for fast first-frame delivery */
-    pthread_mutex_lock(&pub->idr_mutex);
+    p2p_mutex_lock(&pub->idr_mutex);
     if (pub->idr_cache && pub->idr_cache_size > 0) {
-        /* The cached IDR is sent directly via the ICE channel for immediate display */
         juice_send(peer->ice_agent, (const char *)pub->idr_cache, pub->idr_cache_size);
     }
-    pthread_mutex_unlock(&pub->idr_mutex);
+    p2p_mutex_unlock(&pub->idr_mutex);
 }
 
 static void pub_on_quic_closed(p2p_peer_ctx_t *peer, void *user_data)
@@ -140,7 +139,7 @@ int p2p_publisher_init(p2p_publisher_t *pub, const p2p_publisher_config_t *confi
     pub->idr_cache = malloc(P2P_PUB_MAX_IDR_CACHE_SIZE);
     if (!pub->idr_cache) return -1;
     pub->idr_cache_size = 0;
-    pthread_mutex_init(&pub->idr_mutex, NULL);
+    p2p_mutex_init(&pub->idr_mutex);
 
     /* Initialize P2P engine as publisher (QUIC server) */
     p2p_engine_config_t ecfg;
@@ -209,7 +208,7 @@ void p2p_publisher_destroy(p2p_publisher_t *pub)
     p2p_engine_destroy(&pub->engine);
     free(pub->idr_cache);
     pub->idr_cache = NULL;
-    pthread_mutex_destroy(&pub->idr_mutex);
+    p2p_mutex_destroy(&pub->idr_mutex);
 }
 
 int p2p_publisher_send_video(p2p_publisher_t *pub, const uint8_t *data,
@@ -219,11 +218,11 @@ int p2p_publisher_send_video(p2p_publisher_t *pub, const uint8_t *data,
 
     /* Cache IDR frame for fast first-frame delivery to new subscribers */
     if (is_keyframe && size <= P2P_PUB_MAX_IDR_CACHE_SIZE) {
-        pthread_mutex_lock(&pub->idr_mutex);
+        p2p_mutex_lock(&pub->idr_mutex);
         memcpy(pub->idr_cache, data, size);
         pub->idr_cache_size = size;
         pub->idr_timestamp_us = timestamp_us;
-        pthread_mutex_unlock(&pub->idr_mutex);
+        p2p_mutex_unlock(&pub->idr_mutex);
     }
 
     /* Send to all connected subscribers */

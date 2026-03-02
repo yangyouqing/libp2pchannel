@@ -15,10 +15,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "p2p_platform.h"
+#ifndef _WIN32
 #include <signal.h>
-#include <unistd.h>
-#include <getopt.h>
-#include <pthread.h>
+#endif
 #include <libavutil/log.h>
 
 typedef struct {

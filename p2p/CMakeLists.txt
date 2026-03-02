@@ -80,7 +80,7 @@ if(TARGET xquic-static)
 else()
     find_library(XQUIC_LIB NAMES xquic-static xquic
         HINTS ${XQUIC_LIB_PATH} ${_XQUIC_BUILD_DIR}
-        NO_DEFAULT_PATH)
+        NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH)
     if(XQUIC_LIB)
         target_link_libraries(p2p_av PUBLIC ${XQUIC_LIB})
     else()
@@ -98,31 +98,24 @@ if(NOT _BORINGSSL_SRC_DIR)
     set(_BORINGSSL_SRC_DIR "${CMAKE_SOURCE_DIR}/xquic/third_party/boringssl")
 endif()
 
-if(WIN32)
-    if(EXISTS "${_BORINGSSL_BUILD_DIR}/ssl.lib")
-        target_link_libraries(p2p_av PUBLIC
-            "${_BORINGSSL_BUILD_DIR}/ssl.lib"
-            "${_BORINGSSL_BUILD_DIR}/crypto.lib")
-        target_include_directories(p2p_av PUBLIC "${_BORINGSSL_SRC_DIR}/include")
-    else()
-        find_package(OpenSSL REQUIRED)
-        target_link_libraries(p2p_av PUBLIC OpenSSL::SSL OpenSSL::Crypto)
-    endif()
+if(EXISTS "${_BORINGSSL_BUILD_DIR}/libssl.a")
+    target_link_libraries(p2p_av PUBLIC
+        "${_BORINGSSL_BUILD_DIR}/libssl.a"
+        "${_BORINGSSL_BUILD_DIR}/libcrypto.a")
+    target_include_directories(p2p_av PUBLIC "${_BORINGSSL_SRC_DIR}/include")
+elseif(WIN32 AND EXISTS "${_BORINGSSL_BUILD_DIR}/ssl.lib")
+    target_link_libraries(p2p_av PUBLIC
+        "${_BORINGSSL_BUILD_DIR}/ssl.lib"
+        "${_BORINGSSL_BUILD_DIR}/crypto.lib")
+    target_include_directories(p2p_av PUBLIC "${_BORINGSSL_SRC_DIR}/include")
 else()
-    if(EXISTS "${_BORINGSSL_BUILD_DIR}/libssl.a")
-        target_link_libraries(p2p_av PUBLIC
-            "${_BORINGSSL_BUILD_DIR}/libssl.a"
-            "${_BORINGSSL_BUILD_DIR}/libcrypto.a")
-        target_include_directories(p2p_av PUBLIC "${_BORINGSSL_SRC_DIR}/include")
-    else()
-        find_package(OpenSSL REQUIRED)
-        target_link_libraries(p2p_av PUBLIC OpenSSL::SSL OpenSSL::Crypto)
-    endif()
+    find_package(OpenSSL REQUIRED)
+    target_link_libraries(p2p_av PUBLIC OpenSSL::SSL OpenSSL::Crypto)
 endif()
 
 # BoringSSL is C++, xquic uses math functions
 if(WIN32)
-    target_link_libraries(p2p_av PUBLIC ws2_32)
+    target_link_libraries(p2p_av PUBLIC stdc++ ws2_32)
 else()
     target_link_libraries(p2p_av PUBLIC stdc++ m)
 endif()
@@ -189,8 +182,5 @@ endif()
 add_executable(p2p_client src/p2p_client.c)
 target_link_libraries(p2p_client PRIVATE p2p_av)
 
-# p2p_peer is Linux-only (subscriber with SDL2 display)
-if(NOT WIN32)
-    add_executable(p2p_peer src/p2p_peer.c)
-    target_link_libraries(p2p_peer PRIVATE p2p_av)
-endif()
+add_executable(p2p_peer src/p2p_peer.c)
+target_link_libraries(p2p_peer PRIVATE p2p_av)

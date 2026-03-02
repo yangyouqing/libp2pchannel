@@ -174,9 +174,19 @@ static inline void p2p_set_ctrl_handler(volatile int *running_flag)
  * space-separated arguments and short options.
  */
 
+#ifndef no_argument
+#define no_argument        0
+#endif
+#ifndef required_argument
+#define required_argument  1
+#endif
+#ifndef optional_argument
+#define optional_argument  2
+#endif
+
 struct p2p_option {
     const char *name;
-    int         has_arg;   /* 0 = no_argument, 1 = required_argument */
+    int         has_arg;
     int        *flag;
     int         val;
 };

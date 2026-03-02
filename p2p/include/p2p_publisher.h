@@ -33,7 +33,7 @@ typedef struct {
     uint8_t                *idr_cache;
     size_t                  idr_cache_size;
     uint64_t                idr_timestamp_us;
-    pthread_mutex_t         idr_mutex;
+    p2p_mutex_t             idr_mutex;
 
     int                     running;
 } p2p_publisher_t;

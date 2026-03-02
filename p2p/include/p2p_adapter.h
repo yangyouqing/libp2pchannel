@@ -9,9 +9,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
-#include <pthread.h>
-#include <sys/time.h>
-#include <netinet/in.h>
+#include "p2p_platform.h"
 
 #ifdef __cplusplus
 extern "C" {

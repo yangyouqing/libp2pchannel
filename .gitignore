@@ -1,4 +1,5 @@
 build/
+build_win/
 deploy/
 xquic/third_party/boringssl/
 signaling-server/signaling-server
