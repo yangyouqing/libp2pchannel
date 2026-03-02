@@ -2,6 +2,10 @@
 
 QUIC over P2P, embedded media transport solution.
 
+## KEYWORDS
+
+：QUIC、P2P、NAT穿透、文件传输、XQUIC、libjuice、C/C++、跨平台、目标直连率>95%, MPQUIC, 连接迁移, 首帧秒加载, 先通后优
+
 ## Overview
 
 A peer-to-peer audio/video transmission system that combines ICE-based NAT traversal with QUIC transport for low-latency, reliable media streaming.
