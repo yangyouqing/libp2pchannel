@@ -3,7 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include <pthread.h>
+#include "p2p_platform.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -85,9 +85,9 @@ struct p2p_signaling_client_s {
     p2p_signaling_callbacks_t   callbacks;
     void                       *user_data;
     int                         connected;
-    int                         ws_fd;
-    pthread_t                   recv_thread;
-    pthread_t                   heartbeat_thread;
+    p2p_socket_t                ws_fd;
+    p2p_thread_t                recv_thread;
+    p2p_thread_t                heartbeat_thread;
     int                         running;
 };
 

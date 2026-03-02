@@ -19,6 +19,7 @@ set(P2P_SOURCES
 )
 
 set(P2P_HEADERS
+    include/p2p_platform.h
     include/p2p_packet_queue.h
     include/p2p_adapter.h
     include/p2p_signaling.h
@@ -97,38 +98,78 @@ if(NOT _BORINGSSL_SRC_DIR)
     set(_BORINGSSL_SRC_DIR "${CMAKE_SOURCE_DIR}/xquic/third_party/boringssl")
 endif()
 
-if(EXISTS "${_BORINGSSL_BUILD_DIR}/libssl.a")
-    target_link_libraries(p2p_av PUBLIC
-        "${_BORINGSSL_BUILD_DIR}/libssl.a"
-        "${_BORINGSSL_BUILD_DIR}/libcrypto.a")
-    target_include_directories(p2p_av PUBLIC "${_BORINGSSL_SRC_DIR}/include")
+if(WIN32)
+    if(EXISTS "${_BORINGSSL_BUILD_DIR}/ssl.lib")
+        target_link_libraries(p2p_av PUBLIC
+            "${_BORINGSSL_BUILD_DIR}/ssl.lib"
+            "${_BORINGSSL_BUILD_DIR}/crypto.lib")
+        target_include_directories(p2p_av PUBLIC "${_BORINGSSL_SRC_DIR}/include")
+    else()
+        find_package(OpenSSL REQUIRED)
+        target_link_libraries(p2p_av PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+    endif()
 else()
-    find_package(OpenSSL REQUIRED)
-    target_link_libraries(p2p_av PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+    if(EXISTS "${_BORINGSSL_BUILD_DIR}/libssl.a")
+        target_link_libraries(p2p_av PUBLIC
+            "${_BORINGSSL_BUILD_DIR}/libssl.a"
+            "${_BORINGSSL_BUILD_DIR}/libcrypto.a")
+        target_include_directories(p2p_av PUBLIC "${_BORINGSSL_SRC_DIR}/include")
+    else()
+        find_package(OpenSSL REQUIRED)
+        target_link_libraries(p2p_av PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+    endif()
 endif()
 
 # BoringSSL is C++, xquic uses math functions
-target_link_libraries(p2p_av PUBLIC stdc++ m)
+if(WIN32)
+    target_link_libraries(p2p_av PUBLIC ws2_32)
+else()
+    target_link_libraries(p2p_av PUBLIC stdc++ m)
+endif()
 
-# pthreads
-find_package(Threads REQUIRED)
-target_link_libraries(p2p_av PUBLIC Threads::Threads)
+# pthreads (not needed on Windows, threading via Win32 API)
+if(NOT WIN32)
+    find_package(Threads REQUIRED)
+    target_link_libraries(p2p_av PUBLIC Threads::Threads)
+endif()
 
 # --- FFmpeg ---
-pkg_check_modules(AVCODEC    REQUIRED libavcodec)
-pkg_check_modules(AVUTIL     REQUIRED libavutil)
-pkg_check_modules(SWSCALE    REQUIRED libswscale)
-pkg_check_modules(SWRESAMPLE REQUIRED libswresample)
+if(WIN32)
+    pkg_check_modules(AVCODEC    REQUIRED libavcodec)
+    pkg_check_modules(AVUTIL     REQUIRED libavutil)
+    pkg_check_modules(SWSCALE    REQUIRED libswscale)
+    pkg_check_modules(SWRESAMPLE REQUIRED libswresample)
+    pkg_check_modules(AVFORMAT   REQUIRED libavformat)
+    pkg_check_modules(AVDEVICE   REQUIRED libavdevice)
 
-target_include_directories(p2p_av PUBLIC
-    ${AVCODEC_INCLUDE_DIRS} ${AVUTIL_INCLUDE_DIRS}
-    ${SWSCALE_INCLUDE_DIRS} ${SWRESAMPLE_INCLUDE_DIRS})
-target_link_libraries(p2p_av PUBLIC
-    ${AVCODEC_LIBRARIES} ${AVUTIL_LIBRARIES}
-    ${SWSCALE_LIBRARIES} ${SWRESAMPLE_LIBRARIES})
-target_link_directories(p2p_av PUBLIC
-    ${AVCODEC_LIBRARY_DIRS} ${AVUTIL_LIBRARY_DIRS}
-    ${SWSCALE_LIBRARY_DIRS} ${SWRESAMPLE_LIBRARY_DIRS})
+    target_include_directories(p2p_av PUBLIC
+        ${AVCODEC_INCLUDE_DIRS} ${AVUTIL_INCLUDE_DIRS}
+        ${SWSCALE_INCLUDE_DIRS} ${SWRESAMPLE_INCLUDE_DIRS}
+        ${AVFORMAT_INCLUDE_DIRS} ${AVDEVICE_INCLUDE_DIRS})
+    target_link_libraries(p2p_av PUBLIC
+        ${AVCODEC_LIBRARIES} ${AVUTIL_LIBRARIES}
+        ${SWSCALE_LIBRARIES} ${SWRESAMPLE_LIBRARIES}
+        ${AVFORMAT_LIBRARIES} ${AVDEVICE_LIBRARIES})
+    target_link_directories(p2p_av PUBLIC
+        ${AVCODEC_LIBRARY_DIRS} ${AVUTIL_LIBRARY_DIRS}
+        ${SWSCALE_LIBRARY_DIRS} ${SWRESAMPLE_LIBRARY_DIRS}
+        ${AVFORMAT_LIBRARY_DIRS} ${AVDEVICE_LIBRARY_DIRS})
+else()
+    pkg_check_modules(AVCODEC    REQUIRED libavcodec)
+    pkg_check_modules(AVUTIL     REQUIRED libavutil)
+    pkg_check_modules(SWSCALE    REQUIRED libswscale)
+    pkg_check_modules(SWRESAMPLE REQUIRED libswresample)
+
+    target_include_directories(p2p_av PUBLIC
+        ${AVCODEC_INCLUDE_DIRS} ${AVUTIL_INCLUDE_DIRS}
+        ${SWSCALE_INCLUDE_DIRS} ${SWRESAMPLE_INCLUDE_DIRS})
+    target_link_libraries(p2p_av PUBLIC
+        ${AVCODEC_LIBRARIES} ${AVUTIL_LIBRARIES}
+        ${SWSCALE_LIBRARIES} ${SWRESAMPLE_LIBRARIES})
+    target_link_directories(p2p_av PUBLIC
+        ${AVCODEC_LIBRARY_DIRS} ${AVUTIL_LIBRARY_DIRS}
+        ${SWSCALE_LIBRARY_DIRS} ${SWRESAMPLE_LIBRARY_DIRS})
+endif()
 
 # --- SDL2 ---
 pkg_check_modules(SDL2 REQUIRED sdl2)
@@ -136,15 +177,20 @@ target_include_directories(p2p_av PUBLIC ${SDL2_INCLUDE_DIRS})
 target_link_libraries(p2p_av PUBLIC ${SDL2_LIBRARIES})
 target_link_directories(p2p_av PUBLIC ${SDL2_LIBRARY_DIRS})
 
-# --- ALSA ---
-pkg_check_modules(ALSA REQUIRED alsa)
-target_include_directories(p2p_av PUBLIC ${ALSA_INCLUDE_DIRS})
-target_link_libraries(p2p_av PUBLIC ${ALSA_LIBRARIES})
-target_link_directories(p2p_av PUBLIC ${ALSA_LIBRARY_DIRS})
+# --- ALSA (Linux only) ---
+if(NOT WIN32)
+    pkg_check_modules(ALSA REQUIRED alsa)
+    target_include_directories(p2p_av PUBLIC ${ALSA_INCLUDE_DIRS})
+    target_link_libraries(p2p_av PUBLIC ${ALSA_LIBRARIES})
+    target_link_directories(p2p_av PUBLIC ${ALSA_LIBRARY_DIRS})
+endif()
 
 # --- Executables ---
 add_executable(p2p_client src/p2p_client.c)
 target_link_libraries(p2p_client PRIVATE p2p_av)
 
-add_executable(p2p_peer src/p2p_peer.c)
-target_link_libraries(p2p_peer PRIVATE p2p_av)
+# p2p_peer is Linux-only (subscriber with SDL2 display)
+if(NOT WIN32)
+    add_executable(p2p_peer src/p2p_peer.c)
+    target_link_libraries(p2p_peer PRIVATE p2p_av)
+endif()

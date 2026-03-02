@@ -3,18 +3,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <errno.h>
-#include <arpa/inet.h>
-#include <time.h>
 
 /* ---------- helpers ---------- */
 
 uint64_t p2p_now_us(void)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+    return p2p_monotonic_us();
 }
 
 static void make_virtual_addr(struct sockaddr_in *addr, uint16_t port)
@@ -74,10 +69,10 @@ static void xqc_set_event_timer_cb(xqc_usec_t wake_after, void *engine_user_data
     p2p_engine_t *eng = (p2p_engine_t *)engine_user_data;
     uint64_t now = p2p_now_us();
 
-    pthread_mutex_lock(&eng->timer_mutex);
+    p2p_mutex_lock(&eng->timer_mutex);
     eng->next_wakeup_us = now + wake_after;
-    pthread_cond_signal(&eng->timer_cond);
-    pthread_mutex_unlock(&eng->timer_mutex);
+    p2p_cond_signal(&eng->timer_cond);
+    p2p_mutex_unlock(&eng->timer_mutex);
 }
 
 static void xqc_log_write_cb(xqc_log_level_t lvl, const void *buf,
@@ -163,8 +158,11 @@ static void ice_on_gathering_done(juice_agent_t *agent, void *user_ptr)
 
 static int is_p2p_frame(const char *data, size_t size)
 {
-    if (size < P2P_FRAME_HDR_SIZE) return 0;
+    if (size < 1) return 0;
     uint8_t type = (uint8_t)data[0];
+    if (type == P2P_FRAME_TYPE_IDR_REQ)
+        return (size >= 1);
+    if (size < P2P_FRAME_HDR_SIZE) return 0;
     return (type == P2P_FRAME_TYPE_VIDEO || type == P2P_FRAME_TYPE_AUDIO);
 }
 
@@ -176,6 +174,15 @@ static void ice_on_recv(juice_agent_t *agent, const char *data, size_t size, voi
     /* Direct-framed AV packet -> dispatch via data_recv callback */
     if (is_p2p_frame(data, size) &&
         peer->engine->callbacks.on_peer_data_recv) {
+        uint8_t type = (uint8_t)data[0];
+        if (type == P2P_FRAME_TYPE_IDR_REQ) {
+            p2p_frame_header_t idr_hdr;
+            memset(&idr_hdr, 0, sizeof(idr_hdr));
+            idr_hdr.type = P2P_FRAME_TYPE_IDR_REQ;
+            peer->engine->callbacks.on_peer_data_recv(peer, &idr_hdr, NULL,
+                                                       peer->engine->user_data);
+            return;
+        }
         const p2p_frame_header_t *hdr = (const p2p_frame_header_t *)data;
         const uint8_t *payload = (const uint8_t *)data + P2P_FRAME_HDR_SIZE;
         peer->engine->callbacks.on_peer_data_recv(peer, hdr, payload,
@@ -214,29 +221,22 @@ static void *engine_thread_func(void *arg)
     while (eng->engine_running) {
         process_recv_queue(eng);
 
-        pthread_mutex_lock(&eng->timer_mutex);
+        p2p_mutex_lock(&eng->timer_mutex);
         uint64_t now = p2p_now_us();
         if (eng->next_wakeup_us > 0 && now >= eng->next_wakeup_us) {
             eng->next_wakeup_us = 0;
-            pthread_mutex_unlock(&eng->timer_mutex);
+            p2p_mutex_unlock(&eng->timer_mutex);
             xqc_engine_main_logic(eng->xqc_engine);
             continue;
         }
 
-        struct timespec ts;
         uint64_t sleep_us = 5000;
         if (eng->next_wakeup_us > 0 && eng->next_wakeup_us > now) {
             uint64_t delta = eng->next_wakeup_us - now;
             if (delta < sleep_us) sleep_us = delta;
         }
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_nsec += (long)(sleep_us * 1000);
-        if (ts.tv_nsec >= 1000000000L) {
-            ts.tv_sec += ts.tv_nsec / 1000000000L;
-            ts.tv_nsec %= 1000000000L;
-        }
-        pthread_cond_timedwait(&eng->timer_cond, &eng->timer_mutex, &ts);
-        pthread_mutex_unlock(&eng->timer_mutex);
+        p2p_cond_timedwait_us(&eng->timer_cond, &eng->timer_mutex, sleep_us);
+        p2p_mutex_unlock(&eng->timer_mutex);
     }
     return NULL;
 }
@@ -273,8 +273,8 @@ int p2p_engine_init(p2p_engine_t *eng, const p2p_engine_config_t *config)
     if (p2p_packet_queue_init(&eng->recv_queue, P2P_PKT_QUEUE_CAP) != 0)
         return -1;
 
-    pthread_mutex_init(&eng->timer_mutex, NULL);
-    pthread_cond_init(&eng->timer_cond, NULL);
+    p2p_mutex_init(&eng->timer_mutex);
+    p2p_cond_init(&eng->timer_cond);
 
     /* Init peer slots */
     for (int i = 0; i < P2P_MAX_SUBSCRIBERS; i++) {
@@ -345,7 +345,7 @@ int p2p_engine_start(p2p_engine_t *eng)
 {
     if (!eng) return -1;
     eng->engine_running = 1;
-    if (pthread_create(&eng->engine_thread, NULL, engine_thread_func, eng) != 0) {
+    if (p2p_thread_create(&eng->engine_thread, engine_thread_func, eng) != 0) {
         eng->engine_running = 0;
         return -1;
     }
@@ -356,10 +356,10 @@ void p2p_engine_stop(p2p_engine_t *eng)
 {
     if (!eng) return;
     eng->engine_running = 0;
-    pthread_mutex_lock(&eng->timer_mutex);
-    pthread_cond_signal(&eng->timer_cond);
-    pthread_mutex_unlock(&eng->timer_mutex);
-    pthread_join(eng->engine_thread, NULL);
+    p2p_mutex_lock(&eng->timer_mutex);
+    p2p_cond_signal(&eng->timer_cond);
+    p2p_mutex_unlock(&eng->timer_mutex);
+    p2p_thread_join(eng->engine_thread);
 }
 
 void p2p_engine_destroy(p2p_engine_t *eng)
@@ -379,8 +379,8 @@ void p2p_engine_destroy(p2p_engine_t *eng)
     }
 
     p2p_packet_queue_destroy(&eng->recv_queue);
-    pthread_mutex_destroy(&eng->timer_mutex);
-    pthread_cond_destroy(&eng->timer_cond);
+    p2p_mutex_destroy(&eng->timer_mutex);
+    p2p_cond_destroy(&eng->timer_cond);
 }
 
 p2p_peer_ctx_t *p2p_engine_add_peer(p2p_engine_t *eng, const char *peer_id)
@@ -511,9 +511,9 @@ int p2p_peer_send_data(p2p_peer_ctx_t *peer, uint8_t type, uint8_t flags,
     uint32_t offset = 0;
 
     while (offset < payload_len) {
-        uint16_t frag_len = payload_len - offset;
-        if (frag_len > P2P_FRAME_MAX_FRAG)
-            frag_len = P2P_FRAME_MAX_FRAG;
+        uint32_t remaining = payload_len - offset;
+        uint16_t frag_len = (remaining > P2P_FRAME_MAX_FRAG)
+                          ? P2P_FRAME_MAX_FRAG : (uint16_t)remaining;
 
         p2p_frame_header_t *hdr = (p2p_frame_header_t *)buf;
         hdr->type = type;
@@ -529,11 +529,24 @@ int p2p_peer_send_data(p2p_peer_ctx_t *peer, uint8_t type, uint8_t flags,
         int ret = juice_send(peer->ice_agent,
                              (const char *)buf,
                              P2P_FRAME_HDR_SIZE + frag_len);
-        if (ret != JUICE_ERR_SUCCESS) return -1;
+        if (ret != JUICE_ERR_SUCCESS) {
+            fprintf(stderr, "[TX-ERR] juice_send failed seq=%u frag_off=%u ret=%d\n",
+                    seq, offset, ret);
+            return -1;
+        }
 
         offset += frag_len;
     }
     return 0;
+}
+
+/* Send an IDR request to the remote peer (1-byte packet) */
+int p2p_peer_send_idr_request(p2p_peer_ctx_t *peer)
+{
+    if (!peer || !peer->ice_agent) return -1;
+    if (peer->state < P2P_PEER_STATE_ICE_CONNECTED) return -1;
+    uint8_t msg = P2P_FRAME_TYPE_IDR_REQ;
+    return juice_send(peer->ice_agent, (const char *)&msg, 1);
 }
 
 /* ---- QUIC connection ---- */

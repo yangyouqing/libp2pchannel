@@ -24,6 +24,7 @@ extern "C" {
 /* Direct framing header for sending AV data via ICE channel */
 #define P2P_FRAME_TYPE_VIDEO  0x01
 #define P2P_FRAME_TYPE_AUDIO  0x02
+#define P2P_FRAME_TYPE_IDR_REQ 0x03
 #define P2P_FRAME_FLAG_KEY    0x01
 
 typedef struct __attribute__((packed)) {
@@ -32,9 +33,9 @@ typedef struct __attribute__((packed)) {
     uint32_t seq;            /* sequence number */
     uint64_t timestamp_us;   /* capture timestamp */
     uint32_t total_len;      /* total payload size (may span multiple chunks) */
-    uint16_t frag_offset;    /* fragment offset within total payload */
+    uint32_t frag_offset;    /* fragment offset within total payload */
     uint16_t frag_len;       /* this fragment's payload size */
-} p2p_frame_header_t;       /* 20 bytes, followed by frag_len bytes of payload */
+} p2p_frame_header_t;       /* 22 bytes, followed by frag_len bytes of payload */
 
 #define P2P_FRAME_HDR_SIZE sizeof(p2p_frame_header_t)
 #define P2P_FRAME_MAX_FRAG (P2P_ICE_MTU - P2P_FRAME_HDR_SIZE)
@@ -127,14 +128,14 @@ typedef struct p2p_engine_s {
     void                   *user_data;
 
     /* Timer management */
-    pthread_t               timer_thread;
+    p2p_thread_t            timer_thread;
     int                     timer_running;
     uint64_t                next_wakeup_us;
-    pthread_mutex_t         timer_mutex;
-    pthread_cond_t          timer_cond;
+    p2p_mutex_t             timer_mutex;
+    p2p_cond_t              timer_cond;
 
     /* Engine thread processing */
-    pthread_t               engine_thread;
+    p2p_thread_t            engine_thread;
     int                     engine_running;
 
     /* STUN/TURN config passed to each new ICE agent */
@@ -177,6 +178,9 @@ int  p2p_peer_start_quic(p2p_peer_ctx_t *peer);
 int  p2p_peer_send_data(p2p_peer_ctx_t *peer, uint8_t type, uint8_t flags,
                         uint32_t seq, uint64_t timestamp_us,
                         const uint8_t *payload, uint32_t payload_len);
+
+/* Send an IDR (keyframe) request to remote peer. */
+int  p2p_peer_send_idr_request(p2p_peer_ctx_t *peer);
 
 /* ---- Utility ---- */
 uint64_t p2p_now_us(void);

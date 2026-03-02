@@ -3,12 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <errno.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <netdb.h>
 
 /*
  * Minimal JSON serialization / deserialization for signaling messages.
@@ -131,7 +126,7 @@ int p2p_sig_message_from_json(const char *json, size_t len, p2p_sig_message_t *m
  * A production version would use a real WebSocket library.
  */
 
-static int tcp_connect(const char *host, uint16_t port)
+static p2p_socket_t tcp_connect(const char *host, uint16_t port)
 {
     struct addrinfo hints, *res, *rp;
     memset(&hints, 0, sizeof(hints));
@@ -142,43 +137,43 @@ static int tcp_connect(const char *host, uint16_t port)
     snprintf(port_str, sizeof(port_str), "%u", port);
 
     if (getaddrinfo(host, port_str, &hints, &res) != 0)
-        return -1;
+        return P2P_INVALID_SOCKET;
 
-    int fd = -1;
+    p2p_socket_t fd = P2P_INVALID_SOCKET;
     for (rp = res; rp; rp = rp->ai_next) {
         fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-        if (fd < 0) continue;
-        if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) break;
-        close(fd);
-        fd = -1;
+        if (fd == P2P_INVALID_SOCKET) continue;
+        if (connect(fd, rp->ai_addr, (int)rp->ai_addrlen) == 0) break;
+        p2p_socket_close(fd);
+        fd = P2P_INVALID_SOCKET;
     }
     freeaddrinfo(res);
     return fd;
 }
 
-static int send_frame(int fd, const char *data, size_t len)
+static int send_frame(p2p_socket_t fd, const char *data, size_t len)
 {
     uint32_t nlen = htonl((uint32_t)len);
-    if (write(fd, &nlen, 4) != 4) return -1;
+    if (p2p_socket_send(fd, &nlen, 4) != 4) return -1;
     size_t sent = 0;
     while (sent < len) {
-        ssize_t n = write(fd, data + sent, len - sent);
+        int n = p2p_socket_send(fd, data + sent, (int)(len - sent));
         if (n <= 0) return -1;
         sent += n;
     }
     return 0;
 }
 
-static int recv_frame(int fd, char *buf, size_t buf_sz, size_t *out_len)
+static int recv_frame(p2p_socket_t fd, char *buf, size_t buf_sz, size_t *out_len)
 {
     uint32_t nlen;
-    ssize_t n = read(fd, &nlen, 4);
+    int n = p2p_socket_recv(fd, &nlen, 4);
     if (n != 4) return -1;
     uint32_t len = ntohl(nlen);
     if (len == 0 || len >= buf_sz) return -1;
     size_t got = 0;
     while (got < len) {
-        n = read(fd, buf + got, len - got);
+        n = p2p_socket_recv(fd, buf + got, (int)(len - got));
         if (n <= 0) return -1;
         got += n;
     }
@@ -259,7 +254,7 @@ static void *heartbeat_thread_func(void *arg)
 {
     p2p_signaling_client_t *c = (p2p_signaling_client_t *)arg;
     while (c->running) {
-        sleep(15);
+        p2p_sleep_ms(15000);
         if (!c->running || !c->connected) break;
         p2p_sig_message_t msg;
         memset(&msg, 0, sizeof(msg));
@@ -289,7 +284,7 @@ int p2p_signaling_connect(p2p_signaling_client_t *c, const p2p_signaling_config_
     }
 
     c->ws_fd = tcp_connect(host, port);
-    if (c->ws_fd < 0) {
+    if (c->ws_fd == P2P_INVALID_SOCKET) {
         fprintf(stderr, "signaling: connect to %s:%u failed\n", host, port);
         return -1;
     }
@@ -297,14 +292,14 @@ int p2p_signaling_connect(p2p_signaling_client_t *c, const p2p_signaling_config_
     c->connected = 1;
     c->running = 1;
 
-    if (pthread_create(&c->recv_thread, NULL, recv_thread_func, c) != 0) {
-        close(c->ws_fd);
-        c->ws_fd = -1;
+    if (p2p_thread_create(&c->recv_thread, recv_thread_func, c) != 0) {
+        p2p_socket_close(c->ws_fd);
+        c->ws_fd = P2P_INVALID_SOCKET;
         c->connected = 0;
         return -1;
     }
 
-    pthread_create(&c->heartbeat_thread, NULL, heartbeat_thread_func, c);
+    p2p_thread_create(&c->heartbeat_thread, heartbeat_thread_func, c);
 
     if (c->callbacks.on_connected)
         c->callbacks.on_connected(c, c->user_data);
@@ -316,14 +311,14 @@ void p2p_signaling_disconnect(p2p_signaling_client_t *c)
 {
     if (!c) return;
     c->running = 0;
-    if (c->ws_fd >= 0) {
-        shutdown(c->ws_fd, SHUT_RDWR);
-        close(c->ws_fd);
-        c->ws_fd = -1;
+    if (c->ws_fd != P2P_INVALID_SOCKET) {
+        p2p_socket_shutdown(c->ws_fd);
+        p2p_socket_close(c->ws_fd);
+        c->ws_fd = P2P_INVALID_SOCKET;
     }
     if (c->connected) {
-        pthread_join(c->recv_thread, NULL);
-        pthread_join(c->heartbeat_thread, NULL);
+        p2p_thread_join(c->recv_thread);
+        p2p_thread_join(c->heartbeat_thread);
     }
     c->connected = 0;
 }

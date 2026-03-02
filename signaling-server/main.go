@@ -27,12 +27,14 @@ func main() {
 	defer listener.Close()
 
 	// Graceful shutdown
-	done := make(chan os.Signal, 1)
-	signal.Notify(done, syscall.SIGINT, syscall.SIGTERM)
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	shutdown := make(chan struct{})
 
 	go func() {
-		<-done
+		<-sigCh
 		log.Println("Shutting down...")
+		close(shutdown)
 		listener.Close()
 	}()
 
@@ -42,7 +44,7 @@ func main() {
 		conn, err := listener.Accept()
 		if err != nil {
 			select {
-			case <-done:
+			case <-shutdown:
 				return
 			default:
 				log.Printf("Accept error: %v", err)

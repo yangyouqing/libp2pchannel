@@ -9,7 +9,10 @@
 #include <libavutil/opt.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/log.h>
 #include <libswscale/swscale.h>
+
+static int s_av_log_initialized = 0;
 
 /* ======== Video Encoder (H.264 libx264) ======== */
 
@@ -17,6 +20,11 @@ int p2p_video_encoder_open(p2p_video_encoder_t *enc, const p2p_video_encoder_con
 {
     if (!enc || !cfg) return -1;
     memset(enc, 0, sizeof(*enc));
+
+    if (!s_av_log_initialized) {
+        av_log_set_level(AV_LOG_FATAL);
+        s_av_log_initialized = 1;
+    }
 
     enc->width = cfg->width > 0 ? cfg->width : 640;
     enc->height = cfg->height > 0 ? cfg->height : 480;
@@ -85,20 +93,13 @@ int p2p_video_encoder_encode(p2p_video_encoder_t *enc,
 
     av_frame_make_writable(frame);
 
-    if (in_pixfmt == P2P_V4L2_PIX_YUYV) {
-        /* Convert YUYV -> YUV420P */
-        if (!enc->sws_ctx) {
-            enc->sws_ctx = sws_getContext(
-                enc->width, enc->height, AV_PIX_FMT_YUYV422,
-                enc->width, enc->height, AV_PIX_FMT_YUV420P,
-                SWS_FAST_BILINEAR, NULL, NULL, NULL);
+    /* Only MJPEG capture is used; always decode to YUV420P then H.264 encode. */
+    if (in_pixfmt == P2P_V4L2_PIX_MJPEG) {
+        /* Validate JPEG: must start with SOI marker (0xFFD8) and have reasonable size */
+        if (raw_size < 100 || raw_data[0] != 0xFF || raw_data[1] != 0xD8) {
+            return -1;
         }
-        const uint8_t *src_slices[1] = { raw_data };
-        int src_stride[1] = { enc->width * 2 };
-        sws_scale((struct SwsContext *)enc->sws_ctx,
-                  src_slices, src_stride, 0, enc->height,
-                  frame->data, frame->linesize);
-    } else if (in_pixfmt == P2P_V4L2_PIX_MJPEG) {
+
         /* Decode MJPEG (JPEG) to raw pixels, then convert to YUV420P */
         if (!enc->mjpeg_ctx) {
             const AVCodec *mjdec = avcodec_find_decoder(AV_CODEC_ID_MJPEG);
@@ -108,6 +109,7 @@ int p2p_video_encoder_encode(p2p_video_encoder_t *enc,
             }
             AVCodecContext *mctx = avcodec_alloc_context3(mjdec);
             mctx->thread_count = 1;
+            mctx->flags2 |= AV_CODEC_FLAG2_FAST;
             if (avcodec_open2(mctx, mjdec, NULL) < 0) {
                 avcodec_free_context(&mctx);
                 return -1;
@@ -115,6 +117,7 @@ int p2p_video_encoder_encode(p2p_video_encoder_t *enc,
             enc->mjpeg_ctx = mctx;
             enc->mjpeg_pkt = av_packet_alloc();
             enc->mjpeg_frame = av_frame_alloc();
+            enc->mjpeg_last_fmt = -1;
         }
         AVCodecContext *mctx = (AVCodecContext *)enc->mjpeg_ctx;
         AVPacket *mpkt = (AVPacket *)enc->mjpeg_pkt;
@@ -124,35 +127,47 @@ int p2p_video_encoder_encode(p2p_video_encoder_t *enc,
         mpkt->size = raw_size;
 
         int ret2 = avcodec_send_packet(mctx, mpkt);
-        if (ret2 < 0) return -1;
+        if (ret2 < 0) {
+            avcodec_flush_buffers(mctx);
+            return -1;
+        }
         ret2 = avcodec_receive_frame(mctx, mframe);
-        if (ret2 < 0) return -1;
+        if (ret2 < 0) {
+            avcodec_flush_buffers(mctx);
+            return -1;
+        }
+        if (mframe->decode_error_flags) {
+            avcodec_flush_buffers(mctx);
+            return -1;
+        }
 
-        /* MJPEG decoder typically outputs YUVJ422P or YUVJ420P; convert to YUV420P */
-        if (!enc->mjpeg_sws || mframe->format != (int)(intptr_t)enc->sws_ctx) {
+        /* MJPEG decoder outputs YUVJ422P or YUVJ420P; convert to YUV420P */
+        if (!enc->mjpeg_sws || mframe->format != enc->mjpeg_last_fmt) {
             if (enc->mjpeg_sws)
                 sws_freeContext((struct SwsContext *)enc->mjpeg_sws);
             enc->mjpeg_sws = sws_getContext(
                 mframe->width, mframe->height, mframe->format,
                 enc->width, enc->height, AV_PIX_FMT_YUV420P,
                 SWS_FAST_BILINEAR, NULL, NULL, NULL);
+            enc->mjpeg_last_fmt = mframe->format;
         }
         sws_scale((struct SwsContext *)enc->mjpeg_sws,
                   (const uint8_t * const *)mframe->data, mframe->linesize,
                   0, mframe->height,
                   frame->data, frame->linesize);
     } else {
-        /* Assume raw YUV420P planar */
-        int y_size = enc->width * enc->height;
-        int uv_size = y_size / 4;
-        if (raw_size >= y_size + 2 * uv_size) {
-            memcpy(frame->data[0], raw_data, y_size);
-            memcpy(frame->data[1], raw_data + y_size, uv_size);
-            memcpy(frame->data[2], raw_data + y_size + uv_size, uv_size);
-        }
+        /* Only MJPEG capture is supported; other formats are not used. */
+        return -1;
     }
 
     frame->pts = enc->frame_count++;
+
+    if (enc->force_idr) {
+        frame->pict_type = AV_PICTURE_TYPE_I;
+        enc->force_idr = 0;
+    } else {
+        frame->pict_type = AV_PICTURE_TYPE_NONE;
+    }
 
     int ret = avcodec_send_frame(ctx, frame);
     if (ret < 0) return -1;

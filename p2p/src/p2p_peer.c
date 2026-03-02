@@ -19,6 +19,7 @@
 #include <unistd.h>
 #include <getopt.h>
 #include <pthread.h>
+#include <libavutil/log.h>
 
 /* Reassembly buffer for fragmented frames */
 #define REASM_MAX_SIZE (512 * 1024)
@@ -30,6 +31,7 @@ typedef struct {
     uint64_t timestamp_us;
     uint32_t total_len;
     uint32_t received;
+    int      active;
     uint8_t  data[REASM_MAX_SIZE];
 } reasm_buf_t;
 
@@ -75,6 +77,18 @@ typedef struct {
     } aframe;
     pthread_mutex_t      frame_mutex;
 
+    /* Frame loss tracking */
+    uint32_t             last_video_seq;
+    int                  has_last_video_seq;
+    uint32_t             video_frames_ok;
+    uint32_t             video_frames_lost;
+    uint32_t             video_frames_incomplete;
+    int                  waiting_for_keyframe;
+    uint64_t             last_idr_req_us;
+    uint64_t             last_rx_stat_us;
+    uint32_t             rx_frag_total;
+    uint32_t             rx_frag_dup;
+
     /* Timing */
     uint64_t             first_frame_time;
     int                  got_first_frame;
@@ -108,7 +122,6 @@ static void process_complete_frame(peer_ctx_t *ctx, reasm_buf_t *rb)
                 fprintf(stderr, "[peer] first video frame decoded: %dx%d\n", w, h);
             }
 
-            /* Copy frame data for main thread rendering */
             pthread_mutex_lock(&ctx->frame_mutex);
             int y_size = lsy * h;
             int uv_h = h / 2;
@@ -154,10 +167,36 @@ static void process_complete_frame(peer_ctx_t *ctx, reasm_buf_t *rb)
     }
 }
 
+static void request_idr_if_needed(peer_ctx_t *ctx, p2p_peer_ctx_t *peer)
+{
+    uint64_t now = p2p_capture_now_us();
+    if (now - ctx->last_idr_req_us < 200000)
+        return;
+    ctx->last_idr_req_us = now;
+    ctx->waiting_for_keyframe = 1;
+    p2p_peer_send_idr_request(peer);
+    fprintf(stderr, "[RX] IDR request sent\n");
+}
+
+static void rx_print_stats(peer_ctx_t *ctx)
+{
+    uint64_t now = p2p_capture_now_us();
+    if (now - ctx->last_rx_stat_us < 5000000ULL) return;
+    ctx->last_rx_stat_us = now;
+    fprintf(stderr, "[RX-STAT] ok=%u lost=%u incomplete=%u frags=%u dup=%u\n",
+            ctx->video_frames_ok, ctx->video_frames_lost,
+            ctx->video_frames_incomplete,
+            ctx->rx_frag_total, ctx->rx_frag_dup);
+}
+
 static void on_data_recv(p2p_peer_ctx_t *peer, const p2p_frame_header_t *hdr,
                          const uint8_t *payload, void *user_data)
 {
     peer_ctx_t *ctx = (peer_ctx_t *)user_data;
+
+    if (hdr->type == P2P_FRAME_TYPE_IDR_REQ) return;
+    if (hdr->type != P2P_FRAME_TYPE_VIDEO && hdr->type != P2P_FRAME_TYPE_AUDIO)
+        return;
 
     reasm_buf_t *rb = (hdr->type == P2P_FRAME_TYPE_VIDEO)
                     ? &ctx->video_reasm
@@ -165,35 +204,97 @@ static void on_data_recv(p2p_peer_ctx_t *peer, const p2p_frame_header_t *hdr,
 
     pthread_mutex_lock(&ctx->reasm_mutex);
 
-    /* New frame or different sequence -> reset */
-    if (rb->seq != hdr->seq || rb->type != hdr->type) {
+    if (hdr->type == P2P_FRAME_TYPE_VIDEO) {
+        ctx->rx_frag_total++;
+
+        /* Detect sequence gaps (lost frames) */
+        if (ctx->has_last_video_seq && hdr->frag_offset == 0) {
+            uint32_t expected = ctx->last_video_seq + 1;
+            if (hdr->seq > expected) {
+                uint32_t gap = hdr->seq - expected;
+                ctx->video_frames_lost += gap;
+                fprintf(stderr, "[RX] LOST %u frames (expected seq=%u got seq=%u)\n",
+                        gap, expected, hdr->seq);
+                request_idr_if_needed(ctx, peer);
+            }
+        }
+
+        /* Track: if we're starting a new frame and the old one was incomplete */
+        if (rb->active && hdr->seq != rb->seq && rb->received < rb->total_len) {
+            ctx->video_frames_incomplete++;
+            fprintf(stderr, "[RX] INCOMPLETE seq=%u got=%u/%u bytes\n",
+                    rb->seq, rb->received, rb->total_len);
+            request_idr_if_needed(ctx, peer);
+        }
+
+        if (hdr->frag_offset == 0) {
+            ctx->last_video_seq = hdr->seq;
+            ctx->has_last_video_seq = 1;
+        }
+
+        /* If waiting for keyframe, drop non-key P-frames */
+        if (ctx->waiting_for_keyframe) {
+            if (hdr->frag_offset == 0 && (hdr->flags & P2P_FRAME_FLAG_KEY)) {
+                ctx->waiting_for_keyframe = 0;
+                fprintf(stderr, "[RX] got IDR seq=%u, resuming\n", hdr->seq);
+            } else if (hdr->frag_offset == 0) {
+                pthread_mutex_unlock(&ctx->reasm_mutex);
+                return;
+            }
+        }
+
+        rx_print_stats(ctx);
+    }
+
+    /* New frame or different sequence -> reset reassembly */
+    if (!rb->active || rb->seq != hdr->seq || rb->type != hdr->type) {
+        /* Stale fragment from an older frame -> discard */
+        if (rb->active && hdr->type == rb->type && hdr->seq < rb->seq) {
+            ctx->rx_frag_dup++;
+            pthread_mutex_unlock(&ctx->reasm_mutex);
+            return;
+        }
         rb->type = hdr->type;
         rb->flags = hdr->flags;
         rb->seq = hdr->seq;
         rb->timestamp_us = hdr->timestamp_us;
         rb->total_len = hdr->total_len;
         rb->received = 0;
+        rb->active = 1;
         if (rb->total_len > REASM_MAX_SIZE) {
+            fprintf(stderr, "[RX] frame seq=%u too large %u > %d\n",
+                    hdr->seq, rb->total_len, REASM_MAX_SIZE);
+            rb->active = 0;
             pthread_mutex_unlock(&ctx->reasm_mutex);
             return;
         }
     }
 
-    /* Copy fragment into place */
-    if (hdr->frag_offset + hdr->frag_len <= rb->total_len &&
-        hdr->frag_offset + hdr->frag_len <= REASM_MAX_SIZE) {
-        memcpy(rb->data + hdr->frag_offset, payload, hdr->frag_len);
-        rb->received += hdr->frag_len;
+    /* Bounds check */
+    uint32_t frag_end = hdr->frag_offset + hdr->frag_len;
+    if (hdr->frag_offset >= REASM_MAX_SIZE || frag_end > REASM_MAX_SIZE ||
+        frag_end > rb->total_len) {
+        fprintf(stderr, "[RX] OOB seq=%u off=%u len=%u total=%u\n",
+                hdr->seq, hdr->frag_offset, hdr->frag_len, rb->total_len);
+        pthread_mutex_unlock(&ctx->reasm_mutex);
+        return;
     }
 
-    /* Retain flags from first fragment */
+    memcpy(rb->data + hdr->frag_offset, payload, hdr->frag_len);
+    rb->received += hdr->frag_len;
+
     if (hdr->frag_offset == 0)
         rb->flags = hdr->flags;
 
-    /* Check if complete */
+    /* Frame complete? */
     if (rb->received >= rb->total_len) {
+        if (hdr->type == P2P_FRAME_TYPE_VIDEO) {
+            fprintf(stderr, "[RX] seq=%u %s size=%u OK\n",
+                    rb->seq, (rb->flags & P2P_FRAME_FLAG_KEY) ? "IDR" : "P", rb->total_len);
+            ctx->video_frames_ok++;
+        }
         process_complete_frame(ctx, rb);
-        rb->seq = 0;
+        rb->active = 0;
         rb->received = 0;
     }
 
@@ -315,6 +416,8 @@ int main(int argc, char *argv[])
 {
     peer_ctx_t *ctx = &g_ctx;
     memset(ctx, 0, sizeof(*ctx));
+
+    av_log_set_level(AV_LOG_FATAL);
 
     /* Defaults */
     strcpy(ctx->signaling_addr, "127.0.0.1:8080");

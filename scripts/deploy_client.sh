@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 #
 # deploy_client.sh -- Build and deploy the P2P AV Publisher (p2p_client)
+#                     Supports Linux and Windows (via Git Bash / MSYS2)
 #
 # Usage:
 #   ./scripts/deploy_client.sh [OPTIONS]
 #
 # Options:
-#   --install-deps     Install system build dependencies via apt
+#   --install-deps     Install system build dependencies via apt (Linux only)
 #   --deploy-dir DIR   Custom deployment directory (default: deploy/client)
 #   --start            Build, deploy, and start all services
 #   --stop             Stop running services
@@ -19,8 +20,8 @@
 #   STUN_SERVER      STUN/TURN server address        (default: TURN_HOST:TURN_PORT)
 #   ROOM_ID          Room identifier                 (default: test-room)
 #   PEER_ID          Publisher peer ID                (default: pub1)
-#   VIDEO_DEV        V4L2 video device               (default: /dev/video0)
-#   AUDIO_DEV        ALSA audio device               (default: default)
+#   VIDEO_DEV        Video device                     (Linux: /dev/video0, Windows: Integrated Camera)
+#   AUDIO_DEV        Audio device                     (Linux: default, Windows: Microphone)
 #   TURN_HOST        TURN server host                 (default: 127.0.0.1)
 #   TURN_PORT        TURN server port                 (default: 3478)
 #   TURN_SECRET      TURN shared secret               (default: p2p-turn-secret)
@@ -31,6 +32,28 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_DIR="$PROJECT_DIR/build"
+
+# ---- Platform detection ----
+detect_platform() {
+    case "$(uname -s)" in
+        Linux*)         P2P_OS=linux ;;
+        MINGW*|MSYS*)   P2P_OS=windows ;;
+        CYGWIN*)        P2P_OS=windows ;;
+        Darwin*)        P2P_OS=macos ;;
+        *)              P2P_OS=linux ;;
+    esac
+}
+detect_platform
+
+if [[ "$P2P_OS" == "windows" ]]; then
+    EXE_EXT=".exe"
+    DEFAULT_VIDEO_DEV="Integrated Camera"
+    DEFAULT_AUDIO_DEV="Microphone"
+else
+    EXE_EXT=""
+    DEFAULT_VIDEO_DEV="/dev/video0"
+    DEFAULT_AUDIO_DEV="default"
+fi
 
 DEPLOY_DIR="${DEPLOY_DIR:-$PROJECT_DIR/deploy/client}"
 INSTALL_DEPS=false
@@ -44,8 +67,8 @@ TURN_PORT="${TURN_PORT:-3478}"
 STUN_SERVER="${STUN_SERVER:-${TURN_HOST}:${TURN_PORT}}"
 ROOM_ID="${ROOM_ID:-test-room}"
 PEER_ID="${PEER_ID:-pub1}"
-VIDEO_DEV="${VIDEO_DEV:-/dev/video0}"
-AUDIO_DEV="${AUDIO_DEV:-default}"
+VIDEO_DEV="${VIDEO_DEV:-$DEFAULT_VIDEO_DEV}"
+AUDIO_DEV="${AUDIO_DEV:-$DEFAULT_AUDIO_DEV}"
 TURN_SECRET="${TURN_SECRET:-p2p-turn-secret}"
 
 while [[ $# -gt 0 ]]; do
@@ -58,6 +81,7 @@ while [[ $# -gt 0 ]]; do
         --skip-build)   SKIP_BUILD=true; shift ;;
         -h|--help)
             head -30 "$0" | grep '^#' | sed 's/^# \?//'
+            echo "Detected platform: $P2P_OS"
             exit 0 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
@@ -65,18 +89,24 @@ done
 
 log() { echo -e "\033[1;32m[deploy_client]\033[0m $*"; }
 
+log "Platform: $P2P_OS"
+
 # ============================================================
 # Stop running services
 # ============================================================
 stop_services() {
     log "Stopping running services..."
-    local pids
-    pids=$(pgrep -f "$DEPLOY_DIR/bin/p2p_client" 2>/dev/null || true)
-    [[ -n "$pids" ]] && kill $pids 2>/dev/null && log "  p2p_client stopped" || true
+    if [[ "$P2P_OS" == "windows" ]]; then
+        taskkill //F //IM "p2p_client.exe" 2>/dev/null && log "  p2p_client stopped" || true
+        taskkill //F //IM "signaling-server.exe" 2>/dev/null && log "  signaling-server stopped" || true
+    else
+        local pids
+        pids=$(pgrep -f "$DEPLOY_DIR/bin/p2p_client" 2>/dev/null || true)
+        [[ -n "$pids" ]] && kill $pids 2>/dev/null && log "  p2p_client stopped" || true
 
-    pids=$(pgrep -f "$DEPLOY_DIR/bin/signaling-server" 2>/dev/null || true)
-    [[ -n "$pids" ]] && kill $pids 2>/dev/null && log "  signaling-server stopped" || true
-
+        pids=$(pgrep -f "$DEPLOY_DIR/bin/signaling-server" 2>/dev/null || true)
+        [[ -n "$pids" ]] && kill $pids 2>/dev/null && log "  signaling-server stopped" || true
+    fi
     sleep 1
     log "Services stopped."
 }
@@ -98,7 +128,10 @@ if ! $SKIP_BUILD; then
 fi
 
 # Verify binaries exist
-for bin in "$BUILD_DIR/p2p/p2p_client" "$BUILD_DIR/signaling-server"; do
+CLIENT_BIN="$BUILD_DIR/p2p/p2p_client${EXE_EXT}"
+SIGNALING_BIN="$BUILD_DIR/signaling-server${EXE_EXT}"
+
+for bin in "$CLIENT_BIN" "$SIGNALING_BIN"; do
     if [[ ! -f "$bin" ]]; then
         log "ERROR: $bin not found. Run without --skip-build first."
         exit 1
@@ -133,13 +166,14 @@ fi
 log "Assembling deployment directory: $DEPLOY_DIR"
 mkdir -p "$DEPLOY_DIR"/{bin,certs,conf,logs}
 
-cp -f "$BUILD_DIR/p2p/p2p_client"   "$DEPLOY_DIR/bin/"
-cp -f "$BUILD_DIR/signaling-server"  "$DEPLOY_DIR/bin/"
-cp -f "$CERT_DIR/server.crt"        "$DEPLOY_DIR/certs/"
-cp -f "$CERT_DIR/server.key"        "$DEPLOY_DIR/certs/"
+cp -f "$CLIENT_BIN"      "$DEPLOY_DIR/bin/"
+cp -f "$SIGNALING_BIN"   "$DEPLOY_DIR/bin/"
+cp -f "$CERT_DIR/server.crt" "$DEPLOY_DIR/certs/"
+cp -f "$CERT_DIR/server.key" "$DEPLOY_DIR/certs/"
 
 cat > "$DEPLOY_DIR/conf/client.env" <<EOF
 # P2P Client (Publisher) Configuration
+# Platform: $P2P_OS
 SIGNALING_ADDR=${SIGNALING_ADDR}
 STUN_SERVER=${STUN_SERVER}
 ROOM_ID=${ROOM_ID}
@@ -155,6 +189,7 @@ TURN_SECRET=${TURN_SECRET}
 MAX_SUBSCRIBERS=5
 EOF
 
+# ---- Generate bash launcher (works on both platforms via Git Bash) ----
 cat > "$DEPLOY_DIR/start.sh" <<'LAUNCHER'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -163,6 +198,12 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/conf/client.env"
 LOG_DIR="$SCRIPT_DIR/logs"
 mkdir -p "$LOG_DIR"
+
+# Detect executable extension
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) EXE_EXT=".exe" ;;
+    *)                     EXE_EXT="" ;;
+esac
 
 PIDS=()
 cleanup() {
@@ -177,7 +218,7 @@ echo "[launcher] Starting signaling server on $LISTEN_ADDR ..."
 LISTEN_ADDR="$LISTEN_ADDR" \
 TURN_HOST="$TURN_HOST" TURN_PORT="$TURN_PORT" \
 TURN_SECRET="$TURN_SECRET" MAX_SUBSCRIBERS="${MAX_SUBSCRIBERS:-5}" \
-"$SCRIPT_DIR/bin/signaling-server" 2>&1 | tee "$LOG_DIR/signaling.log" &
+"$SCRIPT_DIR/bin/signaling-server${EXE_EXT}" 2>&1 | tee "$LOG_DIR/signaling.log" &
 PIDS+=($!)
 sleep 1
 
@@ -188,7 +229,7 @@ STUN_PORT="${STUN_SERVER##*:}"
 echo "[launcher] Starting p2p_client (publisher)..."
 echo "[launcher]   Signaling: $SIGNALING_ADDR  Room: $ROOM_ID  STUN: $STUN_HOST:$STUN_PORT"
 echo "[launcher]   Video: $VIDEO_DEV  Audio: $AUDIO_DEV"
-"$SCRIPT_DIR/bin/p2p_client" \
+"$SCRIPT_DIR/bin/p2p_client${EXE_EXT}" \
     --signaling "$SIGNALING_ADDR" \
     --room "$ROOM_ID" --peer-id "$PEER_ID" \
     --video-dev "$VIDEO_DEV" --audio-dev "$AUDIO_DEV" \
@@ -203,26 +244,92 @@ wait
 LAUNCHER
 chmod +x "$DEPLOY_DIR/start.sh"
 
+# ---- Generate Windows batch launcher ----
+if [[ "$P2P_OS" == "windows" ]]; then
+    cat > "$DEPLOY_DIR/start.bat" <<WINLAUNCHER
+@echo off
+setlocal enabledelayedexpansion
+
+set "SCRIPT_DIR=%~dp0"
+set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"
+
+:: Load config
+for /f "usebackq tokens=1* delims==" %%a in ("%SCRIPT_DIR%\\conf\\client.env") do (
+    set "line=%%a"
+    if not "!line:~0,1!"=="#" if not "%%a"=="" set "%%a=%%b"
+)
+
+if not exist "%SCRIPT_DIR%\\logs" mkdir "%SCRIPT_DIR%\\logs"
+
+echo [launcher] Starting signaling server on %LISTEN_ADDR% ...
+start "signaling-server" /B cmd /c "%SCRIPT_DIR%\\bin\\signaling-server.exe 2>&1 | tee %SCRIPT_DIR%\\logs\\signaling.log"
+timeout /t 1 /nobreak >nul
+
+for /f "tokens=1 delims=:" %%h in ("%STUN_SERVER%") do set "STUN_HOST=%%h"
+for /f "tokens=2 delims=:" %%p in ("%STUN_SERVER%") do set "STUN_PORT=%%p"
+if "%STUN_PORT%"=="" set "STUN_PORT=3478"
+
+echo [launcher] Starting p2p_client (publisher)...
+echo [launcher]   Signaling: %SIGNALING_ADDR%  Room: %ROOM_ID%  STUN: %STUN_HOST%:%STUN_PORT%
+echo [launcher]   Video: %VIDEO_DEV%  Audio: %AUDIO_DEV%
+
+"%SCRIPT_DIR%\\bin\\p2p_client.exe" ^
+    --signaling "%SIGNALING_ADDR%" ^
+    --room "%ROOM_ID%" --peer-id "%PEER_ID%" ^
+    --video-dev "%VIDEO_DEV%" --audio-dev "%AUDIO_DEV%" ^
+    --stun "%STUN_HOST%:%STUN_PORT%" ^
+    --ssl-cert "%SCRIPT_DIR%\\certs\\server.crt" ^
+    --ssl-key "%SCRIPT_DIR%\\certs\\server.key"
+
+echo [launcher] Publisher stopped.
+taskkill /F /IM signaling-server.exe 2>nul
+WINLAUNCHER
+    log "Windows batch launcher generated: start.bat"
+fi
+
+# ---- Generate stop scripts ----
 cat > "$DEPLOY_DIR/stop.sh" <<'STOPPER'
 #!/usr/bin/env bash
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-echo "[stop] Stopping p2p_client..."
-pkill -f "$SCRIPT_DIR/bin/p2p_client" 2>/dev/null || true
-echo "[stop] Stopping signaling-server..."
-pkill -f "$SCRIPT_DIR/bin/signaling-server" 2>/dev/null || true
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+        taskkill //F //IM "p2p_client.exe" 2>/dev/null || true
+        taskkill //F //IM "signaling-server.exe" 2>/dev/null || true
+        ;;
+    *)
+        pkill -f "$SCRIPT_DIR/bin/p2p_client" 2>/dev/null || true
+        pkill -f "$SCRIPT_DIR/bin/signaling-server" 2>/dev/null || true
+        ;;
+esac
 sleep 1
 echo "[stop] Done."
 STOPPER
 chmod +x "$DEPLOY_DIR/stop.sh"
 
-log "Deployment ready: $DEPLOY_DIR/"
-log "  bin/p2p_client        Publisher binary"
-log "  bin/signaling-server  Signaling server binary"
+if [[ "$P2P_OS" == "windows" ]]; then
+    cat > "$DEPLOY_DIR/stop.bat" <<'WINSTOPPER'
+@echo off
+echo [stop] Stopping p2p_client...
+taskkill /F /IM p2p_client.exe 2>nul
+echo [stop] Stopping signaling-server...
+taskkill /F /IM signaling-server.exe 2>nul
+timeout /t 1 /nobreak >nul
+echo [stop] Done.
+WINSTOPPER
+fi
+
+log "Deployment ready ($P2P_OS): $DEPLOY_DIR/"
+log "  bin/p2p_client${EXE_EXT}        Publisher binary"
+log "  bin/signaling-server${EXE_EXT}  Signaling server binary"
 log "  certs/                TLS certificates"
 log "  conf/client.env       Configuration"
 log "  logs/                 Runtime logs"
-log "  start.sh              Start all services"
-log "  stop.sh               Stop all services"
+if [[ "$P2P_OS" == "windows" ]]; then
+    log "  start.bat             Start all services (Windows native)"
+    log "  stop.bat              Stop all services (Windows native)"
+fi
+log "  start.sh              Start all services (bash)"
+log "  stop.sh               Stop all services (bash)"
 
 # ============================================================
 # Step 5: Optionally start

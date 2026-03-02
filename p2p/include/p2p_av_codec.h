@@ -27,19 +27,21 @@ typedef struct {
     void *mjpeg_pkt;    /* AVPacket*       */
     void *mjpeg_frame;  /* AVFrame*        */
     void *mjpeg_sws;    /* SwsContext* (MJPEG decoded pix -> YUV420P) */
+    int   mjpeg_last_fmt; /* cached pixel format from MJPEG decoder */
     int   width;
     int   height;
     int   frame_count;
+    volatile int force_idr; /* set to 1 to force next frame as IDR */
 } p2p_video_encoder_t;
 
 int  p2p_video_encoder_open(p2p_video_encoder_t *enc, const p2p_video_encoder_config_t *cfg);
-/* Encode a raw frame. Input is YUYV or YUV420P depending on in_pixfmt.
-   Returns encoded NAL data length, or 0 if no output yet, or -1 on error.
+/* Encode a frame to H.264. Input is MJPEG (in_pixfmt = P2P_V4L2_PIX_MJPEG).
+   Returns encoded NAL length, or 0 if no output yet, or -1 on error.
    *out_data points to internal buffer valid until next encode call.
    *is_keyframe set to 1 if output is IDR. */
 int  p2p_video_encoder_encode(p2p_video_encoder_t *enc,
                               const uint8_t *raw_data, int raw_size,
-                              int in_pixfmt, /* P2P_V4L2_PIX_YUYV or -1 for YUV420P */
+                              int in_pixfmt, /* P2P_V4L2_PIX_MJPEG */
                               uint8_t **out_data, int *out_size,
                               int *is_keyframe);
 void p2p_video_encoder_close(p2p_video_encoder_t *enc);

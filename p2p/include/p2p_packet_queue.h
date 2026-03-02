@@ -3,7 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include <pthread.h>
+#include "p2p_platform.h"
 
 #define P2P_PKT_MAX_SIZE   1500
 #define P2P_PKT_QUEUE_CAP  2048
@@ -21,8 +21,8 @@ typedef struct {
     int           head;
     int           tail;
     int           count;
-    pthread_mutex_t mutex;
-    pthread_cond_t  not_empty;
+    p2p_mutex_t mutex;
+    p2p_cond_t  not_empty;
 } p2p_packet_queue_t;
 
 int  p2p_packet_queue_init(p2p_packet_queue_t *q, int capacity);

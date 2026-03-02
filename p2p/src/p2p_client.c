@@ -19,6 +19,7 @@
 #include <unistd.h>
 #include <getopt.h>
 #include <pthread.h>
+#include <libavutil/log.h>
 
 typedef struct {
     /* Config */
@@ -47,7 +48,7 @@ typedef struct {
     /* IDR cache for fast first-frame delivery to new subscribers */
     uint8_t             *idr_cache;
     int                  idr_cache_size;
-    pthread_mutex_t      idr_mutex;
+    p2p_mutex_t          idr_mutex;
 
     /* Sequence counters */
     uint32_t             video_seq;
@@ -76,18 +77,24 @@ static void send_to_all_peers(client_ctx_t *ctx, uint8_t type, uint8_t flags,
 
 static void send_idr_to_peer(client_ctx_t *ctx, p2p_peer_ctx_t *peer)
 {
-    pthread_mutex_lock(&ctx->idr_mutex);
+    p2p_mutex_lock(&ctx->idr_mutex);
     if (ctx->idr_cache && ctx->idr_cache_size > 0) {
         uint64_t ts = p2p_capture_now_us();
+        uint32_t seq = p2p_atomic_fetch_add((volatile P2P_ATOMIC_INT *)&ctx->video_seq, 1);
         p2p_peer_send_data(peer, P2P_FRAME_TYPE_VIDEO, P2P_FRAME_FLAG_KEY,
-                           0, ts, ctx->idr_cache, ctx->idr_cache_size);
-        fprintf(stderr, "[client] sent cached IDR (%d bytes) to %s\n",
-                ctx->idr_cache_size, peer->peer_id);
+                           seq, ts, ctx->idr_cache, ctx->idr_cache_size);
+        fprintf(stderr, "[client] sent cached IDR (%d bytes) seq=%u to %s\n",
+                ctx->idr_cache_size, seq, peer->peer_id);
     }
-    pthread_mutex_unlock(&ctx->idr_mutex);
+    p2p_mutex_unlock(&ctx->idr_mutex);
 }
 
-/* ---- V4L2 video frame callback (called from capture thread) ---- */
+/* ---- Video frame callback (called from capture thread) ---- */
+
+static uint32_t s_cap_total = 0;
+static uint32_t s_enc_ok = 0;
+static uint32_t s_enc_skip = 0;
+static uint64_t s_last_stat_us = 0;
 
 static void on_video_frame(const uint8_t *data, size_t size,
                            int width, int height, int pixfmt,
@@ -98,26 +105,43 @@ static void on_video_frame(const uint8_t *data, size_t size,
     int out_size = 0;
     int is_key = 0;
 
+    s_cap_total++;
+
     int ret = p2p_video_encoder_encode(&ctx->venc, data, size, pixfmt,
                                        &out_data, &out_size, &is_key);
-    if (ret <= 0 || out_size <= 0) return;
+    if (ret <= 0 || out_size <= 0) {
+        s_enc_skip++;
+        goto stats;
+    }
 
-    uint32_t seq = __sync_fetch_and_add(&ctx->video_seq, 1);
+    s_enc_ok++;
+    uint32_t seq = p2p_atomic_fetch_add((volatile P2P_ATOMIC_INT *)&ctx->video_seq, 1);
     uint8_t flags = is_key ? P2P_FRAME_FLAG_KEY : 0;
+
+    int nfrags = (out_size + P2P_FRAME_MAX_FRAG - 1) / P2P_FRAME_MAX_FRAG;
+    fprintf(stderr, "[TX] seq=%u %s size=%d frags=%d\n",
+            seq, is_key ? "IDR" : "P", out_size, nfrags);
 
     /* Cache IDR for new subscribers */
     if (is_key) {
-        pthread_mutex_lock(&ctx->idr_mutex);
+        p2p_mutex_lock(&ctx->idr_mutex);
         ctx->idr_cache = realloc(ctx->idr_cache, out_size);
         if (ctx->idr_cache) {
             memcpy(ctx->idr_cache, out_data, out_size);
             ctx->idr_cache_size = out_size;
         }
-        pthread_mutex_unlock(&ctx->idr_mutex);
+        p2p_mutex_unlock(&ctx->idr_mutex);
     }
 
     send_to_all_peers(ctx, P2P_FRAME_TYPE_VIDEO, flags, seq,
                       timestamp_us, out_data, out_size);
+stats:
+    if (timestamp_us - s_last_stat_us >= 5000000ULL) {
+        fprintf(stderr, "[TX-STAT] cap=%u enc_ok=%u skip=%u (%.0f%% skip)\n",
+                s_cap_total, s_enc_ok, s_enc_skip,
+                s_cap_total ? 100.0 * s_enc_skip / s_cap_total : 0);
+        s_last_stat_us = timestamp_us;
+    }
 }
 
 /* ---- ALSA audio frame callback (called from capture thread) ---- */
@@ -134,7 +158,7 @@ static void on_audio_frame(const int16_t *samples, int num_samples,
                                        &out_data, &out_size);
     if (ret <= 0 || out_size <= 0) return;
 
-    uint32_t seq = __sync_fetch_and_add(&ctx->audio_seq, 1);
+    uint32_t seq = p2p_atomic_fetch_add((volatile P2P_ATOMIC_INT *)&ctx->audio_seq, 1);
 
     send_to_all_peers(ctx, P2P_FRAME_TYPE_AUDIO, 0, seq,
                       timestamp_us, out_data, out_size);
@@ -146,10 +170,21 @@ static int start_capture(client_ctx_t *ctx)
 {
     if (ctx->capture_started) return 0;
 
-    /* Video encoder */
-    p2p_video_encoder_config_t vcfg = {
+    /* Video capture - open first to get actual resolution */
+    p2p_video_capture_config_t vccfg = {
+        .device = ctx->video_dev,
         .width = 640, .height = 480, .fps = 30,
-        .bitrate = 1000000, .gop_size = 30
+        .cb = on_video_frame, .user_data = ctx
+    };
+    if (p2p_video_capture_open(&ctx->vcap, &vccfg) != 0) {
+        fprintf(stderr, "[client] video capture open failed\n");
+        return -1;
+    }
+
+    /* Video encoder - use actual capture resolution */
+    p2p_video_encoder_config_t vcfg = {
+        .width = ctx->vcap.width, .height = ctx->vcap.height, .fps = 30,
+        .bitrate = 2000000, .gop_size = 30
     };
     if (p2p_video_encoder_open(&ctx->venc, &vcfg) != 0) {
         fprintf(stderr, "[client] video encoder open failed\n");
@@ -166,16 +201,6 @@ static int start_capture(client_ctx_t *ctx)
         return -1;
     }
 
-    /* Video capture */
-    p2p_video_capture_config_t vccfg = {
-        .device = ctx->video_dev,
-        .width = 640, .height = 480, .fps = 30,
-        .cb = on_video_frame, .user_data = ctx
-    };
-    if (p2p_video_capture_open(&ctx->vcap, &vccfg) != 0) {
-        fprintf(stderr, "[client] video capture open failed\n");
-        return -1;
-    }
     if (p2p_video_capture_start(&ctx->vcap) != 0) {
         fprintf(stderr, "[client] video capture start failed\n");
         return -1;
@@ -199,6 +224,17 @@ static int start_capture(client_ctx_t *ctx)
     return 0;
 }
 
+/* ---- IDR request from subscriber ---- */
+
+static void on_data_recv(p2p_peer_ctx_t *peer, const p2p_frame_header_t *hdr,
+                         const uint8_t *payload, void *user_data)
+{
+    client_ctx_t *ctx = (client_ctx_t *)user_data;
+    if (hdr->type == P2P_FRAME_TYPE_IDR_REQ) {
+        ctx->venc.force_idr = 1;
+    }
+}
+
 /* ---- Adapter callbacks ---- */
 
 static void on_ice_state(p2p_peer_ctx_t *peer, juice_state_t state, void *user_data)
@@ -206,15 +242,15 @@ static void on_ice_state(p2p_peer_ctx_t *peer, juice_state_t state, void *user_d
     client_ctx_t *ctx = (client_ctx_t *)user_data;
     fprintf(stderr, "[client] peer %s ICE state -> %d\n", peer->peer_id, state);
 
-    if (state == JUICE_STATE_CONNECTED || state == JUICE_STATE_COMPLETED) {
+    if (state == JUICE_STATE_CONNECTED) {
         fprintf(stderr, "[client] ICE connected with %s\n", peer->peer_id);
 
-        /* Start capture on first connection */
         if (!ctx->capture_started)
             start_capture(ctx);
 
-        /* Send cached IDR to new subscriber for fast first-frame */
         send_idr_to_peer(ctx, peer);
+    } else if (state == JUICE_STATE_COMPLETED) {
+        fprintf(stderr, "[client] ICE completed with %s\n", peer->peer_id);
     }
 }
 
@@ -316,11 +352,13 @@ static void on_sig_disconnected(p2p_signaling_client_t *client, void *user_data)
 
 /* ---- Signal handler ---- */
 
+#ifndef _WIN32
 static void sig_handler(int sig)
 {
     (void)sig;
     g_ctx.running = 0;
 }
+#endif
 
 /* ---- Argument parsing ---- */
 
@@ -331,8 +369,13 @@ static void print_usage(const char *prog)
         "  --signaling HOST:PORT   Signaling server address (default 127.0.0.1:8080)\n"
         "  --room ROOM_ID          Room name (default test-room)\n"
         "  --peer-id ID            Publisher peer ID (default pub1)\n"
+#ifdef _WIN32
+        "  --video-dev DEV         Video device name (default \"Integrated Camera\")\n"
+        "  --audio-dev DEV         Audio device name (default \"Microphone\")\n"
+#else
         "  --video-dev DEV         V4L2 video device (default /dev/video0)\n"
         "  --audio-dev DEV         ALSA audio device (default default)\n"
+#endif
         "  --stun HOST:PORT        STUN server (default 127.0.0.1:3478)\n"
         "  --ssl-cert FILE         SSL certificate for QUIC (default ./server.crt)\n"
         "  --ssl-key FILE          SSL private key for QUIC (default ./server.key)\n"
@@ -344,43 +387,54 @@ int main(int argc, char *argv[])
     client_ctx_t *ctx = &g_ctx;
     memset(ctx, 0, sizeof(*ctx));
 
+    av_log_set_level(AV_LOG_FATAL);
+
+#ifdef _WIN32
+    p2p_net_init();
+#endif
+
     /* Defaults */
     strcpy(ctx->signaling_addr, "127.0.0.1:8080");
     strcpy(ctx->room_id, "test-room");
     strcpy(ctx->peer_id, "pub1");
+#ifdef _WIN32
+    strcpy(ctx->video_dev, "Integrated Camera");
+    strcpy(ctx->audio_dev, "Microphone");
+#else
     strcpy(ctx->video_dev, "/dev/video0");
     strcpy(ctx->audio_dev, "default");
+#endif
     strcpy(ctx->stun_host, "127.0.0.1");
     ctx->stun_port = 3478;
     strcpy(ctx->ssl_cert, "./server.crt");
     strcpy(ctx->ssl_key, "./server.key");
 
-    static struct option long_opts[] = {
-        {"signaling", required_argument, NULL, 's'},
-        {"room",      required_argument, NULL, 'r'},
-        {"peer-id",   required_argument, NULL, 'p'},
-        {"video-dev", required_argument, NULL, 'v'},
-        {"audio-dev", required_argument, NULL, 'a'},
-        {"stun",      required_argument, NULL, 't'},
-        {"ssl-cert",  required_argument, NULL, 'c'},
-        {"ssl-key",   required_argument, NULL, 'k'},
-        {"help",      no_argument,       NULL, 'h'},
+    static struct p2p_option long_opts[] = {
+        {"signaling", 1, NULL, 's'},
+        {"room",      1, NULL, 'r'},
+        {"peer-id",   1, NULL, 'p'},
+        {"video-dev", 1, NULL, 'v'},
+        {"audio-dev", 1, NULL, 'a'},
+        {"stun",      1, NULL, 't'},
+        {"ssl-cert",  1, NULL, 'c'},
+        {"ssl-key",   1, NULL, 'k'},
+        {"help",      0, NULL, 'h'},
         {NULL, 0, NULL, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "s:r:p:v:a:t:c:k:h", long_opts, NULL)) != -1) {
+    while ((opt = p2p_getopt_long(argc, argv, "s:r:p:v:a:t:c:k:h", long_opts, NULL)) != -1) {
         switch (opt) {
-        case 's': snprintf(ctx->signaling_addr, sizeof(ctx->signaling_addr), "%s", optarg); break;
-        case 'r': snprintf(ctx->room_id, sizeof(ctx->room_id), "%s", optarg); break;
-        case 'p': snprintf(ctx->peer_id, sizeof(ctx->peer_id), "%s", optarg); break;
-        case 'v': snprintf(ctx->video_dev, sizeof(ctx->video_dev), "%s", optarg); break;
-        case 'a': snprintf(ctx->audio_dev, sizeof(ctx->audio_dev), "%s", optarg); break;
-        case 'c': snprintf(ctx->ssl_cert, sizeof(ctx->ssl_cert), "%s", optarg); break;
-        case 'k': snprintf(ctx->ssl_key, sizeof(ctx->ssl_key), "%s", optarg); break;
+        case 's': snprintf(ctx->signaling_addr, sizeof(ctx->signaling_addr), "%s", p2p_optarg); break;
+        case 'r': snprintf(ctx->room_id, sizeof(ctx->room_id), "%s", p2p_optarg); break;
+        case 'p': snprintf(ctx->peer_id, sizeof(ctx->peer_id), "%s", p2p_optarg); break;
+        case 'v': snprintf(ctx->video_dev, sizeof(ctx->video_dev), "%s", p2p_optarg); break;
+        case 'a': snprintf(ctx->audio_dev, sizeof(ctx->audio_dev), "%s", p2p_optarg); break;
+        case 'c': snprintf(ctx->ssl_cert, sizeof(ctx->ssl_cert), "%s", p2p_optarg); break;
+        case 'k': snprintf(ctx->ssl_key, sizeof(ctx->ssl_key), "%s", p2p_optarg); break;
         case 't': {
             char tmp[256];
-            snprintf(tmp, sizeof(tmp), "%s", optarg);
+            snprintf(tmp, sizeof(tmp), "%s", p2p_optarg);
             char *colon = strrchr(tmp, ':');
             if (colon) {
                 *colon = '\0';
@@ -396,9 +450,13 @@ int main(int argc, char *argv[])
         }
     }
 
+#ifdef _WIN32
+    p2p_set_ctrl_handler(&ctx->running);
+#else
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
-    pthread_mutex_init(&ctx->idr_mutex, NULL);
+#endif
+    p2p_mutex_init(&ctx->idr_mutex);
 
     fprintf(stderr, "[client] P2P AV Publisher starting\n");
     fprintf(stderr, "[client] signaling=%s room=%s peer=%s\n",
@@ -417,6 +475,7 @@ int main(int argc, char *argv[])
             .on_peer_ice_state = on_ice_state,
             .on_peer_ice_candidate = on_ice_candidate,
             .on_peer_ice_gathering_done = on_ice_gathering_done,
+            .on_peer_data_recv = on_data_recv,
         },
         .user_data = ctx
     };
@@ -454,7 +513,7 @@ int main(int argc, char *argv[])
     /* Main loop */
     ctx->running = 1;
     while (ctx->running) {
-        usleep(100000); /* 100ms idle */
+        p2p_sleep_ms(100);
     }
 
     fprintf(stderr, "[client] shutting down...\n");
@@ -473,11 +532,15 @@ int main(int argc, char *argv[])
     p2p_engine_stop(&ctx->engine);
     p2p_engine_destroy(&ctx->engine);
 
-    pthread_mutex_lock(&ctx->idr_mutex);
+    p2p_mutex_lock(&ctx->idr_mutex);
     free(ctx->idr_cache);
     ctx->idr_cache = NULL;
-    pthread_mutex_unlock(&ctx->idr_mutex);
-    pthread_mutex_destroy(&ctx->idr_mutex);
+    p2p_mutex_unlock(&ctx->idr_mutex);
+    p2p_mutex_destroy(&ctx->idr_mutex);
+
+#ifdef _WIN32
+    p2p_net_cleanup();
+#endif
 
     fprintf(stderr, "[client] done\n");
     return 0;

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# build.sh -- Unified build script for libp2pchannel
+# build.sh -- Unified build script for libp2pchannel (Linux & Windows)
 #
 # All build artifacts go into the top-level build/ directory:
 #   build/
@@ -30,7 +30,30 @@ BUILD_DIR="$PROJECT_DIR/build"
 
 INSTALL_DEPS=false
 CLEAN=false
-JOBS="$(nproc 2>/dev/null || echo 4)"
+
+# ---- Platform detection ----
+detect_platform() {
+    case "$(uname -s)" in
+        Linux*)         P2P_OS=linux ;;
+        MINGW*|MSYS*)   P2P_OS=windows ;;
+        CYGWIN*)        P2P_OS=windows ;;
+        Darwin*)        P2P_OS=macos ;;
+        *)              P2P_OS=linux ;;
+    esac
+}
+detect_platform
+
+if [[ "$P2P_OS" == "windows" ]]; then
+    EXE_EXT=".exe"
+    LIB_PREFIX=""
+    STATIC_LIB_EXT=".lib"
+    JOBS="${NUMBER_OF_PROCESSORS:-4}"
+else
+    EXE_EXT=""
+    LIB_PREFIX="lib"
+    STATIC_LIB_EXT=".a"
+    JOBS="$(nproc 2>/dev/null || echo 4)"
+fi
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -40,15 +63,19 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             echo "Usage: $0 [--install-deps] [--clean] [--jobs N]"
             echo ""
-            echo "  --install-deps   Install system dependencies via apt"
+            echo "  --install-deps   Install system dependencies (Linux: apt, Windows: manual)"
             echo "  --clean          Remove build/ and rebuild from scratch"
-            echo "  --jobs N         Parallel build jobs (default: $(nproc))"
+            echo "  --jobs N         Parallel build jobs (default: $JOBS)"
+            echo ""
+            echo "Detected platform: $P2P_OS"
             exit 0 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
 
 log() { echo -e "\033[1;32m[build]\033[0m $*"; }
+
+log "Platform: $P2P_OS"
 
 # ============================================================
 # Step 0: Clean
@@ -64,13 +91,23 @@ mkdir -p "$BUILD_DIR"
 # Step 1: Install system dependencies
 # ============================================================
 if $INSTALL_DEPS; then
-    log "Installing system dependencies..."
-    sudo apt-get update -qq
-    sudo apt-get install -y -qq \
-        build-essential cmake pkg-config git golang \
-        libavcodec-dev libavutil-dev libswscale-dev libswresample-dev \
-        libsdl2-dev libasound2-dev v4l-utils
-    log "Dependencies installed."
+    if [[ "$P2P_OS" == "linux" ]]; then
+        log "Installing system dependencies (apt)..."
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq \
+            build-essential cmake pkg-config git golang \
+            libavcodec-dev libavutil-dev libswscale-dev libswresample-dev \
+            libsdl2-dev libasound2-dev v4l-utils
+        log "Dependencies installed."
+    elif [[ "$P2P_OS" == "windows" ]]; then
+        log "Windows: auto-install not supported. Please install manually:"
+        log "  - Visual Studio / MSYS2 / MinGW toolchain"
+        log "  - CMake (cmake.org)"
+        log "  - Go (go.dev)"
+        log "  - FFmpeg dev libraries (vcpkg or manual)"
+        log "  - SDL2 dev libraries (vcpkg or manual)"
+        log "  - pkg-config (via MSYS2 or vcpkg)"
+    fi
 fi
 
 # ============================================================
@@ -79,7 +116,9 @@ fi
 BORINGSSL_SRC="$PROJECT_DIR/xquic/third_party/boringssl"
 BORINGSSL_BUILD="$BUILD_DIR/boringssl"
 
-if [[ ! -f "$BORINGSSL_BUILD/libssl.a" ]]; then
+BORINGSSL_SSL_LIB="$BORINGSSL_BUILD/${LIB_PREFIX}ssl${STATIC_LIB_EXT}"
+
+if [[ ! -f "$BORINGSSL_SSL_LIB" ]]; then
     log "Building BoringSSL..."
 
     if [[ ! -d "$BORINGSSL_SRC" ]]; then
@@ -101,13 +140,16 @@ fi
 XQUIC_SRC="$PROJECT_DIR/xquic"
 XQUIC_BUILD="$BUILD_DIR/xquic"
 
-if [[ ! -f "$XQUIC_BUILD/libxquic-static.a" ]]; then
+XQUIC_LIB="$XQUIC_BUILD/${LIB_PREFIX}xquic-static${STATIC_LIB_EXT}"
+
+if [[ ! -f "$XQUIC_LIB" ]]; then
     log "Building xquic..."
+    BORINGSSL_CRYPTO_LIB="$BORINGSSL_BUILD/${LIB_PREFIX}crypto${STATIC_LIB_EXT}"
     cmake -B "$XQUIC_BUILD" -S "$XQUIC_SRC" \
         -DSSL_TYPE=boringssl \
         -DSSL_PATH="$BORINGSSL_SRC" \
         -DSSL_INC_PATH="$BORINGSSL_SRC/include" \
-        -DSSL_LIB_PATH="$BORINGSSL_BUILD/libssl.a;$BORINGSSL_BUILD/libcrypto.a" \
+        -DSSL_LIB_PATH="$BORINGSSL_SSL_LIB;$BORINGSSL_CRYPTO_LIB" \
         -DCMAKE_BUILD_TYPE=Release \
         -DXQC_ENABLE_TESTING=OFF
     cmake --build "$XQUIC_BUILD" --target xquic-static -j"$JOBS"
@@ -133,10 +175,11 @@ log "Main project built."
 # Step 5: Build Go signaling server -> build/signaling-server
 # ============================================================
 SIGNALING_DIR="$PROJECT_DIR/signaling-server"
+SIGNALING_BIN="$BUILD_DIR/signaling-server${EXE_EXT}"
 if [[ -f "$SIGNALING_DIR/main.go" ]]; then
     log "Building signaling server..."
-    (cd "$SIGNALING_DIR" && go build -o "$BUILD_DIR/signaling-server" .)
-    log "Signaling server built -> $BUILD_DIR/signaling-server"
+    (cd "$SIGNALING_DIR" && go build -o "$SIGNALING_BIN" .)
+    log "Signaling server built -> $SIGNALING_BIN"
 else
     log "Signaling server source not found, skipping."
 fi
@@ -145,15 +188,17 @@ fi
 # Summary
 # ============================================================
 log ""
-log "Build complete. Output:"
+log "Build complete ($P2P_OS). Output:"
 log "  $BUILD_DIR/"
-log "    boringssl/libssl.a          BoringSSL"
-log "    boringssl/libcrypto.a"
-log "    xquic/libxquic-static.a     xquic"
-log "    p2p/p2p_client              Publisher"
-log "    p2p/p2p_peer                Subscriber"
-log "    signaling-server            Signaling server"
-[[ -f "$BUILD_DIR/tests/test_signaling" ]] && \
-log "    tests/test_signaling        Test"
-[[ -f "$BUILD_DIR/tests/test_ice_connectivity" ]] && \
-log "    tests/test_ice_connectivity Test"
+log "    boringssl/${LIB_PREFIX}ssl${STATIC_LIB_EXT}          BoringSSL"
+log "    boringssl/${LIB_PREFIX}crypto${STATIC_LIB_EXT}"
+log "    xquic/${LIB_PREFIX}xquic-static${STATIC_LIB_EXT}     xquic"
+log "    p2p/p2p_client${EXE_EXT}              Publisher"
+if [[ "$P2P_OS" == "linux" ]]; then
+    log "    p2p/p2p_peer                Subscriber"
+fi
+log "    signaling-server${EXE_EXT}            Signaling server"
+[[ -f "$BUILD_DIR/tests/test_signaling${EXE_EXT}" ]] && \
+log "    tests/test_signaling${EXE_EXT}        Test"
+[[ -f "$BUILD_DIR/tests/test_ice_connectivity${EXE_EXT}" ]] && \
+log "    tests/test_ice_connectivity${EXE_EXT} Test"
