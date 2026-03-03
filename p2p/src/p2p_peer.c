@@ -40,6 +40,7 @@ typedef struct {
     char signaling_addr[256];
     char room_id[64];
     char peer_id[64];
+    char token[1024];
     char stun_host[256];
     uint16_t stun_port;
 
@@ -420,9 +421,10 @@ int main(int argc, char *argv[])
     av_log_set_level(AV_LOG_FATAL);
 
     /* Defaults */
-    strcpy(ctx->signaling_addr, "127.0.0.1:8080");
+    strcpy(ctx->signaling_addr, "127.0.0.1:8443");
     strcpy(ctx->room_id, "test-room");
     strcpy(ctx->peer_id, "sub1");
+    ctx->token[0] = '\0';
     strcpy(ctx->stun_host, "127.0.0.1");
     ctx->stun_port = 3478;
 
@@ -430,17 +432,19 @@ int main(int argc, char *argv[])
         {"signaling", required_argument, NULL, 's'},
         {"room",      required_argument, NULL, 'r'},
         {"peer-id",   required_argument, NULL, 'p'},
+        {"token",     required_argument, NULL, 'T'},
         {"stun",      required_argument, NULL, 't'},
         {"help",      no_argument,       NULL, 'h'},
         {NULL, 0, NULL, 0}
     };
 
     int opt;
-    while ((opt = p2p_getopt_long(argc, argv, "s:r:p:t:h", long_opts, NULL)) != -1) {
+    while ((opt = p2p_getopt_long(argc, argv, "s:r:p:T:t:h", long_opts, NULL)) != -1) {
         switch (opt) {
         case 's': snprintf(ctx->signaling_addr, sizeof(ctx->signaling_addr), "%s", p2p_optarg); break;
         case 'r': snprintf(ctx->room_id, sizeof(ctx->room_id), "%s", p2p_optarg); break;
         case 'p': snprintf(ctx->peer_id, sizeof(ctx->peer_id), "%s", p2p_optarg); break;
+        case 'T': snprintf(ctx->token, sizeof(ctx->token), "%s", p2p_optarg); break;
         case 't': {
             char tmp[256];
             snprintf(tmp, sizeof(tmp), "%s", p2p_optarg);
@@ -518,6 +522,7 @@ int main(int argc, char *argv[])
     p2p_signaling_config_t scfg = {
         .server_url = ctx->signaling_addr,
         .peer_id = ctx->peer_id,
+        .token = ctx->token[0] ? ctx->token : NULL,
         .callbacks = {
             .on_connected = on_sig_connected,
             .on_disconnected = on_sig_disconnected,

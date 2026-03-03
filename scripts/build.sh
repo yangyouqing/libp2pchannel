@@ -113,7 +113,7 @@ fi
 # ============================================================
 # Step 2: Build BoringSSL -> build/boringssl/
 # ============================================================
-BORINGSSL_SRC="$PROJECT_DIR/xquic/third_party/boringssl"
+BORINGSSL_SRC="$PROJECT_DIR/third_party/xquic/third_party/boringssl"
 BORINGSSL_BUILD="$BUILD_DIR/boringssl"
 
 BORINGSSL_SSL_LIB="$BORINGSSL_BUILD/${LIB_PREFIX}ssl${STATIC_LIB_EXT}"
@@ -123,7 +123,7 @@ if [[ ! -f "$BORINGSSL_SSL_LIB" ]]; then
 
     if [[ ! -d "$BORINGSSL_SRC" ]]; then
         log "Cloning BoringSSL..."
-        mkdir -p "$PROJECT_DIR/xquic/third_party"
+        mkdir -p "$PROJECT_DIR/third_party/xquic/third_party"
         git clone --depth 1 https://boringssl.googlesource.com/boringssl "$BORINGSSL_SRC"
     fi
 
@@ -137,7 +137,7 @@ fi
 # ============================================================
 # Step 3: Build xquic -> build/xquic/
 # ============================================================
-XQUIC_SRC="$PROJECT_DIR/xquic"
+XQUIC_SRC="$PROJECT_DIR/third_party/xquic"
 XQUIC_BUILD="$BUILD_DIR/xquic"
 
 XQUIC_LIB="$XQUIC_BUILD/${LIB_PREFIX}xquic-static${STATIC_LIB_EXT}"

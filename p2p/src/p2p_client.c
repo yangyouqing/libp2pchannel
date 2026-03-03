@@ -26,6 +26,7 @@ typedef struct {
     char signaling_addr[256];
     char room_id[64];
     char peer_id[64];
+    char token[1024];
     char video_dev[128];
     char audio_dev[128];
     char stun_host[256];
@@ -394,9 +395,10 @@ int main(int argc, char *argv[])
 #endif
 
     /* Defaults */
-    strcpy(ctx->signaling_addr, "127.0.0.1:8080");
+    strcpy(ctx->signaling_addr, "127.0.0.1:8443");
     strcpy(ctx->room_id, "test-room");
     strcpy(ctx->peer_id, "pub1");
+    ctx->token[0] = '\0';
 #ifdef _WIN32
     strcpy(ctx->video_dev, "Integrated Camera");
     strcpy(ctx->audio_dev, "Microphone");
@@ -413,6 +415,7 @@ int main(int argc, char *argv[])
         {"signaling", 1, NULL, 's'},
         {"room",      1, NULL, 'r'},
         {"peer-id",   1, NULL, 'p'},
+        {"token",     1, NULL, 'T'},
         {"video-dev", 1, NULL, 'v'},
         {"audio-dev", 1, NULL, 'a'},
         {"stun",      1, NULL, 't'},
@@ -423,11 +426,12 @@ int main(int argc, char *argv[])
     };
 
     int opt;
-    while ((opt = p2p_getopt_long(argc, argv, "s:r:p:v:a:t:c:k:h", long_opts, NULL)) != -1) {
+    while ((opt = p2p_getopt_long(argc, argv, "s:r:p:T:v:a:t:c:k:h", long_opts, NULL)) != -1) {
         switch (opt) {
         case 's': snprintf(ctx->signaling_addr, sizeof(ctx->signaling_addr), "%s", p2p_optarg); break;
         case 'r': snprintf(ctx->room_id, sizeof(ctx->room_id), "%s", p2p_optarg); break;
         case 'p': snprintf(ctx->peer_id, sizeof(ctx->peer_id), "%s", p2p_optarg); break;
+        case 'T': snprintf(ctx->token, sizeof(ctx->token), "%s", p2p_optarg); break;
         case 'v': snprintf(ctx->video_dev, sizeof(ctx->video_dev), "%s", p2p_optarg); break;
         case 'a': snprintf(ctx->audio_dev, sizeof(ctx->audio_dev), "%s", p2p_optarg); break;
         case 'c': snprintf(ctx->ssl_cert, sizeof(ctx->ssl_cert), "%s", p2p_optarg); break;
@@ -490,6 +494,7 @@ int main(int argc, char *argv[])
     p2p_signaling_config_t scfg = {
         .server_url = ctx->signaling_addr,
         .peer_id = ctx->peer_id,
+        .token = ctx->token[0] ? ctx->token : NULL,
         .callbacks = {
             .on_connected = on_sig_connected,
             .on_disconnected = on_sig_disconnected,

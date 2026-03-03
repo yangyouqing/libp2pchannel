@@ -30,15 +30,43 @@ Publisher (p2p_client)                    Subscriber (p2p_peer)
              └──────────► (Go, TCP) ◄─────────────┘
 ```
 
+## Project Structure
+
+```
+libp2pchannel/
+├── CMakeLists.txt              # Root build configuration
+├── README.md
+├── LICENSE
+├── cmake/                      # CMake toolchains & cross-compilation support
+│   ├── mingw-w64-x86_64.cmake  #   MinGW-w64 toolchain file
+│   └── mingw-compat/           #   POSIX→Winsock header wrappers
+├── p2p/                        # Core P2P library (C11)
+│   ├── include/                #   Public headers
+│   └── src/                    #   p2p_client.c, p2p_peer.c, adapters, codecs
+├── signaling-server/           # Go signaling server (TCP JSON)
+├── scripts/                    # Build & deployment scripts
+│   ├── build.sh                #   Native build (Linux / MSYS2)
+│   ├── build_win.sh            #   Cross-compile to Windows (MinGW-w64)
+│   ├── deploy_client.sh        #   Deploy publisher
+│   └── deploy_peer.sh          #   Deploy subscriber
+├── tests/                      # Integration tests
+├── third_party/                # External dependencies
+│   ├── libjuice/               #   ICE / STUN / TURN agent
+│   └── xquic/                  #   QUIC protocol (+ BoringSSL)
+├── conf/                       # Configuration templates
+├── docs/                       # Design documents
+├── build/                      # Native build output (gitignored)
+└── build_win/                  # Windows cross-build output (gitignored)
+```
+
 ## Components
 
 | Component | Description |
 |-----------|-------------|
 | **p2p/** | Core P2P adapter library — bridges libjuice ICE and xquic QUIC |
-| **libjuice/** | ICE agent for STUN/TURN NAT traversal |
-| **xquic/** | QUIC protocol implementation (requires BoringSSL) |
+| **third_party/libjuice/** | ICE agent for STUN/TURN NAT traversal |
+| **third_party/xquic/** | QUIC protocol implementation (requires BoringSSL) |
 | **signaling-server/** | Go TCP server for SDP/candidate exchange and TURN credential distribution |
-| **coturn/** | TURN relay server for fallback connectivity |
 | **scripts/** | Build, deployment, and test scripts |
 
 ## Quick Start
@@ -53,7 +81,7 @@ sudo apt-get install -y \
     libsdl2-dev libasound2-dev v4l-utils
 ```
 
-### Build
+### Build (Linux)
 
 All build artifacts go into the `build/` directory:
 
@@ -68,17 +96,39 @@ All build artifacts go into the `build/` directory:
 ./scripts/build.sh --clean
 ```
 
-Build output:
+### Cross-compile for Windows
+
+Cross-compile from Linux to Windows x86_64 using MinGW-w64:
+
+```bash
+# First time (installs mingw-w64, downloads FFmpeg/SDL2 dev libs)
+./scripts/build_win.sh --install-deps --clean
+
+# Subsequent builds
+./scripts/build_win.sh
+```
+
+Output in `build_win/bin/` — copy to Windows machine:
+
+```
+build_win/bin/
+  p2p_client.exe           # Publisher
+  p2p_peer.exe             # Subscriber
+  signaling-server.exe     # Signaling server
+  *.dll                    # Runtime DLLs (FFmpeg, SDL2, MinGW runtime)
+```
+
+### Build output (native)
 
 ```
 build/
-  boringssl/libssl.a, libcrypto.a     # BoringSSL
-  xquic/libxquic-static.a             # xquic
-  libjuice/libjuice.a                 # libjuice
-  p2p/p2p_client                      # Publisher executable
-  p2p/p2p_peer                        # Subscriber executable
-  signaling-server                    # Go signaling server
-  tests/test_signaling                # Tests
+  boringssl/libssl.a, libcrypto.a
+  xquic/libxquic-static.a
+  third_party/libjuice/libjuice.a
+  p2p/p2p_client
+  p2p/p2p_peer
+  signaling-server
+  tests/test_signaling
   tests/test_ice_connectivity
 ```
 

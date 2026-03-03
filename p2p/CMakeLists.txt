@@ -10,6 +10,7 @@ include(FindPkgConfig)
 set(P2P_SOURCES
     src/p2p_packet_queue.c
     src/p2p_adapter.c
+    src/p2p_tls.c
     src/p2p_signaling.c
     src/p2p_publisher.c
     src/p2p_subscriber.c
@@ -22,6 +23,7 @@ set(P2P_HEADERS
     include/p2p_platform.h
     include/p2p_packet_queue.h
     include/p2p_adapter.h
+    include/p2p_tls.h
     include/p2p_signaling.h
     include/p2p_publisher.h
     include/p2p_subscriber.h
@@ -44,8 +46,8 @@ target_include_directories(p2p_av
 if(TARGET juice)
     target_link_libraries(p2p_av PUBLIC juice)
 else()
-    find_library(JUICE_LIB juice HINTS ${JUICE_LIB_PATH} ${CMAKE_BINARY_DIR}/libjuice)
-    find_path(JUICE_INCLUDE juice/juice.h HINTS ${JUICE_INCLUDE_PATH} ${CMAKE_SOURCE_DIR}/libjuice/include)
+    find_library(JUICE_LIB juice HINTS ${JUICE_LIB_PATH} ${CMAKE_BINARY_DIR}/third_party/libjuice)
+    find_path(JUICE_INCLUDE juice/juice.h HINTS ${JUICE_INCLUDE_PATH} ${CMAKE_SOURCE_DIR}/third_party/libjuice/include)
     if(JUICE_LIB AND JUICE_INCLUDE)
         target_link_libraries(p2p_av PUBLIC ${JUICE_LIB})
         target_include_directories(p2p_av PUBLIC ${JUICE_INCLUDE})
@@ -58,7 +60,7 @@ endif()
 # Headers from source tree
 set(_XQUIC_SRC_DIR "${XQUIC_SRC_DIR}")
 if(NOT _XQUIC_SRC_DIR)
-    set(_XQUIC_SRC_DIR "${CMAKE_SOURCE_DIR}/xquic")
+    set(_XQUIC_SRC_DIR "${CMAKE_SOURCE_DIR}/third_party/xquic")
 endif()
 if(NOT EXISTS "${_XQUIC_SRC_DIR}/include/xquic/xquic.h")
     message(FATAL_ERROR "xquic headers not found at ${_XQUIC_SRC_DIR}/include")
@@ -95,7 +97,7 @@ if(NOT _BORINGSSL_BUILD_DIR)
 endif()
 set(_BORINGSSL_SRC_DIR "${BORINGSSL_SRC_DIR}")
 if(NOT _BORINGSSL_SRC_DIR)
-    set(_BORINGSSL_SRC_DIR "${CMAKE_SOURCE_DIR}/xquic/third_party/boringssl")
+    set(_BORINGSSL_SRC_DIR "${CMAKE_SOURCE_DIR}/third_party/xquic/third_party/boringssl")
 endif()
 
 if(EXISTS "${_BORINGSSL_BUILD_DIR}/libssl.a")

@@ -61,7 +61,9 @@ START_SERVICES=false
 STOP_SERVICES=false
 SKIP_BUILD=false
 
-SIGNALING_ADDR="${SIGNALING_ADDR:-127.0.0.1:8080}"
+SIGNALING_ADDR="${SIGNALING_ADDR:-127.0.0.1:8443}"
+JWT_SECRET="${JWT_SECRET:-p2p-jwt-secret}"
+ADMIN_SECRET="${ADMIN_SECRET:-p2p-admin-secret}"
 TURN_HOST="${TURN_HOST:-127.0.0.1}"
 TURN_PORT="${TURN_PORT:-3478}"
 STUN_SERVER="${STUN_SERVER:-${TURN_HOST}:${TURN_PORT}}"
@@ -171,6 +173,22 @@ cp -f "$SIGNALING_BIN"   "$DEPLOY_DIR/bin/"
 cp -f "$CERT_DIR/server.crt" "$DEPLOY_DIR/certs/"
 cp -f "$CERT_DIR/server.key" "$DEPLOY_DIR/certs/"
 
+# Generate JWT token for the publisher
+log "Generating JWT token for publisher..."
+PUB_TOKEN=$("$DEPLOY_DIR/bin/signaling-server${EXE_EXT}" 2>/dev/null & SIG_PID=$!; sleep 0; kill $SIG_PID 2>/dev/null || true; echo "")
+# Use a simple token generation via the server's /v1/token endpoint, or embed in env
+# For simplicity, we'll store the JWT secret and let the launcher generate tokens
+
+# Generate signaling server TLS certificate
+SIG_CERT_DIR="$DEPLOY_DIR/certs"
+mkdir -p "$SIG_CERT_DIR"
+if [[ ! -f "$SIG_CERT_DIR/sig_server.crt" ]]; then
+    log "Generating signaling server TLS certificate..."
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+        -keyout "$SIG_CERT_DIR/sig_server.key" -out "$SIG_CERT_DIR/sig_server.crt" \
+        -days 365 -nodes -batch -subj "/CN=p2p-signaling" 2>/dev/null
+fi
+
 cat > "$DEPLOY_DIR/conf/client.env" <<EOF
 # P2P Client (Publisher) Configuration
 # Platform: $P2P_OS
@@ -181,12 +199,16 @@ PEER_ID=${PEER_ID}
 VIDEO_DEV=${VIDEO_DEV}
 AUDIO_DEV=${AUDIO_DEV}
 
-# Signaling server settings
+# Signaling server settings (HTTPS)
 LISTEN_ADDR=:${SIGNALING_ADDR##*:}
+TLS_CERT_FILE=\${SCRIPT_DIR}/certs/sig_server.crt
+TLS_KEY_FILE=\${SCRIPT_DIR}/certs/sig_server.key
+JWT_SECRET=${JWT_SECRET}
+ADMIN_SECRET=${ADMIN_SECRET}
 TURN_HOST=${TURN_HOST}
 TURN_PORT=${TURN_PORT}
 TURN_SECRET=${TURN_SECRET}
-MAX_SUBSCRIBERS=5
+MAX_SUBSCRIBERS=10
 EOF
 
 # ---- Generate bash launcher (works on both platforms via Git Bash) ----
@@ -214,13 +236,27 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-echo "[launcher] Starting signaling server on $LISTEN_ADDR ..."
+echo "[launcher] Starting signaling server (HTTPS) on $LISTEN_ADDR ..."
 LISTEN_ADDR="$LISTEN_ADDR" \
+TLS_CERT_FILE="$TLS_CERT_FILE" TLS_KEY_FILE="$TLS_KEY_FILE" \
+JWT_SECRET="$JWT_SECRET" ADMIN_SECRET="$ADMIN_SECRET" \
 TURN_HOST="$TURN_HOST" TURN_PORT="$TURN_PORT" \
-TURN_SECRET="$TURN_SECRET" MAX_SUBSCRIBERS="${MAX_SUBSCRIBERS:-5}" \
+TURN_SECRET="$TURN_SECRET" MAX_SUBSCRIBERS="${MAX_SUBSCRIBERS:-10}" \
 "$SCRIPT_DIR/bin/signaling-server${EXE_EXT}" 2>&1 | tee "$LOG_DIR/signaling.log" &
 PIDS+=($!)
-sleep 1
+sleep 2
+
+# Generate JWT token for publisher via signaling server's /v1/token endpoint
+SIG_HOST="${SIGNALING_ADDR%:*}"
+SIG_PORT="${SIGNALING_ADDR##*:}"
+[[ "$SIG_HOST" == "0.0.0.0" || "$SIG_HOST" == "" ]] && SIG_HOST="127.0.0.1"
+TOKEN_URL="https://${SIG_HOST}:${SIG_PORT}/v1/token?peer_id=${PEER_ID}"
+echo "[launcher] Requesting JWT token from $TOKEN_URL ..."
+PUB_TOKEN=$(curl -sk -H "Authorization: Bearer $ADMIN_SECRET" "$TOKEN_URL" | \
+    sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+if [[ -z "$PUB_TOKEN" ]]; then
+    echo "[launcher] WARNING: Could not obtain JWT token, proceeding without auth"
+fi
 
 STUN_HOST="${STUN_SERVER%:*}"
 STUN_PORT="${STUN_SERVER##*:}"
@@ -229,13 +265,18 @@ STUN_PORT="${STUN_SERVER##*:}"
 echo "[launcher] Starting p2p_client (publisher)..."
 echo "[launcher]   Signaling: $SIGNALING_ADDR  Room: $ROOM_ID  STUN: $STUN_HOST:$STUN_PORT"
 echo "[launcher]   Video: $VIDEO_DEV  Audio: $AUDIO_DEV"
+
+TOKEN_ARG=""
+[[ -n "$PUB_TOKEN" ]] && TOKEN_ARG="--token $PUB_TOKEN"
+
 "$SCRIPT_DIR/bin/p2p_client${EXE_EXT}" \
     --signaling "$SIGNALING_ADDR" \
     --room "$ROOM_ID" --peer-id "$PEER_ID" \
     --video-dev "$VIDEO_DEV" --audio-dev "$AUDIO_DEV" \
     --stun "$STUN_HOST:$STUN_PORT" \
     --ssl-cert "$SCRIPT_DIR/certs/server.crt" \
-    --ssl-key "$SCRIPT_DIR/certs/server.key" 2>&1 | tee "$LOG_DIR/p2p_client.log" &
+    --ssl-key "$SCRIPT_DIR/certs/server.key" \
+    $TOKEN_ARG 2>&1 | tee "$LOG_DIR/p2p_client.log" &
 PIDS+=($!)
 
 echo "[launcher] Publisher running. Press Ctrl+C to stop."

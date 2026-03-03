@@ -18,18 +18,18 @@ option(BUILD_TESTS    "Build end-to-end test programs" ON)
 # These variables tell p2p/CMakeLists.txt where to find them.
 set(BORINGSSL_BUILD_DIR "${CMAKE_BINARY_DIR}/boringssl" CACHE PATH
     "Path to BoringSSL build directory containing libssl.a and libcrypto.a")
-set(BORINGSSL_SRC_DIR "${CMAKE_SOURCE_DIR}/xquic/third_party/boringssl" CACHE PATH
+set(BORINGSSL_SRC_DIR "${CMAKE_SOURCE_DIR}/third_party/xquic/third_party/boringssl" CACHE PATH
     "Path to BoringSSL source directory for headers")
 set(XQUIC_BUILD_DIR "${CMAKE_BINARY_DIR}/xquic" CACHE PATH
     "Path to xquic build directory containing libxquic-static.a")
-set(XQUIC_SRC_DIR "${CMAKE_SOURCE_DIR}/xquic" CACHE PATH
+set(XQUIC_SRC_DIR "${CMAKE_SOURCE_DIR}/third_party/xquic" CACHE PATH
     "Path to xquic source directory for headers")
 
 # === libjuice ===
 if(BUILD_LIBJUICE)
     set(NO_TESTS ON CACHE BOOL "" FORCE)
     set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-    add_subdirectory(libjuice)
+    add_subdirectory(third_party/libjuice)
 endif()
 
 # === coturn ===

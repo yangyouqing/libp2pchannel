@@ -1,56 +1,95 @@
 package main
 
 import (
+	"context"
 	"log"
-	"net"
+	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
+	"time"
 
+	"github.com/libp2pchannel/signaling-server/auth"
 	"github.com/libp2pchannel/signaling-server/config"
 	"github.com/libp2pchannel/signaling-server/handler"
+	"github.com/libp2pchannel/signaling-server/middleware"
 )
 
 func main() {
 	cfg := config.LoadFromEnv()
 
-	log.Printf("P2P Signaling Server starting on %s", cfg.ListenAddr)
-	log.Printf("TURN server: %s:%d (realm: %s)", cfg.TURNServerHost, cfg.TURNServerPort, cfg.TURNRealm)
+	log.Printf("P2P Signaling Server (HTTPS) starting on %s", cfg.ListenAddr)
+	log.Printf("TLS cert: %s, key: %s", cfg.TLSCertFile, cfg.TLSKeyFile)
+	log.Printf("TURN server: %s:%d", cfg.TURNServerHost, cfg.TURNServerPort)
 	log.Printf("Max subscribers per room: %d", cfg.MaxSubscribers)
 
-	h := handler.NewSignalingHandler(cfg)
+	h := handler.NewHandler(cfg)
+	authMW := middleware.Auth(cfg.JWTSecret, cfg.AdminSecret)
 
-	listener, err := net.Listen("tcp", cfg.ListenAddr)
-	if err != nil {
-		log.Fatalf("Failed to listen on %s: %v", cfg.ListenAddr, err)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/signal", h.HandleSignal)
+	mux.HandleFunc("/v1/events", h.HandleSSE)
+
+	// Admin endpoints use prefix matching for path parameters
+	mux.HandleFunc("/v1/admin/peers/", h.HandleAdminPeerByID)
+	mux.HandleFunc("/v1/admin/peers", h.HandleAdminPeers)
+	mux.HandleFunc("/v1/admin/rooms/", h.HandleAdminRoomByID)
+	mux.HandleFunc("/v1/admin/rooms", h.HandleAdminRooms)
+
+	// Health check (no auth)
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"status":"ok"}`))
+	})
+
+	// Token generation endpoint (development/testing, admin-auth protected)
+	mux.HandleFunc("/v1/token", func(w http.ResponseWriter, r *http.Request) {
+		authHeader := r.Header.Get("Authorization")
+		if !strings.HasPrefix(authHeader, "Bearer ") ||
+			strings.TrimPrefix(authHeader, "Bearer ") != cfg.AdminSecret {
+			http.Error(w, `{"error":"admin auth required"}`, http.StatusUnauthorized)
+			return
+		}
+		peerID := r.URL.Query().Get("peer_id")
+		if peerID == "" {
+			http.Error(w, `{"error":"peer_id query param required"}`, http.StatusBadRequest)
+			return
+		}
+		token, err := auth.GenerateToken(peerID, cfg.JWTSecret, 24*time.Hour)
+		if err != nil {
+			http.Error(w, `{"error":"token generation failed"}`, http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"token":"` + token + `"}`))
+	})
+
+	wrapped := authMW(mux)
+
+	srv := &http.Server{
+		Addr:         cfg.ListenAddr,
+		Handler:      wrapped,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 0, // SSE needs unlimited write timeout
+		IdleTimeout:  120 * time.Second,
 	}
-	defer listener.Close()
 
 	// Graceful shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	shutdown := make(chan struct{})
 
 	go func() {
 		<-sigCh
 		log.Println("Shutting down...")
-		close(shutdown)
-		listener.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		srv.Shutdown(ctx)
 	}()
 
-	log.Printf("Signaling server listening on %s", cfg.ListenAddr)
+	log.Printf("Signaling server listening on %s (HTTPS)", cfg.ListenAddr)
 
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			select {
-			case <-shutdown:
-				return
-			default:
-				log.Printf("Accept error: %v", err)
-				continue
-			}
-		}
-		go h.HandleConnection(conn)
+	if err := srv.ListenAndServeTLS(cfg.TLSCertFile, cfg.TLSKeyFile); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("ListenAndServeTLS: %v", err)
 	}
 }

@@ -1,32 +1,52 @@
 package model
 
-const (
-	MsgCreateRoom      = 1
-	MsgJoinRoom        = 2
-	MsgLeaveRoom       = 3
-	MsgICEOffer        = 4
-	MsgICEAnswer       = 5
-	MsgICECandidate    = 6
-	MsgGatheringDone   = 7
-	MsgTurnCredentials = 8
-	MsgRoomInfo        = 9
-	MsgHeartbeat       = 10
-	MsgError           = 11
-	MsgPeerJoined      = 12
-	MsgPeerLeft        = 13
-)
+// SignalRequest is the JSON body sent by clients via POST /v1/signal.
+type SignalRequest struct {
+	Type       string   `json:"type"`
+	PeerID     string   `json:"peer_id"`
+	Token      string   `json:"token,omitempty"`
+	To         string   `json:"to,omitempty"`
+	RoomID     string   `json:"room_id,omitempty"`
+	SDP        string   `json:"sdp,omitempty"`
+	Candidate  string   `json:"candidate,omitempty"`
+	Candidates []string `json:"candidates,omitempty"`
+}
 
-type SignalMessage struct {
-	Type         int    `json:"type"`
-	From         string `json:"from"`
-	To           string `json:"to"`
-	Room         string `json:"room"`
-	SDP          string `json:"sdp,omitempty"`
-	Candidate    string `json:"candidate,omitempty"`
-	TurnUsername string `json:"turn_username,omitempty"`
-	TurnPassword string `json:"turn_password,omitempty"`
-	TurnServer   string `json:"turn_server,omitempty"`
-	TurnPort     uint16 `json:"turn_port,omitempty"`
-	TurnTTL      uint32 `json:"turn_ttl,omitempty"`
-	Error        string `json:"error,omitempty"`
+// SignalResponse is the JSON response returned by POST /v1/signal.
+type SignalResponse struct {
+	Type   string    `json:"type"`
+	RoomID string    `json:"room_id,omitempty"`
+	Error  string    `json:"error,omitempty"`
+	Turn   *TurnInfo `json:"turn,omitempty"`
+}
+
+// TurnInfo carries TURN server credentials.
+type TurnInfo struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+	Server   string `json:"server"`
+	Port     uint16 `json:"port"`
+	TTL      uint32 `json:"ttl"`
+}
+
+// SSEEvent is pushed to clients over the event stream.
+type SSEEvent struct {
+	Type string // SSE event: field
+	Data string // SSE data: field (JSON)
+}
+
+// PeerInfo is the admin API representation of a connected peer.
+type PeerInfo struct {
+	ID          string `json:"id"`
+	RoomID      string `json:"room_id,omitempty"`
+	Role        string `json:"role,omitempty"`
+	Online      bool   `json:"online"`
+	OnlineSince string `json:"online_since,omitempty"`
+}
+
+// RoomInfo is the admin API representation of a room.
+type RoomInfo struct {
+	ID          string   `json:"id"`
+	Publisher   string   `json:"publisher"`
+	Subscribers []string `json:"subscribers"`
 }

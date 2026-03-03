@@ -1,284 +1,338 @@
 package main
 
 import (
-	"encoding/binary"
+	"bufio"
 	"encoding/json"
-	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/libp2pchannel/signaling-server/auth"
 	"github.com/libp2pchannel/signaling-server/config"
 	"github.com/libp2pchannel/signaling-server/handler"
+	"github.com/libp2pchannel/signaling-server/middleware"
 	"github.com/libp2pchannel/signaling-server/model"
 )
 
-func sendMsg(t *testing.T, conn net.Conn, msg *model.SignalMessage) {
+func setupTestServer(t *testing.T, maxSubs int) (*httptest.Server, *config.Config) {
 	t.Helper()
-	data, err := json.Marshal(msg)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	lenBuf := make([]byte, 4)
-	binary.BigEndian.PutUint32(lenBuf, uint32(len(data)))
-	conn.Write(lenBuf)
-	conn.Write(data)
-}
-
-func recvMsg(t *testing.T, conn net.Conn) *model.SignalMessage {
-	t.Helper()
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-
-	lenBuf := make([]byte, 4)
-	if _, err := conn.Read(lenBuf); err != nil {
-		t.Fatalf("read len: %v", err)
-	}
-	msgLen := binary.BigEndian.Uint32(lenBuf)
-	data := make([]byte, msgLen)
-	n := 0
-	for n < int(msgLen) {
-		nn, err := conn.Read(data[n:])
-		if err != nil {
-			t.Fatalf("read data: %v", err)
-		}
-		n += nn
-	}
-
-	var msg model.SignalMessage
-	if err := json.Unmarshal(data[:n], &msg); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	return &msg
-}
-
-func TestSignalingEndToEnd(t *testing.T) {
 	cfg := config.DefaultConfig()
-	cfg.ListenAddr = "127.0.0.1:0"
+	cfg.MaxSubscribers = maxSubs
+	cfg.JWTSecret = "test-secret"
+	cfg.AdminSecret = "test-admin"
 
-	h := handler.NewSignalingHandler(cfg)
+	h := handler.NewHandler(cfg)
+	authMW := middleware.Auth(cfg.JWTSecret, cfg.AdminSecret)
 
-	listener, err := net.Listen("tcp", cfg.ListenAddr)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/signal", h.HandleSignal)
+	mux.HandleFunc("/v1/events", h.HandleSSE)
+	mux.HandleFunc("/v1/admin/peers/", h.HandleAdminPeerByID)
+	mux.HandleFunc("/v1/admin/peers", h.HandleAdminPeers)
+	mux.HandleFunc("/v1/admin/rooms/", h.HandleAdminRoomByID)
+	mux.HandleFunc("/v1/admin/rooms", h.HandleAdminRooms)
+
+	srv := httptest.NewServer(authMW(mux))
+	return srv, cfg
+}
+
+func genToken(t *testing.T, peerID, secret string) string {
+	t.Helper()
+	tok, err := auth.GenerateToken(peerID, secret, 1*time.Hour)
 	if err != nil {
-		t.Fatalf("listen: %v", err)
+		t.Fatalf("generate token: %v", err)
 	}
-	defer listener.Close()
+	return tok
+}
 
-	addr := listener.Addr().String()
-	t.Logf("Server listening on %s", addr)
+func postSignal(t *testing.T, baseURL string, req model.SignalRequest) model.SignalResponse {
+	t.Helper()
+	body, _ := json.Marshal(req)
+	resp, err := http.Post(baseURL+"/v1/signal", "application/json",
+		strings.NewReader(string(body)))
+	if err != nil {
+		t.Fatalf("POST /v1/signal: %v", err)
+	}
+	defer resp.Body.Close()
 
+	var sresp model.SignalResponse
+	json.NewDecoder(resp.Body).Decode(&sresp)
+	return sresp
+}
+
+// readSSEEvent reads a single SSE event from a bufio.Reader.
+func readSSEEvent(t *testing.T, reader *bufio.Reader, timeout time.Duration) (string, string) {
+	t.Helper()
+	eventType := ""
+	eventData := ""
+
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		for {
-			conn, err := listener.Accept()
+			line, err := reader.ReadString('\n')
 			if err != nil {
 				return
 			}
-			go h.HandleConnection(conn)
+			line = strings.TrimRight(line, "\r\n")
+			if line == "" {
+				if eventType != "" || eventData != "" {
+					return
+				}
+				continue
+			}
+			if strings.HasPrefix(line, "event: ") {
+				eventType = strings.TrimPrefix(line, "event: ")
+			} else if strings.HasPrefix(line, "data: ") {
+				eventData = strings.TrimPrefix(line, "data: ")
+			}
 		}
 	}()
 
-	// --- Publisher connects and creates room ---
-	pubConn, err := net.Dial("tcp", addr)
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		t.Fatalf("SSE event read timeout after %v", timeout)
+	}
+	return eventType, eventData
+}
+
+func TestCreateAndJoinRoom(t *testing.T) {
+	srv, cfg := setupTestServer(t, 5)
+	defer srv.Close()
+
+	pubToken := genToken(t, "publisher-1", cfg.JWTSecret)
+	subToken := genToken(t, "subscriber-1", cfg.JWTSecret)
+
+	// Connect SSE for publisher
+	pubSSEResp, err := http.Get(srv.URL + "/v1/events?peer_id=publisher-1&token=" + pubToken)
 	if err != nil {
-		t.Fatalf("pub connect: %v", err)
+		t.Fatalf("SSE connect: %v", err)
 	}
-	defer pubConn.Close()
+	defer pubSSEResp.Body.Close()
+	pubReader := bufio.NewReader(pubSSEResp.Body)
 
-	sendMsg(t, pubConn, &model.SignalMessage{
-		Type: model.MsgCreateRoom,
-		From: "publisher-1",
-		Room: "test-room",
+	// Publisher creates room
+	resp := postSignal(t, srv.URL, model.SignalRequest{
+		Type: "create_room", PeerID: "publisher-1", Token: pubToken, RoomID: "test-room",
 	})
-
-	roomInfo := recvMsg(t, pubConn)
-	if roomInfo.Type != model.MsgRoomInfo {
-		t.Fatalf("expected RoomInfo, got type %d", roomInfo.Type)
+	if resp.Type != "room_created" {
+		t.Fatalf("expected room_created, got %s: %s", resp.Type, resp.Error)
 	}
-	if roomInfo.Room != "test-room" {
-		t.Fatalf("expected room 'test-room', got '%s'", roomInfo.Room)
+	if resp.RoomID != "test-room" {
+		t.Fatalf("expected room_id test-room, got %s", resp.RoomID)
 	}
-	t.Logf("Room created: %s", roomInfo.Room)
+	t.Logf("Room created: %s", resp.RoomID)
 
-	// --- Subscriber connects and joins room ---
-	subConn, err := net.Dial("tcp", addr)
+	// Connect SSE for subscriber
+	subSSEResp, err := http.Get(srv.URL + "/v1/events?peer_id=subscriber-1&token=" + subToken)
 	if err != nil {
-		t.Fatalf("sub connect: %v", err)
+		t.Fatalf("SSE connect: %v", err)
 	}
-	defer subConn.Close()
+	defer subSSEResp.Body.Close()
 
-	sendMsg(t, subConn, &model.SignalMessage{
-		Type: model.MsgJoinRoom,
-		From: "subscriber-1",
-		Room: "test-room",
+	// Subscriber joins room
+	joinResp := postSignal(t, srv.URL, model.SignalRequest{
+		Type: "join_room", PeerID: "subscriber-1", Token: subToken, RoomID: "test-room",
+	})
+	if joinResp.Type != "joined" {
+		t.Fatalf("expected joined, got %s: %s", joinResp.Type, joinResp.Error)
+	}
+	if joinResp.Turn == nil {
+		t.Fatal("expected TURN credentials in join response")
+	}
+	t.Logf("Join response: TURN user=%s server=%s:%d",
+		joinResp.Turn.Username, joinResp.Turn.Server, joinResp.Turn.Port)
+
+	// Publisher should receive peer_joined via SSE
+	evtType, evtData := readSSEEvent(t, pubReader, 5*time.Second)
+
+	// The publisher may get turn_credentials first, then peer_joined
+	if evtType == "turn_credentials" {
+		t.Logf("Publisher got TURN creds first (expected)")
+		evtType, evtData = readSSEEvent(t, pubReader, 5*time.Second)
+	}
+	if evtType != "peer_joined" {
+		t.Fatalf("expected peer_joined SSE event, got %s", evtType)
+	}
+	t.Logf("Publisher SSE: %s = %s", evtType, evtData)
+}
+
+func TestICEForwarding(t *testing.T) {
+	srv, cfg := setupTestServer(t, 5)
+	defer srv.Close()
+
+	pubToken := genToken(t, "pub1", cfg.JWTSecret)
+	subToken := genToken(t, "sub1", cfg.JWTSecret)
+
+	// Connect SSE for both
+	pubSSEResp, _ := http.Get(srv.URL + "/v1/events?peer_id=pub1&token=" + pubToken)
+	defer pubSSEResp.Body.Close()
+	pubReader := bufio.NewReader(pubSSEResp.Body)
+
+	subSSEResp, _ := http.Get(srv.URL + "/v1/events?peer_id=sub1&token=" + subToken)
+	defer subSSEResp.Body.Close()
+	subReader := bufio.NewReader(subSSEResp.Body)
+
+	// Create + join
+	postSignal(t, srv.URL, model.SignalRequest{
+		Type: "create_room", PeerID: "pub1", Token: pubToken, RoomID: "r1",
+	})
+	postSignal(t, srv.URL, model.SignalRequest{
+		Type: "join_room", PeerID: "sub1", Token: subToken, RoomID: "r1",
 	})
 
-	// Subscriber should receive TURN credentials
-	turnCreds := recvMsg(t, subConn)
-	if turnCreds.Type != model.MsgTurnCredentials {
-		t.Fatalf("expected TurnCredentials, got type %d", turnCreds.Type)
-	}
-	if turnCreds.TurnServer == "" {
-		t.Fatal("TURN server not set")
-	}
-	if turnCreds.TurnUsername == "" || turnCreds.TurnPassword == "" {
-		t.Fatal("TURN credentials empty")
-	}
-	t.Logf("TURN credentials: user=%s server=%s:%d ttl=%d",
-		turnCreds.TurnUsername, turnCreds.TurnServer, turnCreds.TurnPort, turnCreds.TurnTTL)
+	// Drain publisher SSE (turn_credentials + peer_joined)
+	readSSEEvent(t, pubReader, 5*time.Second)
+	readSSEEvent(t, pubReader, 5*time.Second)
 
-	// Publisher should receive PeerJoined + TURN credentials
-	pubMsg1 := recvMsg(t, pubConn)
-	pubMsg2 := recvMsg(t, pubConn)
-
-	var peerJoined, pubTurn *model.SignalMessage
-	for _, m := range []*model.SignalMessage{pubMsg1, pubMsg2} {
-		switch m.Type {
-		case model.MsgPeerJoined:
-			peerJoined = m
-		case model.MsgTurnCredentials:
-			pubTurn = m
-		}
+	// Publisher sends ICE offer to subscriber
+	resp := postSignal(t, srv.URL, model.SignalRequest{
+		Type: "ice_offer", PeerID: "pub1", Token: pubToken,
+		To: "sub1", RoomID: "r1", SDP: "v=0\r\ntest-offer\r\n",
+	})
+	if resp.Type != "ok" {
+		t.Fatalf("expected ok, got %s: %s", resp.Type, resp.Error)
 	}
 
-	if peerJoined == nil || peerJoined.From != "subscriber-1" {
-		t.Fatal("publisher did not receive PeerJoined")
+	// Subscriber should receive it via SSE
+	evtType, evtData := readSSEEvent(t, subReader, 5*time.Second)
+	if evtType != "ice_offer" {
+		t.Fatalf("expected ice_offer, got %s", evtType)
 	}
-	t.Logf("Publisher notified of subscriber: %s", peerJoined.From)
+	t.Logf("Subscriber got: %s = %s", evtType, evtData)
 
-	if pubTurn == nil {
-		t.Fatal("publisher did not receive TURN credentials")
+	// Subscriber sends ICE answer
+	resp = postSignal(t, srv.URL, model.SignalRequest{
+		Type: "ice_answer", PeerID: "sub1", Token: subToken,
+		To: "pub1", RoomID: "r1", SDP: "v=0\r\ntest-answer\r\n",
+	})
+	if resp.Type != "ok" {
+		t.Fatalf("expected ok, got %s", resp.Type)
 	}
 
-	// --- ICE Offer/Answer exchange ---
-	sendMsg(t, pubConn, &model.SignalMessage{
-		Type: model.MsgICEOffer,
-		From: "publisher-1",
-		To:   "subscriber-1",
-		Room: "test-room",
-		SDP:  "v=0\r\na=ice-ufrag:AAAA\r\na=ice-pwd:BBBBBBBB\r\n",
+	evtType, _ = readSSEEvent(t, pubReader, 5*time.Second)
+	if evtType != "ice_answer" {
+		t.Fatalf("expected ice_answer, got %s", evtType)
+	}
+	t.Logf("ICE offer/answer forwarded OK")
+}
+
+func TestAdminEndpoints(t *testing.T) {
+	srv, cfg := setupTestServer(t, 5)
+	defer srv.Close()
+
+	pubToken := genToken(t, "admin-pub", cfg.JWTSecret)
+
+	// Connect SSE + create room
+	sseResp, _ := http.Get(srv.URL + "/v1/events?peer_id=admin-pub&token=" + pubToken)
+	defer sseResp.Body.Close()
+
+	postSignal(t, srv.URL, model.SignalRequest{
+		Type: "create_room", PeerID: "admin-pub", Token: pubToken, RoomID: "admin-room",
 	})
 
-	offer := recvMsg(t, subConn)
-	if offer.Type != model.MsgICEOffer {
-		t.Fatalf("expected ICEOffer, got type %d", offer.Type)
+	// Admin: list peers
+	req, _ := http.NewRequest("GET", srv.URL+"/v1/admin/peers", nil)
+	req.Header.Set("Authorization", "Bearer "+cfg.AdminSecret)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("admin peers: %v", err)
 	}
-	if offer.From != "publisher-1" {
-		t.Fatalf("expected from 'publisher-1', got '%s'", offer.From)
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
-	t.Logf("Subscriber received ICE offer from %s", offer.From)
 
-	sendMsg(t, subConn, &model.SignalMessage{
-		Type: model.MsgICEAnswer,
-		From: "subscriber-1",
-		To:   "publisher-1",
-		Room: "test-room",
-		SDP:  "v=0\r\na=ice-ufrag:CCCC\r\na=ice-pwd:DDDDDDDD\r\n",
-	})
-
-	answer := recvMsg(t, pubConn)
-	if answer.Type != model.MsgICEAnswer {
-		t.Fatalf("expected ICEAnswer, got type %d", answer.Type)
+	var peersResp map[string][]model.PeerInfo
+	json.NewDecoder(resp.Body).Decode(&peersResp)
+	if len(peersResp["peers"]) == 0 {
+		t.Fatal("expected at least one peer")
 	}
-	t.Logf("Publisher received ICE answer from %s", answer.From)
+	t.Logf("Admin peers: %+v", peersResp["peers"])
 
-	// --- ICE Candidate exchange ---
-	sendMsg(t, pubConn, &model.SignalMessage{
-		Type:      model.MsgICECandidate,
-		From:      "publisher-1",
-		To:        "subscriber-1",
-		Candidate: "candidate:1 1 UDP 2122252543 192.168.1.100 50000 typ host",
-	})
+	// Admin: list rooms
+	req, _ = http.NewRequest("GET", srv.URL+"/v1/admin/rooms", nil)
+	req.Header.Set("Authorization", "Bearer "+cfg.AdminSecret)
+	resp, _ = http.DefaultClient.Do(req)
+	defer resp.Body.Close()
 
-	cand := recvMsg(t, subConn)
-	if cand.Type != model.MsgICECandidate {
-		t.Fatalf("expected ICECandidate, got type %d", cand.Type)
+	var roomsResp map[string][]model.RoomInfo
+	json.NewDecoder(resp.Body).Decode(&roomsResp)
+	if len(roomsResp["rooms"]) == 0 {
+		t.Fatal("expected at least one room")
 	}
-	t.Logf("Candidate forwarded: %s", cand.Candidate)
+	t.Logf("Admin rooms: %+v", roomsResp["rooms"])
 
-	// --- Gathering done ---
-	sendMsg(t, pubConn, &model.SignalMessage{
-		Type: model.MsgGatheringDone,
-		From: "publisher-1",
-		To:   "subscriber-1",
-	})
+	// Admin: query specific peer
+	req, _ = http.NewRequest("GET", srv.URL+"/v1/admin/peers/admin-pub", nil)
+	req.Header.Set("Authorization", "Bearer "+cfg.AdminSecret)
+	resp, _ = http.DefaultClient.Do(req)
+	defer resp.Body.Close()
 
-	gd := recvMsg(t, subConn)
-	if gd.Type != model.MsgGatheringDone {
-		t.Fatalf("expected GatheringDone, got type %d", gd.Type)
+	var peerInfo model.PeerInfo
+	json.NewDecoder(resp.Body).Decode(&peerInfo)
+	if !peerInfo.Online {
+		t.Fatal("expected peer to be online")
 	}
-	t.Logf("Gathering done forwarded")
+	t.Logf("Peer info: %+v", peerInfo)
+}
 
-	// --- Heartbeat ---
-	sendMsg(t, pubConn, &model.SignalMessage{
-		Type: model.MsgHeartbeat,
-		From: "publisher-1",
-	})
+func TestAdminAuthRequired(t *testing.T) {
+	srv, _ := setupTestServer(t, 5)
+	defer srv.Close()
 
-	hb := recvMsg(t, pubConn)
-	if hb.Type != model.MsgHeartbeat {
-		t.Fatalf("expected Heartbeat reply, got type %d", hb.Type)
+	resp, _ := http.Get(srv.URL + "/v1/admin/peers")
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", resp.StatusCode)
 	}
-	t.Logf("Heartbeat OK")
 
-	t.Log("=== All signaling tests passed ===")
+	req, _ := http.NewRequest("GET", srv.URL+"/v1/admin/peers", nil)
+	req.Header.Set("Authorization", "Bearer wrong-secret")
+	resp, _ = http.DefaultClient.Do(req)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", resp.StatusCode)
+	}
 }
 
 func TestMaxSubscribers(t *testing.T) {
-	cfg := config.DefaultConfig()
-	cfg.ListenAddr = "127.0.0.1:0"
-	cfg.MaxSubscribers = 2
+	srv, cfg := setupTestServer(t, 2)
+	defer srv.Close()
 
-	h := handler.NewSignalingHandler(cfg)
+	pubToken := genToken(t, "pub", cfg.JWTSecret)
 
-	listener, err := net.Listen("tcp", cfg.ListenAddr)
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	defer listener.Close()
+	// SSE + create room
+	sseResp, _ := http.Get(srv.URL + "/v1/events?peer_id=pub&token=" + pubToken)
+	defer sseResp.Body.Close()
 
-	addr := listener.Addr().String()
-
-	go func() {
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				return
-			}
-			go h.HandleConnection(conn)
-		}
-	}()
-
-	// Publisher creates room
-	pubConn, _ := net.Dial("tcp", addr)
-	defer pubConn.Close()
-	sendMsg(t, pubConn, &model.SignalMessage{
-		Type: model.MsgCreateRoom, From: "pub", Room: "limited-room",
+	postSignal(t, srv.URL, model.SignalRequest{
+		Type: "create_room", PeerID: "pub", Token: pubToken, RoomID: "limited",
 	})
-	recvMsg(t, pubConn)
 
 	// Two subscribers should succeed
 	for i := 1; i <= 2; i++ {
-		conn, _ := net.Dial("tcp", addr)
-		defer conn.Close()
-		sendMsg(t, conn, &model.SignalMessage{
-			Type: model.MsgJoinRoom, From: "sub" + string(rune('0'+i)), Room: "limited-room",
+		subID := "sub" + string(rune('0'+i))
+		subToken := genToken(t, subID, cfg.JWTSecret)
+		sseR, _ := http.Get(srv.URL + "/v1/events?peer_id=" + subID + "&token=" + subToken)
+		defer sseR.Body.Close()
+
+		resp := postSignal(t, srv.URL, model.SignalRequest{
+			Type: "join_room", PeerID: subID, Token: subToken, RoomID: "limited",
 		})
-		msg := recvMsg(t, conn)
-		if msg.Type == model.MsgError {
-			t.Fatalf("subscriber %d should have been accepted", i)
+		if resp.Type == "error" {
+			t.Fatalf("subscriber %d should have been accepted: %s", i, resp.Error)
 		}
-		// Drain publisher PeerJoined + TURN
-		recvMsg(t, pubConn)
-		recvMsg(t, pubConn)
 	}
 
 	// Third subscriber should be rejected
-	conn3, _ := net.Dial("tcp", addr)
-	defer conn3.Close()
-	sendMsg(t, conn3, &model.SignalMessage{
-		Type: model.MsgJoinRoom, From: "sub3", Room: "limited-room",
+	sub3Token := genToken(t, "sub3", cfg.JWTSecret)
+	resp := postSignal(t, srv.URL, model.SignalRequest{
+		Type: "join_room", PeerID: "sub3", Token: sub3Token, RoomID: "limited",
 	})
-	msg3 := recvMsg(t, conn3)
-	if msg3.Type != model.MsgError {
-		t.Fatalf("expected error for 3rd subscriber, got type %d", msg3.Type)
+	if resp.Type != "error" {
+		t.Fatalf("expected error for 3rd subscriber, got %s", resp.Type)
 	}
-	t.Logf("Max subscribers enforced: %s", msg3.SDP)
+	t.Logf("Max subscribers enforced: %s", resp.Error)
 }

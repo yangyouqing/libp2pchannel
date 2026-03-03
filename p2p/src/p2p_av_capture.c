@@ -48,7 +48,7 @@ int p2p_video_capture_open(p2p_video_capture_t *cap, const p2p_video_capture_con
         return -1;
     }
 
-    /* Capture as MJPEG; video is always re-encoded to H.264 before sending. */
+    /* Try MJPEG first, fall back to YUYV for devices that don't support it. */
     struct v4l2_format fmt;
     memset(&fmt, 0, sizeof(fmt));
     fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -57,14 +57,29 @@ int p2p_video_capture_open(p2p_video_capture_t *cap, const p2p_video_capture_con
     fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG;
     fmt.fmt.pix.field = V4L2_FIELD_NONE;
 
-    if (xioctl(cap->fd, VIDIOC_S_FMT, &fmt) < 0 ||
-        fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_MJPEG) {
-        fprintf(stderr, "[v4l2] VIDIOC_S_FMT MJPEG failed: %s\n", strerror(errno));
-        close(cap->fd);
-        return -1;
+    if (xioctl(cap->fd, VIDIOC_S_FMT, &fmt) == 0 &&
+        fmt.fmt.pix.pixelformat == V4L2_PIX_FMT_MJPEG) {
+        cap->pixfmt = P2P_V4L2_PIX_MJPEG;
+        cap->v4l2_pixfmt = V4L2_PIX_FMT_MJPEG;
+        fprintf(stderr, "[v4l2] using MJPEG capture\n");
+    } else {
+        fprintf(stderr, "[v4l2] MJPEG not supported, falling back to YUYV\n");
+        memset(&fmt, 0, sizeof(fmt));
+        fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        fmt.fmt.pix.width = cap->width;
+        fmt.fmt.pix.height = cap->height;
+        fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
+        fmt.fmt.pix.field = V4L2_FIELD_NONE;
+        if (xioctl(cap->fd, VIDIOC_S_FMT, &fmt) < 0 ||
+            fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_YUYV) {
+            fprintf(stderr, "[v4l2] VIDIOC_S_FMT YUYV also failed: %s\n", strerror(errno));
+            close(cap->fd);
+            return -1;
+        }
+        cap->pixfmt = P2P_V4L2_PIX_YUYV;
+        cap->v4l2_pixfmt = V4L2_PIX_FMT_YUYV;
+        fprintf(stderr, "[v4l2] using YUYV capture\n");
     }
-    cap->pixfmt = P2P_V4L2_PIX_MJPEG;
-    cap->v4l2_pixfmt = V4L2_PIX_FMT_MJPEG;
     cap->width = fmt.fmt.pix.width;
     cap->height = fmt.fmt.pix.height;
     cap->bytesperline = fmt.fmt.pix.bytesperline;

@@ -1,51 +1,59 @@
 package room
 
 import (
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
-	"net"
 	"sync"
 	"time"
 
 	"github.com/libp2pchannel/signaling-server/model"
 )
 
+// Peer represents a connected client with an SSE event channel.
 type Peer struct {
-	ID       string
-	Conn     net.Conn
-	RoomID   string
+	ID          string
+	RoomID      string
 	IsPublisher bool
-	LastPing time.Time
-	mu       sync.Mutex
+	OnlineAt    time.Time
+	Events      chan model.SSEEvent
+	mu          sync.Mutex
 }
 
-func (p *Peer) Send(msg *model.SignalMessage) error {
-	data, err := json.Marshal(msg)
+// PushEvent sends an SSE event to the peer's event channel (non-blocking).
+func (p *Peer) PushEvent(evt model.SSEEvent) {
+	select {
+	case p.Events <- evt:
+	default:
+		log.Printf("[room] event channel full for peer %s, dropping event %s", p.ID, evt.Type)
+	}
+}
+
+// PushJSON marshals data to JSON and pushes an SSE event.
+func (p *Peer) PushJSON(eventType string, data interface{}) {
+	b, err := json.Marshal(data)
 	if err != nil {
-		return err
+		log.Printf("[room] marshal error for peer %s: %v", p.ID, err)
+		return
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	// length-prefixed frame: [4-byte big-endian length][JSON]
-	lenBuf := make([]byte, 4)
-	binary.BigEndian.PutUint32(lenBuf, uint32(len(data)))
-	if _, err := p.Conn.Write(lenBuf); err != nil {
-		return err
-	}
-	_, err = p.Conn.Write(data)
-	return err
+	p.PushEvent(model.SSEEvent{Type: eventType, Data: string(b)})
 }
 
+// Room holds a publisher and its subscribers.
 type Room struct {
-	ID            string
-	Publisher     *Peer
-	Subscribers   map[string]*Peer
+	ID             string
+	Publisher      *Peer
+	Subscribers    map[string]*Peer
 	MaxSubscribers int
-	mu            sync.RWMutex
+	CachedOffer    *CachedICE // Publisher's pre-gathered offer
+	mu             sync.RWMutex
+}
+
+// CachedICE stores a batched SDP + candidates for forwarding.
+type CachedICE struct {
+	From       string   `json:"from"`
+	SDP        string   `json:"sdp"`
+	Candidates []string `json:"candidates"`
 }
 
 func NewRoom(id string, publisher *Peer, maxSubs int) *Room {
@@ -85,10 +93,20 @@ func (r *Room) SubscriberCount() int {
 	return len(r.Subscribers)
 }
 
-// Manager manages all rooms and peers.
+func (r *Room) SubscriberIDs() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	ids := make([]string, 0, len(r.Subscribers))
+	for id := range r.Subscribers {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// Manager manages all rooms and peers (in-memory, single-server).
 type Manager struct {
 	rooms          map[string]*Room
-	peers          map[string]*Peer // peerID -> Peer
+	peers          map[string]*Peer
 	maxSubscribers int
 	mu             sync.RWMutex
 }
@@ -101,13 +119,31 @@ func NewManager(maxSubscribers int) *Manager {
 	}
 }
 
-func (m *Manager) RegisterPeer(peer *Peer) {
+// RegisterSSE registers a peer with an SSE channel. Called when SSE connection opens.
+func (m *Manager) RegisterSSE(peerID string, events chan model.SSEEvent) *Peer {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.peers[peer.ID] = peer
+
+	peer, exists := m.peers[peerID]
+	if exists {
+		// Peer already exists (re-connect); replace the event channel
+		peer.Events = events
+		peer.OnlineAt = time.Now()
+		return peer
+	}
+
+	peer = &Peer{
+		ID:       peerID,
+		OnlineAt: time.Now(),
+		Events:   events,
+	}
+	m.peers[peerID] = peer
+	log.Printf("[room] peer %s registered (SSE)", peerID)
+	return peer
 }
 
-func (m *Manager) UnregisterPeer(peerID string) {
+// UnregisterSSE removes a peer's SSE presence. Called when SSE connection closes.
+func (m *Manager) UnregisterSSE(peerID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -119,31 +155,46 @@ func (m *Manager) UnregisterPeer(peerID string) {
 	if peer.RoomID != "" {
 		if room, exists := m.rooms[peer.RoomID]; exists {
 			if peer.IsPublisher {
-				// Notify all subscribers that room is closing
 				room.mu.RLock()
 				for _, sub := range room.Subscribers {
-					sub.Send(&model.SignalMessage{
-						Type: model.MsgPeerLeft,
-						From: peerID,
-						Room: peer.RoomID,
-					})
+					sub.PushJSON("peer_left", map[string]string{"peer_id": peerID})
 				}
 				room.mu.RUnlock()
 				delete(m.rooms, peer.RoomID)
+				log.Printf("[room] room %s removed (publisher %s disconnected)", peer.RoomID, peerID)
 			} else {
 				room.RemoveSubscriber(peerID)
 				if room.Publisher != nil {
-					room.Publisher.Send(&model.SignalMessage{
-						Type: model.MsgPeerLeft,
-						From: peerID,
-						Room: peer.RoomID,
-					})
+					room.Publisher.PushJSON("peer_left", map[string]string{"peer_id": peerID})
 				}
 			}
 		}
 	}
 
 	delete(m.peers, peerID)
+	log.Printf("[room] peer %s unregistered", peerID)
+}
+
+// EnsurePeer returns the existing peer or creates a placeholder without SSE.
+func (m *Manager) EnsurePeer(peerID string) *Peer {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	peer, ok := m.peers[peerID]
+	if ok {
+		return peer
+	}
+	peer = &Peer{
+		ID:       peerID,
+		OnlineAt: time.Now(),
+	}
+	m.peers[peerID] = peer
+	return peer
+}
+
+func (m *Manager) GetPeer(peerID string) *Peer {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.peers[peerID]
 }
 
 func (m *Manager) CreateRoom(roomID string, publisher *Peer) error {
@@ -182,16 +233,45 @@ func (m *Manager) JoinRoom(roomID string, subscriber *Peer) error {
 	log.Printf("[room] subscriber %s joined room %s (%d/%d)",
 		subscriber.ID, roomID, room.SubscriberCount(), room.MaxSubscribers)
 
-	// Notify publisher that a new subscriber joined
+	// Notify publisher
 	if room.Publisher != nil {
-		room.Publisher.Send(&model.SignalMessage{
-			Type: model.MsgPeerJoined,
-			From: subscriber.ID,
-			Room: roomID,
-		})
+		room.Publisher.PushJSON("peer_joined", map[string]string{"peer_id": subscriber.ID})
 	}
 
 	return nil
+}
+
+func (m *Manager) LeaveRoom(peerID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	peer, ok := m.peers[peerID]
+	if !ok || peer.RoomID == "" {
+		return
+	}
+
+	room, exists := m.rooms[peer.RoomID]
+	if !exists {
+		peer.RoomID = ""
+		return
+	}
+
+	if peer.IsPublisher {
+		room.mu.RLock()
+		for _, sub := range room.Subscribers {
+			sub.PushJSON("peer_left", map[string]string{"peer_id": peerID})
+		}
+		room.mu.RUnlock()
+		delete(m.rooms, peer.RoomID)
+	} else {
+		room.RemoveSubscriber(peerID)
+		if room.Publisher != nil {
+			room.Publisher.PushJSON("peer_left", map[string]string{"peer_id": peerID})
+		}
+	}
+
+	peer.RoomID = ""
+	peer.IsPublisher = false
 }
 
 func (m *Manager) GetRoom(roomID string) *Room {
@@ -200,43 +280,132 @@ func (m *Manager) GetRoom(roomID string) *Room {
 	return m.rooms[roomID]
 }
 
-func (m *Manager) GetPeer(peerID string) *Peer {
+// CacheOffer stores the publisher's full ICE offer for the given room.
+func (m *Manager) CacheOffer(roomID string, offer *CachedICE) {
+	m.mu.RLock()
+	room, exists := m.rooms[roomID]
+	m.mu.RUnlock()
+	if !exists {
+		return
+	}
+	room.mu.Lock()
+	room.CachedOffer = offer
+	room.mu.Unlock()
+}
+
+// GetCachedOffer returns the cached publisher offer, if any.
+func (m *Manager) GetCachedOffer(roomID string) *CachedICE {
+	m.mu.RLock()
+	room, exists := m.rooms[roomID]
+	m.mu.RUnlock()
+	if !exists {
+		return nil
+	}
+	room.mu.RLock()
+	defer room.mu.RUnlock()
+	return room.CachedOffer
+}
+
+// ForwardToPeer sends an SSE event to a specific peer.
+func (m *Manager) ForwardToPeer(peerID string, evt model.SSEEvent) error {
+	m.mu.RLock()
+	peer, ok := m.peers[peerID]
+	m.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("peer %s not found", peerID)
+	}
+	peer.PushEvent(evt)
+	return nil
+}
+
+// ListPeers returns info about all online peers.
+func (m *Manager) ListPeers() []model.PeerInfo {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.peers[peerID]
+
+	result := make([]model.PeerInfo, 0, len(m.peers))
+	for _, p := range m.peers {
+		role := "standalone"
+		if p.RoomID != "" {
+			if p.IsPublisher {
+				role = "publisher"
+			} else {
+				role = "subscriber"
+			}
+		}
+		result = append(result, model.PeerInfo{
+			ID:          p.ID,
+			RoomID:      p.RoomID,
+			Role:        role,
+			Online:      p.Events != nil,
+			OnlineSince: p.OnlineAt.Format(time.RFC3339),
+		})
+	}
+	return result
 }
 
-func (m *Manager) ForwardMessage(msg *model.SignalMessage) error {
+// ListRooms returns info about all active rooms.
+func (m *Manager) ListRooms() []model.RoomInfo {
 	m.mu.RLock()
-	target, ok := m.peers[msg.To]
-	m.mu.RUnlock()
+	defer m.mu.RUnlock()
 
-	if !ok {
-		return fmt.Errorf("peer %s not found", msg.To)
+	result := make([]model.RoomInfo, 0, len(m.rooms))
+	for _, r := range m.rooms {
+		pubID := ""
+		if r.Publisher != nil {
+			pubID = r.Publisher.ID
+		}
+		result = append(result, model.RoomInfo{
+			ID:          r.ID,
+			Publisher:   pubID,
+			Subscribers: r.SubscriberIDs(),
+		})
 	}
-
-	return target.Send(msg)
+	return result
 }
 
-// ReadMessage reads a length-prefixed JSON message from a connection.
-func ReadMessage(conn net.Conn) (*model.SignalMessage, error) {
-	lenBuf := make([]byte, 4)
-	if _, err := io.ReadFull(conn, lenBuf); err != nil {
-		return nil, err
-	}
-	msgLen := binary.BigEndian.Uint32(lenBuf)
-	if msgLen == 0 || msgLen > 65536 {
-		return nil, fmt.Errorf("invalid message length: %d", msgLen)
-	}
+// GetPeerInfo returns admin info for a single peer.
+func (m *Manager) GetPeerInfo(peerID string) *model.PeerInfo {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 
-	data := make([]byte, msgLen)
-	if _, err := io.ReadFull(conn, data); err != nil {
-		return nil, err
+	p, ok := m.peers[peerID]
+	if !ok {
+		return nil
 	}
+	role := "standalone"
+	if p.RoomID != "" {
+		if p.IsPublisher {
+			role = "publisher"
+		} else {
+			role = "subscriber"
+		}
+	}
+	return &model.PeerInfo{
+		ID:          p.ID,
+		RoomID:      p.RoomID,
+		Role:        role,
+		Online:      p.Events != nil,
+		OnlineSince: p.OnlineAt.Format(time.RFC3339),
+	}
+}
 
-	var msg model.SignalMessage
-	if err := json.Unmarshal(data, &msg); err != nil {
-		return nil, err
+// GetRoomInfo returns admin info for a single room.
+func (m *Manager) GetRoomInfo(roomID string) *model.RoomInfo {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	r, ok := m.rooms[roomID]
+	if !ok {
+		return nil
 	}
-	return &msg, nil
+	pubID := ""
+	if r.Publisher != nil {
+		pubID = r.Publisher.ID
+	}
+	return &model.RoomInfo{
+		ID:          r.ID,
+		Publisher:   pubID,
+		Subscribers: r.SubscriberIDs(),
+	}
 }

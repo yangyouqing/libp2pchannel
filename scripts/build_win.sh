@@ -173,7 +173,7 @@ export PKG_CONFIG_LIBDIR="$FFMPEG_DIR/lib/pkgconfig:$SDL2_DIR/lib/pkgconfig"
 # ============================================================
 # Step 3: Cross-compile BoringSSL -> build_win/boringssl/
 # ============================================================
-BORINGSSL_SRC="$PROJECT_DIR/xquic/third_party/boringssl"
+BORINGSSL_SRC="$PROJECT_DIR/third_party/xquic/third_party/boringssl"
 BORINGSSL_BUILD="$BUILD_DIR/boringssl"
 BORINGSSL_LIB="$BORINGSSL_BUILD/libssl.a"
 
@@ -182,7 +182,7 @@ if [[ ! -f "$BORINGSSL_LIB" ]]; then
 
     if [[ ! -d "$BORINGSSL_SRC" ]]; then
         log "Cloning BoringSSL..."
-        mkdir -p "$PROJECT_DIR/xquic/third_party"
+        mkdir -p "$PROJECT_DIR/third_party/xquic/third_party"
         git clone --depth 1 https://boringssl.googlesource.com/boringssl "$BORINGSSL_SRC"
     fi
 
@@ -200,7 +200,7 @@ fi
 # ============================================================
 # Step 4: Cross-compile xquic -> build_win/xquic/
 # ============================================================
-XQUIC_SRC="$PROJECT_DIR/xquic"
+XQUIC_SRC="$PROJECT_DIR/third_party/xquic"
 XQUIC_BUILD="$BUILD_DIR/xquic"
 XQUIC_LIB="$XQUIC_BUILD/libxquic-static.a"
 

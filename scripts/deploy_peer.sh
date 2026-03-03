@@ -52,7 +52,9 @@ START_SERVICES=false
 STOP_SERVICES=false
 SKIP_BUILD=false
 
-SIGNALING_ADDR="${SIGNALING_ADDR:-127.0.0.1:8080}"
+SIGNALING_ADDR="${SIGNALING_ADDR:-127.0.0.1:8443}"
+JWT_SECRET="${JWT_SECRET:-p2p-jwt-secret}"
+ADMIN_SECRET="${ADMIN_SECRET:-p2p-admin-secret}"
 TURN_HOST="${TURN_HOST:-127.0.0.1}"
 TURN_PORT="${TURN_PORT:-3478}"
 STUN_SERVER="${STUN_SERVER:-${TURN_HOST}:${TURN_PORT}}"
@@ -140,6 +142,8 @@ SIGNALING_ADDR=${SIGNALING_ADDR}
 STUN_SERVER=${STUN_SERVER}
 ROOM_ID=${ROOM_ID}
 PEER_ID=${PEER_ID}
+JWT_SECRET=${JWT_SECRET}
+ADMIN_SECRET=${ADMIN_SECRET}
 EOF
 
 # ---- Generate bash launcher ----
@@ -162,6 +166,21 @@ STUN_HOST="${STUN_SERVER%:*}"
 STUN_PORT="${STUN_SERVER##*:}"
 [[ "$STUN_PORT" == "$STUN_HOST" ]] && STUN_PORT=3478
 
+# Request JWT token from signaling server
+SIG_HOST="${SIGNALING_ADDR%:*}"
+SIG_PORT="${SIGNALING_ADDR##*:}"
+[[ "$SIG_HOST" == "0.0.0.0" || "$SIG_HOST" == "" ]] && SIG_HOST="127.0.0.1"
+TOKEN_URL="https://${SIG_HOST}:${SIG_PORT}/v1/token?peer_id=${PEER_ID}"
+echo "[launcher] Requesting JWT token from $TOKEN_URL ..."
+SUB_TOKEN=$(curl -sk -H "Authorization: Bearer $ADMIN_SECRET" "$TOKEN_URL" | \
+    sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+TOKEN_ARG=""
+if [[ -n "$SUB_TOKEN" ]]; then
+    TOKEN_ARG="--token $SUB_TOKEN"
+else
+    echo "[launcher] WARNING: Could not obtain JWT token, proceeding without auth"
+fi
+
 echo "[launcher] Starting p2p_peer (subscriber)..."
 echo "[launcher]   Signaling: $SIGNALING_ADDR  Room: $ROOM_ID  STUN: $STUN_HOST:$STUN_PORT"
 echo "[launcher]   Log: $LOG_DIR/p2p_peer.log"
@@ -169,7 +188,8 @@ echo "[launcher]   Log: $LOG_DIR/p2p_peer.log"
 exec "$SCRIPT_DIR/bin/p2p_peer${EXE_EXT}" \
     --signaling "$SIGNALING_ADDR" \
     --room "$ROOM_ID" --peer-id "$PEER_ID" \
-    --stun "$STUN_HOST:$STUN_PORT" 2>&1 | tee "$LOG_DIR/p2p_peer.log"
+    --stun "$STUN_HOST:$STUN_PORT" \
+    $TOKEN_ARG 2>&1 | tee "$LOG_DIR/p2p_peer.log"
 LAUNCHER
 chmod +x "$DEPLOY_DIR/start.sh"
 

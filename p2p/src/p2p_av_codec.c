@@ -155,8 +155,24 @@ int p2p_video_encoder_encode(p2p_video_encoder_t *enc,
                   (const uint8_t * const *)mframe->data, mframe->linesize,
                   0, mframe->height,
                   frame->data, frame->linesize);
+    } else if (in_pixfmt == P2P_V4L2_PIX_YUYV) {
+        int expected = enc->width * enc->height * 2;
+        if (raw_size < expected) return -1;
+
+        if (!enc->sws_ctx) {
+            enc->sws_ctx = sws_getContext(
+                enc->width, enc->height, AV_PIX_FMT_YUYV422,
+                enc->width, enc->height, AV_PIX_FMT_YUV420P,
+                SWS_FAST_BILINEAR, NULL, NULL, NULL);
+            if (!enc->sws_ctx) return -1;
+        }
+
+        const uint8_t *src_data[1] = { raw_data };
+        int src_linesize[1] = { enc->width * 2 };
+        sws_scale((struct SwsContext *)enc->sws_ctx,
+                  src_data, src_linesize, 0, enc->height,
+                  frame->data, frame->linesize);
     } else {
-        /* Only MJPEG capture is supported; other formats are not used. */
         return -1;
     }
 

@@ -1,7 +1,7 @@
 build/
 build_win/
 deploy/
-xquic/third_party/boringssl/
+third_party/xquic/third_party/boringssl/
 signaling-server/signaling-server
 .vscode/
 .idea/
