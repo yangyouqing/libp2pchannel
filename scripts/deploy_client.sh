@@ -166,12 +166,21 @@ fi
 # Step 4: Assemble deployment directory
 # ============================================================
 log "Assembling deployment directory: $DEPLOY_DIR"
-mkdir -p "$DEPLOY_DIR"/{bin,certs,conf,logs}
+mkdir -p "$DEPLOY_DIR"/{bin,lib,certs,conf,logs}
 
 cp -f "$CLIENT_BIN"      "$DEPLOY_DIR/bin/"
 cp -f "$SIGNALING_BIN"   "$DEPLOY_DIR/bin/"
 cp -f "$CERT_DIR/server.crt" "$DEPLOY_DIR/certs/"
 cp -f "$CERT_DIR/server.key" "$DEPLOY_DIR/certs/"
+
+# Copy shared library
+if [[ "$P2P_OS" == "windows" ]]; then
+    cp -f "$BUILD_DIR/p2p/libp2pav.dll" "$DEPLOY_DIR/lib/" 2>/dev/null || true
+    cp -f "$BUILD_DIR/p2p/p2pav.dll"    "$DEPLOY_DIR/lib/" 2>/dev/null || true
+else
+    cp -f "$BUILD_DIR/p2p/libp2pav.so"* "$DEPLOY_DIR/lib/" 2>/dev/null || true
+fi
+log "Shared library deployed to $DEPLOY_DIR/lib/"
 
 # Generate JWT token for the publisher
 log "Generating JWT token for publisher..."
@@ -268,6 +277,8 @@ echo "[launcher]   Video: $VIDEO_DEV  Audio: $AUDIO_DEV"
 
 TOKEN_ARG=""
 [[ -n "$PUB_TOKEN" ]] && TOKEN_ARG="--token $PUB_TOKEN"
+
+export LD_LIBRARY_PATH="$SCRIPT_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 "$SCRIPT_DIR/bin/p2p_client${EXE_EXT}" \
     --signaling "$SIGNALING_ADDR" \

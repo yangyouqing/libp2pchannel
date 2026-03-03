@@ -40,6 +40,12 @@ endif()
 # === P2P adapter library ===
 add_subdirectory(p2p)
 
+# === Examples ===
+option(BUILD_EXAMPLES "Build libp2pav usage examples" ON)
+if(BUILD_EXAMPLES)
+    add_subdirectory(examples)
+endif()
+
 # === Test programs ===
 if(BUILD_TESTS)
     add_subdirectory(tests)

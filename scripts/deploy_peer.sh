@@ -131,9 +131,18 @@ fi
 # Step 3: Assemble deployment directory
 # ============================================================
 log "Assembling deployment directory: $DEPLOY_DIR"
-mkdir -p "$DEPLOY_DIR"/{bin,conf,logs}
+mkdir -p "$DEPLOY_DIR"/{bin,lib,conf,logs}
 
 cp -f "$PEER_BIN" "$DEPLOY_DIR/bin/"
+
+# Copy shared library
+if [[ "$P2P_OS" == "windows" ]]; then
+    cp -f "$BUILD_DIR/p2p/libp2pav.dll" "$DEPLOY_DIR/lib/" 2>/dev/null || true
+    cp -f "$BUILD_DIR/p2p/p2pav.dll"    "$DEPLOY_DIR/lib/" 2>/dev/null || true
+else
+    cp -f "$BUILD_DIR/p2p/libp2pav.so"* "$DEPLOY_DIR/lib/" 2>/dev/null || true
+fi
+log "Shared library deployed to $DEPLOY_DIR/lib/"
 
 cat > "$DEPLOY_DIR/conf/peer.env" <<EOF
 # P2P Peer (Subscriber) Configuration
@@ -184,6 +193,8 @@ fi
 echo "[launcher] Starting p2p_peer (subscriber)..."
 echo "[launcher]   Signaling: $SIGNALING_ADDR  Room: $ROOM_ID  STUN: $STUN_HOST:$STUN_PORT"
 echo "[launcher]   Log: $LOG_DIR/p2p_peer.log"
+
+export LD_LIBRARY_PATH="$SCRIPT_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 exec "$SCRIPT_DIR/bin/p2p_peer${EXE_EXT}" \
     --signaling "$SIGNALING_ADDR" \

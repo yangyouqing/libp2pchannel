@@ -163,7 +163,8 @@ static int is_p2p_frame(const char *data, size_t size)
     if (type == P2P_FRAME_TYPE_IDR_REQ)
         return (size >= 1);
     if (size < P2P_FRAME_HDR_SIZE) return 0;
-    return (type == P2P_FRAME_TYPE_VIDEO || type == P2P_FRAME_TYPE_AUDIO);
+    return (type == P2P_FRAME_TYPE_VIDEO || type == P2P_FRAME_TYPE_AUDIO ||
+            type == P2P_FRAME_TYPE_DATA);
 }
 
 static void ice_on_recv(juice_agent_t *agent, const char *data, size_t size, void *user_ptr)

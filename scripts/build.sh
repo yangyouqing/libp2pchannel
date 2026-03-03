@@ -127,7 +127,7 @@ if [[ ! -f "$BORINGSSL_SSL_LIB" ]]; then
         git clone --depth 1 https://boringssl.googlesource.com/boringssl "$BORINGSSL_SRC"
     fi
 
-    cmake -B "$BORINGSSL_BUILD" -S "$BORINGSSL_SRC" -DCMAKE_BUILD_TYPE=Release
+    cmake -B "$BORINGSSL_BUILD" -S "$BORINGSSL_SRC" -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON
     cmake --build "$BORINGSSL_BUILD" --target ssl crypto -j"$JOBS"
     log "BoringSSL built -> $BORINGSSL_BUILD/"
 else
@@ -151,6 +151,7 @@ if [[ ! -f "$XQUIC_LIB" ]]; then
         -DSSL_INC_PATH="$BORINGSSL_SRC/include" \
         -DSSL_LIB_PATH="$BORINGSSL_SSL_LIB;$BORINGSSL_CRYPTO_LIB" \
         -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
         -DXQC_ENABLE_TESTING=OFF
     cmake --build "$XQUIC_BUILD" --target xquic-static -j"$JOBS"
     log "xquic built -> $XQUIC_BUILD/"
@@ -193,6 +194,11 @@ log "  $BUILD_DIR/"
 log "    boringssl/${LIB_PREFIX}ssl${STATIC_LIB_EXT}          BoringSSL"
 log "    boringssl/${LIB_PREFIX}crypto${STATIC_LIB_EXT}"
 log "    xquic/${LIB_PREFIX}xquic-static${STATIC_LIB_EXT}     xquic"
+if [[ "$P2P_OS" == "linux" ]]; then
+    log "    p2p/libp2pav.so              Shared transport library"
+else
+    log "    p2p/p2pav.dll                Shared transport library"
+fi
 log "    p2p/p2p_client${EXE_EXT}              Publisher"
 if [[ "$P2P_OS" == "linux" ]]; then
     log "    p2p/p2p_peer                Subscriber"

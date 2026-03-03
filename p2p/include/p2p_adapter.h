@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define P2P_MAX_SUBSCRIBERS   5
+#define P2P_MAX_SUBSCRIBERS   10
 #define P2P_VIRTUAL_PORT_BASE 20000
 #define P2P_ICE_MTU           1200
 
@@ -23,6 +23,7 @@ extern "C" {
 #define P2P_FRAME_TYPE_VIDEO  0x01
 #define P2P_FRAME_TYPE_AUDIO  0x02
 #define P2P_FRAME_TYPE_IDR_REQ 0x03
+#define P2P_FRAME_TYPE_DATA   0x04
 #define P2P_FRAME_FLAG_KEY    0x01
 
 typedef struct __attribute__((packed)) {
