@@ -40,7 +40,16 @@ if(NOT TARGET xquic-static)
     endif()
 endif()
 
-# BoringSSL (required by xquic)
+# TLS library: mbedTLS or BoringSSL (required by xquic)
+set(_MBEDTLS_BUILD_DIR "${MBEDTLS_BUILD_DIR}")
+if(NOT _MBEDTLS_BUILD_DIR)
+    set(_MBEDTLS_BUILD_DIR "${CMAKE_BINARY_DIR}/mbedtls")
+endif()
+set(_MBEDTLS_SRC_DIR "${MBEDTLS_SRC_DIR}")
+if(NOT _MBEDTLS_SRC_DIR)
+    set(_MBEDTLS_SRC_DIR "${CMAKE_SOURCE_DIR}/third_party/mbedtls")
+endif()
+
 set(_BORINGSSL_BUILD_DIR "${BORINGSSL_BUILD_DIR}")
 if(NOT _BORINGSSL_BUILD_DIR)
     set(_BORINGSSL_BUILD_DIR "${CMAKE_BINARY_DIR}/boringssl")
@@ -94,8 +103,15 @@ elseif(XQUIC_LIB)
     target_link_libraries(p2pav PUBLIC ${XQUIC_LIB})
 endif()
 
-# BoringSSL
-if(EXISTS "${_BORINGSSL_BUILD_DIR}/libssl.a")
+# TLS library
+if(EXISTS "${_MBEDTLS_BUILD_DIR}/library/libmbedtls.a")
+    target_compile_definitions(p2pav PRIVATE XQC_USE_MBEDTLS=1)
+    target_link_libraries(p2pav PRIVATE
+        "${_MBEDTLS_BUILD_DIR}/library/libmbedtls.a"
+        "${_MBEDTLS_BUILD_DIR}/library/libmbedx509.a"
+        "${_MBEDTLS_BUILD_DIR}/library/libmbedcrypto.a")
+    target_include_directories(p2pav PRIVATE "${_MBEDTLS_SRC_DIR}/include")
+elseif(EXISTS "${_BORINGSSL_BUILD_DIR}/libssl.a")
     target_link_libraries(p2pav PRIVATE
         "${_BORINGSSL_BUILD_DIR}/libssl.a"
         "${_BORINGSSL_BUILD_DIR}/libcrypto.a")

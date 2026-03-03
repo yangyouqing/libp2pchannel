@@ -26,15 +26,25 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 
-# SSL lib type, xquic support babassl and boringssl interfaces
+# SSL lib type, xquic support babassl, boringssl, and mbedtls interfaces
 if(NOT SSL_TYPE)
     set(SSL_TYPE "babassl")
     message(NOTICE "-- SSL_TYPE not set, use default babassl")
 endif()
 
-if(${SSL_TYPE} MATCHES "babassl")
-    # PATH of ssl, by default XQUIC will use babassl installed in
-    # /usr/local/babassl if SSL_PATH is not set
+if(${SSL_TYPE} MATCHES "mbedtls")
+    add_definitions(-DXQC_USE_MBEDTLS=1)
+    if(NOT MBEDTLS_PATH)
+        set(MBEDTLS_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../mbedtls")
+    endif()
+    if(NOT MBEDTLS_BUILD_PATH)
+        set(MBEDTLS_BUILD_PATH "${CMAKE_BINARY_DIR}/../mbedtls")
+    endif()
+    set(SSL_INC_PATH "${MBEDTLS_PATH}/include")
+    set(SSL_LIB_PATH "")
+    message(NOTICE "-- Using mbedTLS from ${MBEDTLS_PATH}")
+
+elseif(${SSL_TYPE} MATCHES "babassl")
     if(NOT SSL_PATH)
         set(SSL_PATH "/usr/local/babassl")
         message(NOTICE "-- SSL_PATH not set, use default ${SSL_PATH}")
@@ -42,59 +52,46 @@ if(${SSL_TYPE} MATCHES "babassl")
 
 elseif(${SSL_TYPE} MATCHES "boringssl")
     add_definitions(-DNOCRYPT=1)
-    # PATH of ssl, by default XQUIC will use boringssl in third_party
     if(NOT SSL_PATH)
         set(SSL_PATH ${CMAKE_CURRENT_SOURCE_DIR}/third_party/boringssl)
         message(NOTICE "-- SSL_PATH not set, use default ${SSL_PATH}")
     endif()
 endif()
 
-# Users can use both SSL_DIR or SSL_PATH to specify the ssl path to find the ssl
-# module, if both are defined, SSL_DIR will be used.
-if(NOT SSL_DIR)
-    if(NOT SSL_PATH)
-        # at least SSL_DIR or SSL_PATH shall be set
-        message(FATAL_ERROR "SSL_PATH not set")
-    else()
-        set(SSL_DIR ${SSL_PATH})
-    endif()
-endif()
-
-
-# find ssl module from SSL_DIR if SSL_INC_PATH AND SSL_LIB_PATH not set.
-if(NOT SSL_INC_PATH AND NOT SSL_LIB_PATH)
-    find_package(SSL)
-
-    if(NOT SSL_FOUND)
-        message(FATAL_ERROR "ssl module not found")
-    endif(NOT SSL_FOUND)
-
-    # compat with elder macros
-    if(SSL_DYNAMIC)
-        message(NOTICE "-- Building with dynamic libssl")
-        set(SSL_LIB_PATH ${SSL_LIBRARIES})
-    else()
-        message(NOTICE "-- Building with static libssl")
-        set(SSL_LIB_PATH ${SSL_LIBRARIES_STATIC})
-    endif()
-    set(SSL_INC_PATH ${SSL_INCLUDE_DIR})
-
-else()
-    if(NOT EXISTS ${SSL_INC_PATH})
-        message(FATAL_ERROR "ssl include path not found")
-    endif()
-
-    foreach(LIB IN LISTS SSL_LIB_PATH)
-        if(NOT EXISTS ${LIB})
-            message(FATAL_ERROR "ssl lib not found ${LIB}")
+if(NOT ${SSL_TYPE} MATCHES "mbedtls")
+    # Users can use both SSL_DIR or SSL_PATH to specify the ssl path
+    if(NOT SSL_DIR)
+        if(NOT SSL_PATH)
+            message(FATAL_ERROR "SSL_PATH not set")
+        else()
+            set(SSL_DIR ${SSL_PATH})
         endif()
-    endforeach()
+    endif()
 
+    if(NOT SSL_INC_PATH AND NOT SSL_LIB_PATH)
+        find_package(SSL)
+        if(NOT SSL_FOUND)
+            message(FATAL_ERROR "ssl module not found")
+        endif(NOT SSL_FOUND)
+        if(SSL_DYNAMIC)
+            set(SSL_LIB_PATH ${SSL_LIBRARIES})
+        else()
+            set(SSL_LIB_PATH ${SSL_LIBRARIES_STATIC})
+        endif()
+        set(SSL_INC_PATH ${SSL_INCLUDE_DIR})
+    else()
+        if(NOT EXISTS ${SSL_INC_PATH})
+            message(FATAL_ERROR "ssl include path not found")
+        endif()
+        foreach(LIB IN LISTS SSL_LIB_PATH)
+            if(NOT EXISTS ${LIB})
+                message(FATAL_ERROR "ssl lib not found ${LIB}")
+            endif()
+        endforeach()
+    endif()
 endif()
 
 MESSAGE("-- SSL_TYPE: ${SSL_TYPE}")
-MESSAGE("-- SSL_PATH: ${SSL_PATH}")
-MESSAGE("-- SSL_LIB_PATH: ${SSL_LIB_PATH}")
 MESSAGE("-- SSL_INC_PATH: ${SSL_INC_PATH}")
 
 
@@ -290,20 +287,30 @@ if(XQC_ENABLE_FEC)
     )
 endif()
 
-# TLS source
+# TLS source (shared across all backends)
 set (
     TLS_SOURCE
     "src/tls/xqc_hkdf.c"
     "src/tls/xqc_null_crypto.c"
     "src/tls/xqc_crypto.c"
-    "src/tls/xqc_tls_ctx.c"
-    "src/tls/xqc_tls.c"
 )
 
-if(${SSL_TYPE} MATCHES "boringssl")
+if(${SSL_TYPE} MATCHES "mbedtls")
     set(
         TLS_SOURCE
         ${TLS_SOURCE}
+        "src/tls/mbedtls/xqc_hkdf_impl.c"
+        "src/tls/mbedtls/xqc_crypto_impl.c"
+        "src/tls/mbedtls/xqc_ssl_if_impl.c"
+        "src/tls/mbedtls/xqc_tls_mbedtls.c"
+        "src/tls/mbedtls/xqc_tls_ctx_mbedtls.c"
+    )
+elseif(${SSL_TYPE} MATCHES "boringssl")
+    set(
+        TLS_SOURCE
+        ${TLS_SOURCE}
+        "src/tls/xqc_tls_ctx.c"
+        "src/tls/xqc_tls.c"
         "src/tls/boringssl/xqc_hkdf_impl.c"
         "src/tls/boringssl/xqc_crypto_impl.c"
         "src/tls/boringssl/xqc_ssl_if_impl.c"
@@ -312,6 +319,8 @@ elseif(${SSL_TYPE} MATCHES "babassl")
     set(
         TLS_SOURCE
         ${TLS_SOURCE}
+        "src/tls/xqc_tls_ctx.c"
+        "src/tls/xqc_tls.c"
         "src/tls/babassl/xqc_hkdf_impl.c"
         "src/tls/babassl/xqc_crypto_impl.c"
         "src/tls/babassl/xqc_ssl_if_impl.c"
@@ -405,7 +414,19 @@ add_library(
     ${XQC_SOURCE}
 )
 
-if(PLATFORM MATCHES "mac")
+if(${SSL_TYPE} MATCHES "mbedtls")
+    target_link_libraries(xquic-static PUBLIC
+        "${MBEDTLS_BUILD_PATH}/library/libmbedtls.a"
+        "${MBEDTLS_BUILD_PATH}/library/libmbedx509.a"
+        "${MBEDTLS_BUILD_PATH}/library/libmbedcrypto.a"
+    )
+    target_link_libraries(xquic
+        "${MBEDTLS_BUILD_PATH}/library/libmbedtls.a"
+        "${MBEDTLS_BUILD_PATH}/library/libmbedx509.a"
+        "${MBEDTLS_BUILD_PATH}/library/libmbedcrypto.a"
+        -lpthread
+    )
+elseif(PLATFORM MATCHES "mac")
     target_link_libraries(
         xquic
         "-ldl -Wl,-all_load"

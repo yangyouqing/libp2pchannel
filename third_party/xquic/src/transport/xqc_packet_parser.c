@@ -3,10 +3,14 @@
  */
 
 #include <string.h>
+#ifndef XQC_USE_MBEDTLS
 #ifdef XQC_SYS_WINDOWS
 #include <openssl/x509.h>
 #endif
 #include <openssl/hmac.h>
+#else
+#include <mbedtls/md.h>
+#endif
 #include "src/transport/xqc_packet_parser.h"
 #include "src/transport/xqc_cid.h"
 #include "src/common/utils/vint/xqc_variable_len_int.h"
@@ -1395,6 +1399,21 @@ xqc_gen_reset_token(xqc_cid_t *cid, unsigned char *token, int token_len, char *k
 {
     unsigned char *input = cid->cid_buf;
     int input_len = cid->cid_len;
+
+#ifdef XQC_USE_MBEDTLS
+    unsigned char output[32];
+    const mbedtls_md_info_t *md_info = mbedtls_md_info_from_type(MBEDTLS_MD_MD5);
+    if (md_info == NULL) {
+        return;
+    }
+    size_t md_size = mbedtls_md_get_size(md_info);
+    if (mbedtls_md_hmac(md_info, (const unsigned char *)key, keylen,
+                        input, input_len, output) != 0) {
+        return;
+    }
+    size_t copy_len = md_size < (size_t)token_len ? md_size : (size_t)token_len;
+    memcpy(token, output, copy_len);
+#else
     unsigned char output[EVP_MAX_MD_SIZE];
     int output_len = EVP_MAX_MD_SIZE;
     const EVP_MD *engine = NULL;
@@ -1408,6 +1427,7 @@ xqc_gen_reset_token(xqc_cid_t *cid, unsigned char *token, int token_len, char *k
     HMAC_CTX_free(ctx);
 
     memcpy(token, output, output_len < token_len ? output_len : token_len);
+#endif
 }
 
 /*

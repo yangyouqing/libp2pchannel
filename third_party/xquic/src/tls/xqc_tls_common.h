@@ -5,8 +5,10 @@
 #ifndef XQC_TLS_COMMON_H
 #define XQC_TLS_COMMON_H
 
+#ifndef XQC_USE_MBEDTLS
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#endif
 #include <xquic/xquic.h>
 
 /**
@@ -103,9 +105,13 @@ typedef struct xqc_ssl_session_ticket_key_s {
 /* the default max depth of cert chain is 100 */
 #define XQC_MAX_VERIFY_DEPTH 100
 
+#ifdef XQC_USE_MBEDTLS
+#define XQC_TLS_SELF_SIGNED_CERT(err_code) (0)
+#else
 #define XQC_TLS_SELF_SIGNED_CERT(err_code) \
     (err_code == X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT \
         || err_code == X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN)
+#endif
 
 
 #endif

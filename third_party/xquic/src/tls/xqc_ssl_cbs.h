@@ -5,11 +5,15 @@
 #ifndef XQC_SSL_CBS_H
 #define XQC_SSL_CBS_H
 
+#ifndef XQC_USE_MBEDTLS
 #include <openssl/ssl.h>
+#endif
 
 /**
  * @brief this file describes all the callback functions registered in ssl lib
  */
+
+#ifndef XQC_USE_MBEDTLS
 
 
 /**
@@ -62,4 +66,6 @@ int xqc_ssl_cert_verify_cb(int ok, X509_STORE_CTX *store_ctx);
  */
 int xqc_ssl_cert_cb(SSL *ssl, void *arg);
 
-#endif
+#endif /* !XQC_USE_MBEDTLS */
+
+#endif /* XQC_SSL_CBS_H */

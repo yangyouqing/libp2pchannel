@@ -127,8 +127,9 @@ int p2p_video_capture_open(p2p_video_capture_t *cap, const p2p_video_capture_con
         }
     }
 
-    fprintf(stderr, "[v4l2] opened %s: %dx%d @%dfps fmt=MJPEG (H.264 encoded on send)\n",
-            cfg->device, cap->width, cap->height, cap->fps);
+    fprintf(stderr, "[v4l2] opened %s: %dx%d @%dfps fmt=%s\n",
+            cfg->device, cap->width, cap->height, cap->fps,
+            cap->pixfmt == P2P_V4L2_PIX_MJPEG ? "MJPEG" : "YUYV");
     return 0;
 }
 
@@ -173,7 +174,10 @@ static void *video_capture_thread(void *arg)
 
 int p2p_video_capture_start(p2p_video_capture_t *cap)
 {
-    if (!cap || cap->fd < 0) return -1;
+    if (!cap || cap->fd < 0) {
+        fprintf(stderr, "[v4l2] start: invalid capture handle or fd\n");
+        return -1;
+    }
 
     for (int i = 0; i < cap->n_buffers; i++) {
         struct v4l2_buffer buf;
@@ -181,14 +185,21 @@ int p2p_video_capture_start(p2p_video_capture_t *cap)
         buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         buf.memory = V4L2_MEMORY_MMAP;
         buf.index = i;
-        if (xioctl(cap->fd, VIDIOC_QBUF, &buf) < 0) return -1;
+        if (xioctl(cap->fd, VIDIOC_QBUF, &buf) < 0) {
+            fprintf(stderr, "[v4l2] QBUF[%d] failed: %s\n", i, strerror(errno));
+            return -1;
+        }
     }
 
     enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    if (xioctl(cap->fd, VIDIOC_STREAMON, &type) < 0) return -1;
+    if (xioctl(cap->fd, VIDIOC_STREAMON, &type) < 0) {
+        fprintf(stderr, "[v4l2] STREAMON failed: %s\n", strerror(errno));
+        return -1;
+    }
 
     cap->running = 1;
     if (p2p_thread_create(&cap->thread, video_capture_thread, cap) != 0) {
+        fprintf(stderr, "[v4l2] capture thread creation failed\n");
         cap->running = 0;
         return -1;
     }

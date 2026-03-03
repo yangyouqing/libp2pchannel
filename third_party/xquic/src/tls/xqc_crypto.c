@@ -515,7 +515,7 @@ xqc_crypto_derive_keys(xqc_crypto_t *crypto, const uint8_t *secret, size_t secre
         return -XQC_TLS_DERIVE_KEY_ERROR;
     }
 
-    if (crypto->pp_aead.aead) {
+    if (crypto->pp_aead.keylen > 1) {
         xqc_aead_ctx_free(p_ckm->aead_ctx);
         p_ckm->aead_ctx = xqc_aead_ctx_new(&crypto->pp_aead, type, key, ivlen);
         if (!p_ckm->aead_ctx) {
@@ -523,7 +523,7 @@ xqc_crypto_derive_keys(xqc_crypto_t *crypto, const uint8_t *secret, size_t secre
         }
     }
 
-    if (crypto->hp_cipher.cipher) {
+    if (crypto->hp_cipher.keylen > 1) {
         xqc_hp_ctx_free(*p_hp_ctx);
         *p_hp_ctx = xqc_hp_ctx_new(&crypto->hp_cipher, hp);
         if (!(*p_hp_ctx)) {
@@ -707,7 +707,7 @@ xqc_crypto_derive_updated_keys(xqc_crypto_t *crypto, xqc_key_type_t type)
         return -XQC_TLS_UPDATE_KEY_ERROR;
     }
 
-    if (crypto->pp_aead.aead) {
+    if (crypto->pp_aead.keylen > 1) {
         xqc_aead_ctx_free(updated_ckm->aead_ctx);
         updated_ckm->aead_ctx = xqc_aead_ctx_new(&crypto->pp_aead, type, key, ivlen);
         if (!updated_ckm->aead_ctx) {

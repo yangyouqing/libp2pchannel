@@ -6,7 +6,9 @@
 #define XQC_CRYPTO_H_
 
 #include <xquic/xquic_typedef.h>
+#ifndef XQC_USE_MBEDTLS
 #include <openssl/ssl.h>
+#endif
 #include "src/tls/xqc_tls_defs.h"
 #include "src/tls/xqc_tls_common.h"
 #include "src/transport/xqc_packet.h"
@@ -17,7 +19,9 @@ typedef struct xqc_hdr_protect_cipher_s    xqc_hdr_protect_cipher_t;
 #undef  XQC_CRYPTO_PRIVATE
 #define XQC_CRYPTO_PRIVATE
 
-#ifdef OPENSSL_IS_BORINGSSL
+#if defined(XQC_USE_MBEDTLS)
+#include "src/tls/mbedtls/xqc_aead_impl.h"
+#elif defined(OPENSSL_IS_BORINGSSL)
 #include "src/tls/boringssl/xqc_aead_impl.h"
 #else
 #include "src/tls/babassl/xqc_aead_impl.h"
@@ -105,12 +109,20 @@ struct xqc_hdr_protect_cipher_s {
     xqc_hp_mask_pt          hp_mask;
 };
 
+#if defined(XQC_USE_MBEDTLS)
+#include <mbedtls/md.h>
+typedef struct xqc_digest_s {
+    mbedtls_md_type_t md_type;
+} xqc_digest_t;
+#define xqc_digest_init_to_sha256(obj)  ((obj)->md_type = MBEDTLS_MD_SHA256)
+#define xqc_digest_init_to_sha384(obj)  ((obj)->md_type = MBEDTLS_MD_SHA384)
+#else
 typedef struct xqc_digest_s {
     const EVP_MD *digest ;
 } xqc_digest_t;
-
 #define xqc_digest_init_to_sha256(obj)  ((obj)->digest = EVP_sha256())
 #define xqc_digest_init_to_sha384(obj)  ((obj)->digest = EVP_sha384())
+#endif
 
 #define XQC_KEY_PHASE_CNT 2
 

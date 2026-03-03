@@ -34,7 +34,13 @@
 #include "src/tls/xqc_tls.h"
 #include "src/tls/xqc_tls_common.h"
 #include <inttypes.h>
+#ifdef XQC_USE_MBEDTLS
+#include <mbedtls/gcm.h>
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/entropy.h>
+#else
 #include <openssl/rand.h>
+#endif
 
 xqc_conn_settings_t internal_default_conn_settings = {
     .pacing_on                  = 0,
@@ -3819,13 +3825,8 @@ xqc_conn_decrypt_token(xqc_connection_t *conn, unsigned char *dec_data, unsigned
         return XQC_ERROR;
     }
 
-    const EVP_CIPHER  *cipher = EVP_aes_128_gcm(); 
-    int len, tmp_len;
-
-    /* random iv */
     const unsigned char *iv = enc_data;
     
-    /* flag do not encrypt */
     uint8_t flag = enc_data[XQC_TOKEN_IV_LEN];
     dec_data[0] = flag;
     *d_len = 1;
@@ -3835,12 +3836,35 @@ xqc_conn_decrypt_token(xqc_connection_t *conn, unsigned char *dec_data, unsigned
     
     const unsigned char *p_enc = enc_data + XQC_TOKEN_IV_LEN + 1;
     unsigned char *p_dec = dec_data + 1;
-    len = e_len - XQC_TOKEN_IV_LEN - XQC_TOKEN_TAG_LEN - 1;
+    int len = e_len - XQC_TOKEN_IV_LEN - XQC_TOKEN_TAG_LEN - 1;
+
+#ifdef XQC_USE_MBEDTLS
+    mbedtls_gcm_context gcm;
+    mbedtls_gcm_init(&gcm);
+    if (mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, key, 128) != 0) {
+        xqc_log(conn->log, XQC_LOG_ERROR, "|gcm setkey failed|");
+        mbedtls_gcm_free(&gcm);
+        return XQC_ERROR;
+    }
+    int ret = mbedtls_gcm_auth_decrypt(&gcm, len,
+                                        iv, XQC_TOKEN_IV_LEN,
+                                        NULL, 0,
+                                        p_enc + len, XQC_TOKEN_TAG_LEN,
+                                        p_enc, p_dec);
+    mbedtls_gcm_free(&gcm);
+    if (ret != 0) {
+        xqc_log(conn->log, XQC_LOG_ERROR, "|gcm auth_decrypt failed|ret:%d|", ret);
+        return XQC_ERROR;
+    }
+    *d_len += len;
+#else
+    int tmp_len;
     EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
     if (ctx == NULL) {
         xqc_log(conn->log, XQC_LOG_ERROR, "|decrypt token create cipher ctx error|");
         return XQC_ERROR;
     }
+    const EVP_CIPHER *cipher = EVP_aes_128_gcm();
     if (XQC_SSL_SUCCESS != EVP_DecryptInit_ex(ctx, cipher, NULL, key, iv)) {
         xqc_log(conn->log, XQC_LOG_ERROR, "|EVP_DecryptInit_ex failed|");
         goto error;
@@ -3869,6 +3893,8 @@ error:
         EVP_CIPHER_CTX_free(ctx);
     }
     return XQC_ERROR;
+#endif
+    return XQC_OK;
 }
 
 xqc_int_t
@@ -3995,9 +4021,62 @@ xqc_conn_generate_and_encrypt_token(xqc_connection_t *conn, unsigned char *token
         return XQC_ERROR;
     }
 
-    char *iv = token, *crypto_p = token + XQC_TOKEN_IV_LEN + 1, *plain_p = &plain_text[1];
+    unsigned char *iv = token;
+    unsigned char *crypto_p = token + XQC_TOKEN_IV_LEN + 1;
+    unsigned char *plain_p = &plain_text[1];
     unsigned int plain_len = len - 1;
     const unsigned char *key = conn->engine->token_secret_list[cur_ts_index];
+
+#ifdef XQC_USE_MBEDTLS
+    {
+        mbedtls_entropy_context entropy;
+        mbedtls_ctr_drbg_context ctr_drbg;
+        mbedtls_entropy_init(&entropy);
+        mbedtls_ctr_drbg_init(&ctr_drbg);
+        if (mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, NULL, 0) != 0) {
+            xqc_log(conn->log, XQC_LOG_ERROR, "|rng seed error|");
+            mbedtls_ctr_drbg_free(&ctr_drbg);
+            mbedtls_entropy_free(&entropy);
+            return XQC_ERROR;
+        }
+        if (mbedtls_ctr_drbg_random(&ctr_drbg, iv, XQC_TOKEN_IV_LEN) != 0) {
+            xqc_log(conn->log, XQC_LOG_ERROR, "|generate iv error|");
+            mbedtls_ctr_drbg_free(&ctr_drbg);
+            mbedtls_entropy_free(&entropy);
+            return XQC_ERROR;
+        }
+        mbedtls_ctr_drbg_free(&ctr_drbg);
+        mbedtls_entropy_free(&entropy);
+    }
+    *token_len = XQC_TOKEN_IV_LEN;
+    token[XQC_TOKEN_IV_LEN] = plain_text[0];
+    *token_len += 1;
+
+    {
+        mbedtls_gcm_context gcm;
+        mbedtls_gcm_init(&gcm);
+        if (mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, key, 128) != 0) {
+            xqc_log(conn->log, XQC_LOG_ERROR, "|gcm setkey error|");
+            mbedtls_gcm_free(&gcm);
+            return XQC_ERROR;
+        }
+        uint8_t tag[XQC_TOKEN_TAG_LEN];
+        int ret = mbedtls_gcm_crypt_and_tag(&gcm, MBEDTLS_GCM_ENCRYPT,
+                                             plain_len,
+                                             iv, XQC_TOKEN_IV_LEN,
+                                             NULL, 0,
+                                             plain_p, crypto_p,
+                                             XQC_TOKEN_TAG_LEN, tag);
+        mbedtls_gcm_free(&gcm);
+        if (ret != 0) {
+            xqc_log(conn->log, XQC_LOG_ERROR, "|gcm encrypt error|ret:%d|", ret);
+            return XQC_ERROR;
+        }
+        *token_len += plain_len;
+        memcpy(token + *token_len, tag, XQC_TOKEN_TAG_LEN);
+        *token_len += XQC_TOKEN_TAG_LEN;
+    }
+#else
     if (RAND_bytes(iv, XQC_TOKEN_IV_LEN) == 0) {
         xqc_log(conn->log, XQC_LOG_ERROR,  "|generate iv error|"); 
         return XQC_ERROR;
@@ -4017,13 +4096,13 @@ xqc_conn_generate_and_encrypt_token(xqc_connection_t *conn, unsigned char *token
         goto error; 
     }
 
-    if (XQC_SSL_SUCCESS != EVP_EncryptUpdate(ctx, crypto_p, &len, plain_p, plain_len)) {
+    if (XQC_SSL_SUCCESS != EVP_EncryptUpdate(ctx, crypto_p, (int *)&len, plain_p, plain_len)) {
         xqc_log(conn->log, XQC_LOG_ERROR, "|EVP_EncryptUpdate error|"); 
         goto error;
     }
     *token_len += len;
 
-    if (XQC_SSL_SUCCESS != EVP_EncryptFinal_ex(ctx, token + *token_len, &len)) {
+    if (XQC_SSL_SUCCESS != EVP_EncryptFinal_ex(ctx, token + *token_len, (int *)&len)) {
         xqc_log(conn->log, XQC_LOG_ERROR, "|EVP_EncryptFinal_ex error|"); 
         goto error;
     }
@@ -4040,7 +4119,8 @@ error:
         EVP_CIPHER_CTX_free(ctx);
     }
     return XQC_ERROR;
-    
+#endif
+    return XQC_OK;
 }
    
 xqc_int_t

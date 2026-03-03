@@ -7,14 +7,20 @@
 
 #include "xqc_tls.h"
 #include "xqc_tls_common.h"
+
+#ifndef XQC_USE_MBEDTLS
 #include <openssl/ssl.h>
 #include <openssl/err.h>
-
+#endif
 
 /**
- * @brief get SSL_CTX object
+ * @brief get SSL_CTX object (returns NULL for mbedTLS backend)
  */
+#ifdef XQC_USE_MBEDTLS
+void *xqc_tls_ctx_get_ssl_ctx(xqc_tls_ctx_t *ctx);
+#else
 SSL_CTX *xqc_tls_ctx_get_ssl_ctx(xqc_tls_ctx_t *ctx);
+#endif
 
 /**
  * @brief get configured tls context type

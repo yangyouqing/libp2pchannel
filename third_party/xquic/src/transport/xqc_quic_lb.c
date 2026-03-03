@@ -1,5 +1,9 @@
+#ifdef XQC_USE_MBEDTLS
+#include <mbedtls/aes.h>
+#else
 #include <openssl/evp.h>
 #include <openssl/ssl.h>
+#endif
 #include <xquic/xquic.h>
 #include "src/transport/xqc_engine.h"
 
@@ -11,11 +15,9 @@
 #define XQC_TMP_CIPHER_LEN 16
 #define XQC_FIRST_OCTET 1
 
-/* Each encrypted CID creates and releases a cipher ctx, which may occupies cpu resources a lot. It should be optimaized in the future.*/
 xqc_int_t
 xqc_cid_encryption_aes_128_ecb(unsigned char *plaintext, size_t plaintext_len, uint8_t *ciphertext, size_t ciphertext_len, uint8_t *key, size_t key_len, xqc_engine_t *engine)
 {
-    xqc_int_t update_len = 0, final_len = 0;
     xqc_log_t *log = engine->log;
 
     if (plaintext_len != XQC_EN_SINGLE_PASS_ENCRYPTION_LEN) {
@@ -33,6 +35,22 @@ xqc_cid_encryption_aes_128_ecb(unsigned char *plaintext, size_t plaintext_len, u
         return -XQC_EPARAM;
     }
 
+#ifdef XQC_USE_MBEDTLS
+    mbedtls_aes_context aes;
+    mbedtls_aes_init(&aes);
+    if (mbedtls_aes_setkey_enc(&aes, key, 128) != 0) {
+        xqc_log(log, XQC_LOG_ERROR, "|lb-cid encryption error|lb-cid aes_128_ecb setkey error|");
+        mbedtls_aes_free(&aes);
+        return -XQC_EENCRYPT_AES_128_ECB;
+    }
+    if (mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_ENCRYPT, plaintext, ciphertext) != 0) {
+        xqc_log(log, XQC_LOG_ERROR, "|lb-cid encryption error|lb-cid aes_128_ecb encrypt error|");
+        mbedtls_aes_free(&aes);
+        return -XQC_EENCRYPT_AES_128_ECB;
+    }
+    mbedtls_aes_free(&aes);
+#else
+    xqc_int_t update_len = 0, final_len = 0;
     EVP_CIPHER_CTX *cipher_ctx = EVP_CIPHER_CTX_new();
     if (!cipher_ctx) {
         xqc_log(log, XQC_LOG_ERROR, "|lb-cid encryption error|lb-cid aes_128_ecb encryption ctx generate error|");
@@ -61,6 +79,7 @@ xqc_cid_encryption_aes_128_ecb(unsigned char *plaintext, size_t plaintext_len, u
     }
 
     EVP_CIPHER_CTX_free(cipher_ctx);
+#endif
 
     return XQC_OK;
 }

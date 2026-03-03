@@ -8,7 +8,9 @@
 #include <xquic/xquic_typedef.h>
 #include "xqc_tls_defs.h"
 
+#ifndef XQC_USE_MBEDTLS
 #include <openssl/ssl.h>
+#endif
 
 /**
  * @brief this file wraps ssl interfaces between different ssl implements
@@ -21,13 +23,11 @@ typedef enum xqc_ssl_handshake_res_s {
 } xqc_ssl_handshake_res_t;
 
 
+#ifndef XQC_USE_MBEDTLS
 void xqc_ssl_ctx_set_timeout(SSL_CTX *ctx, uint32_t timeout);
 
 xqc_int_t xqc_ssl_ctx_set_cipher_suites(SSL_CTX *ctx, const char *ciphers);
 
-/**
- * @brief early data related functions
- */
 void xqc_ssl_ctx_enable_max_early_data(SSL_CTX *ctx);
 xqc_bool_t xqc_ssl_session_is_early_data_enabled(SSL_SESSION *session);
 xqc_bool_t xqc_ssl_is_early_data_accepted(SSL *ssl);
@@ -38,5 +38,6 @@ xqc_int_t xqc_ssl_get_certs_array(SSL *ssl, X509_STORE_CTX *store_ctx, unsigned 
 void xqc_ssl_free_certs_array(unsigned char **certs_array, size_t certs_array_len);
 
 xqc_ssl_handshake_res_t xqc_ssl_do_handshake(SSL *ssl, xqc_connection_t *conn, xqc_log_t *log);
+#endif
 
 #endif

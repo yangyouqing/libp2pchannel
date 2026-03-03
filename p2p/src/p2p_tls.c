@@ -1,21 +1,34 @@
+/**
+ * p2p_tls.c -- TLS client for signaling (HTTPS) using mbedTLS.
+ *
+ * Implements the same p2p_tls.h interface but with mbedTLS instead of OpenSSL.
+ */
+
 #include "p2p_tls.h"
 #include "p2p_platform.h"
 
-#include <openssl/ssl.h>
-#include <openssl/err.h>
+#include <mbedtls/ssl.h>
+#include <mbedtls/net_sockets.h>
+#include <mbedtls/entropy.h>
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/error.h>
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 struct p2p_tls_ctx_s {
-    SSL_CTX *ctx;
+    mbedtls_ssl_config      conf;
+    mbedtls_entropy_context  entropy;
+    mbedtls_ctr_drbg_context ctr_drbg;
 };
 
 struct p2p_tls_conn_s {
-    SSL          *ssl;
-    p2p_socket_t  fd;
+    mbedtls_ssl_context     ssl;
+    mbedtls_net_context     net;
+    p2p_tls_ctx_t          *ctx;
 };
+
 
 /* ------------------------------------------------------------------ */
 /*  Context                                                           */
@@ -26,100 +39,128 @@ p2p_tls_ctx_t *p2p_tls_ctx_create(void)
     p2p_tls_ctx_t *c = calloc(1, sizeof(*c));
     if (!c) return NULL;
 
-    c->ctx = SSL_CTX_new(TLS_client_method());
-    if (!c->ctx) { free(c); return NULL; }
+    mbedtls_ssl_config_init(&c->conf);
+    mbedtls_entropy_init(&c->entropy);
+    mbedtls_ctr_drbg_init(&c->ctr_drbg);
 
-    SSL_CTX_set_min_proto_version(c->ctx, TLS1_2_VERSION);
-    /* Skip server cert verification for self-signed dev certs */
-    SSL_CTX_set_verify(c->ctx, SSL_VERIFY_NONE, NULL);
+    if (mbedtls_ctr_drbg_seed(&c->ctr_drbg, mbedtls_entropy_func,
+                               &c->entropy, (const unsigned char *)"p2p_tls", 7) != 0)
+    {
+        goto fail;
+    }
+
+    if (mbedtls_ssl_config_defaults(&c->conf, MBEDTLS_SSL_IS_CLIENT,
+                                     MBEDTLS_SSL_TRANSPORT_STREAM,
+                                     MBEDTLS_SSL_PRESET_DEFAULT) != 0)
+    {
+        goto fail;
+    }
+
+    mbedtls_ssl_conf_authmode(&c->conf, MBEDTLS_SSL_VERIFY_NONE);
+    mbedtls_ssl_conf_rng(&c->conf, mbedtls_ctr_drbg_random, &c->ctr_drbg);
+    mbedtls_ssl_conf_min_tls_version(&c->conf, MBEDTLS_SSL_VERSION_TLS1_2);
+
     return c;
+
+fail:
+    mbedtls_ctr_drbg_free(&c->ctr_drbg);
+    mbedtls_entropy_free(&c->entropy);
+    mbedtls_ssl_config_free(&c->conf);
+    free(c);
+    return NULL;
 }
 
 void p2p_tls_ctx_destroy(p2p_tls_ctx_t *c)
 {
     if (!c) return;
-    SSL_CTX_free(c->ctx);
+    mbedtls_ssl_config_free(&c->conf);
+    mbedtls_ctr_drbg_free(&c->ctr_drbg);
+    mbedtls_entropy_free(&c->entropy);
     free(c);
 }
+
 
 /* ------------------------------------------------------------------ */
 /*  Connection                                                        */
 /* ------------------------------------------------------------------ */
-
-static p2p_socket_t tcp_connect(const char *host, uint16_t port)
-{
-    struct addrinfo hints, *res, *rp;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family   = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-
-    char port_str[8];
-    snprintf(port_str, sizeof(port_str), "%u", port);
-
-    if (getaddrinfo(host, port_str, &hints, &res) != 0)
-        return P2P_INVALID_SOCKET;
-
-    p2p_socket_t fd = P2P_INVALID_SOCKET;
-    for (rp = res; rp; rp = rp->ai_next) {
-        fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-        if (fd == P2P_INVALID_SOCKET) continue;
-        if (connect(fd, rp->ai_addr, (int)rp->ai_addrlen) == 0) break;
-        p2p_socket_close(fd);
-        fd = P2P_INVALID_SOCKET;
-    }
-    freeaddrinfo(res);
-    return fd;
-}
 
 p2p_tls_conn_t *p2p_tls_connect(p2p_tls_ctx_t *ctx,
                                  const char *host, uint16_t port)
 {
     if (!ctx || !host) return NULL;
 
-    p2p_socket_t fd = tcp_connect(host, port);
-    if (fd == P2P_INVALID_SOCKET) return NULL;
+    p2p_tls_conn_t *conn = calloc(1, sizeof(*conn));
+    if (!conn) return NULL;
+    conn->ctx = ctx;
 
-    SSL *ssl = SSL_new(ctx->ctx);
-    if (!ssl) { p2p_socket_close(fd); return NULL; }
+    mbedtls_ssl_init(&conn->ssl);
+    mbedtls_net_init(&conn->net);
 
-    SSL_set_fd(ssl, (int)fd);
-    SSL_set_tlsext_host_name(ssl, host);
+    char port_str[8];
+    snprintf(port_str, sizeof(port_str), "%u", port);
 
-    if (SSL_connect(ssl) != 1) {
-        fprintf(stderr, "[p2p_tls] SSL_connect failed: ");
-        ERR_print_errors_fp(stderr);
-        SSL_free(ssl);
-        p2p_socket_close(fd);
-        return NULL;
+    if (mbedtls_net_connect(&conn->net, host, port_str, MBEDTLS_NET_PROTO_TCP) != 0) {
+        goto fail;
     }
 
-    p2p_tls_conn_t *conn = calloc(1, sizeof(*conn));
-    if (!conn) { SSL_free(ssl); p2p_socket_close(fd); return NULL; }
-    conn->ssl = ssl;
-    conn->fd  = fd;
+    if (mbedtls_ssl_setup(&conn->ssl, &ctx->conf) != 0) {
+        goto fail;
+    }
+
+    mbedtls_ssl_set_hostname(&conn->ssl, host);
+    mbedtls_ssl_set_bio(&conn->ssl, &conn->net,
+                         mbedtls_net_send, mbedtls_net_recv, NULL);
+
+    int ret;
+    while ((ret = mbedtls_ssl_handshake(&conn->ssl)) != 0) {
+        if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+            char errbuf[128];
+            mbedtls_strerror(ret, errbuf, sizeof(errbuf));
+            fprintf(stderr, "[p2p_tls] handshake failed: %s\n", errbuf);
+            goto fail;
+        }
+    }
+
     return conn;
+
+fail:
+    mbedtls_ssl_free(&conn->ssl);
+    mbedtls_net_free(&conn->net);
+    free(conn);
+    return NULL;
 }
 
 void p2p_tls_close(p2p_tls_conn_t *conn)
 {
     if (!conn) return;
-    SSL_shutdown(conn->ssl);
-    SSL_free(conn->ssl);
-    p2p_socket_close(conn->fd);
+    mbedtls_ssl_close_notify(&conn->ssl);
+    mbedtls_ssl_free(&conn->ssl);
+    mbedtls_net_free(&conn->net);
     free(conn);
 }
 
 int p2p_tls_write(p2p_tls_conn_t *conn, const void *buf, int len)
 {
     if (!conn) return -1;
-    return SSL_write(conn->ssl, buf, len);
+    int ret;
+    while ((ret = mbedtls_ssl_write(&conn->ssl, buf, len)) <= 0) {
+        if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE)
+            return -1;
+    }
+    return ret;
 }
 
 int p2p_tls_read(p2p_tls_conn_t *conn, void *buf, int len)
 {
     if (!conn) return -1;
-    return SSL_read(conn->ssl, buf, len);
+    int ret;
+    while ((ret = mbedtls_ssl_read(&conn->ssl, buf, len)) < 0) {
+        if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE)
+            return -1;
+    }
+    return ret;
 }
+
 
 /* ------------------------------------------------------------------ */
 /*  Internal: read exactly n bytes                                    */
@@ -129,19 +170,18 @@ static int tls_read_full(p2p_tls_conn_t *conn, char *buf, int need)
 {
     int got = 0;
     while (got < need) {
-        int n = SSL_read(conn->ssl, buf + got, need - got);
+        int n = p2p_tls_read(conn, buf + got, need - got);
         if (n <= 0) return -1;
         got += n;
     }
     return got;
 }
 
-/* Read one line (up to '\n') into buf. Returns length or -1. */
 static int tls_read_line(p2p_tls_conn_t *conn, char *buf, int buf_sz)
 {
     int i = 0;
     while (i < buf_sz - 1) {
-        int n = SSL_read(conn->ssl, buf + i, 1);
+        int n = p2p_tls_read(conn, buf + i, 1);
         if (n <= 0) return -1;
         if (buf[i] == '\n') { buf[i + 1] = '\0'; return i + 1; }
         i++;
@@ -149,6 +189,7 @@ static int tls_read_line(p2p_tls_conn_t *conn, char *buf, int buf_sz)
     buf[i] = '\0';
     return i;
 }
+
 
 /* ------------------------------------------------------------------ */
 /*  HTTP/1.1 POST                                                     */
@@ -173,13 +214,13 @@ int p2p_https_post(p2p_tls_conn_t *conn, const char *host,
         path, host, body_len, json_body);
 
     if (rlen <= 0 || (size_t)rlen >= sizeof(req)) return -1;
-    if (SSL_write(conn->ssl, req, rlen) != rlen) return -1;
+    if (p2p_tls_write(conn, req, rlen) != rlen) return -1;
 
     /* Read response headers */
     char hdr_buf[4096];
     int hdr_len = 0;
     while (hdr_len < (int)sizeof(hdr_buf) - 1) {
-        int n = SSL_read(conn->ssl, hdr_buf + hdr_len, 1);
+        int n = p2p_tls_read(conn, hdr_buf + hdr_len, 1);
         if (n <= 0) return -1;
         hdr_len++;
         if (hdr_len >= 4 &&
@@ -189,20 +230,17 @@ int p2p_https_post(p2p_tls_conn_t *conn, const char *host,
     }
     hdr_buf[hdr_len] = '\0';
 
-    /* Parse status code */
     int status = 0;
     if (sscanf(hdr_buf, "HTTP/1.1 %d", &status) != 1 &&
         sscanf(hdr_buf, "HTTP/1.0 %d", &status) != 1)
         return -1;
 
-    /* Parse Content-Length */
     int content_len = 0;
     const char *cl = strstr(hdr_buf, "Content-Length:");
     if (!cl) cl = strstr(hdr_buf, "content-length:");
     if (cl) content_len = atoi(cl + 15);
 
     if (content_len <= 0 || (size_t)content_len >= resp_buf_sz) {
-        /* No body or too large -- drain what we can */
         if (content_len > 0 && (size_t)content_len < resp_buf_sz) {
             if (tls_read_full(conn, resp_buf, content_len) < 0) return -1;
             resp_buf[content_len] = '\0';
@@ -216,6 +254,7 @@ int p2p_https_post(p2p_tls_conn_t *conn, const char *host,
     resp_buf[content_len] = '\0';
     return status;
 }
+
 
 /* ------------------------------------------------------------------ */
 /*  HTTP/1.1 GET for SSE                                              */
@@ -236,13 +275,12 @@ int p2p_https_get_sse(p2p_tls_conn_t *conn, const char *host,
         path, host);
 
     if (rlen <= 0 || (size_t)rlen >= sizeof(req)) return -1;
-    if (SSL_write(conn->ssl, req, rlen) != rlen) return -1;
+    if (p2p_tls_write(conn, req, rlen) != rlen) return -1;
 
-    /* Read and discard response headers until blank line */
     char hdr_buf[4096];
     int hdr_len = 0;
     while (hdr_len < (int)sizeof(hdr_buf) - 1) {
-        int n = SSL_read(conn->ssl, hdr_buf + hdr_len, 1);
+        int n = p2p_tls_read(conn, hdr_buf + hdr_len, 1);
         if (n <= 0) return -1;
         hdr_len++;
         if (hdr_len >= 4 &&
@@ -258,6 +296,7 @@ int p2p_https_get_sse(p2p_tls_conn_t *conn, const char *host,
 
     return 0;
 }
+
 
 /* ------------------------------------------------------------------ */
 /*  SSE event reader                                                  */
@@ -279,15 +318,13 @@ int p2p_sse_read_event(p2p_tls_conn_t *conn,
         int n = tls_read_line(conn, line, sizeof(line));
         if (n < 0) return -1;
 
-        /* Strip trailing \r\n */
         while (n > 0 && (line[n-1] == '\n' || line[n-1] == '\r'))
             line[--n] = '\0';
 
-        /* Blank line = end of event */
         if (n == 0) {
             if (event_type[0] != '\0' || data_off > 0)
-                return 0;  /* event complete */
-            continue;       /* spurious blank line, keep reading */
+                return 0;
+            continue;
         }
 
         if (strncmp(line, "event:", 6) == 0) {
@@ -304,6 +341,5 @@ int p2p_sse_read_event(p2p_tls_conn_t *conn,
                 event_data[data_off] = '\0';
             }
         }
-        /* ignore id:, retry:, comments */
     }
 }

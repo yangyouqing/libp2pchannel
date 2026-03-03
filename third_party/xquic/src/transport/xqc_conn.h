@@ -5,7 +5,11 @@
 #ifndef _XQC_CONN_H_INCLUDED_
 #define _XQC_CONN_H_INCLUDED_
 
+#ifndef XQC_USE_MBEDTLS
 #include <openssl/ssl.h>
+#else
+#include <inttypes.h>
+#endif
 #include <xquic/xquic.h>
 #include <xquic/xquic_typedef.h>
 #include "src/transport/xqc_cid.h"
