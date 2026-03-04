@@ -1,9 +1,18 @@
 package config
 
 import (
+	"crypto/rand"
+	"encoding/json"
+	"fmt"
 	"os"
 	"strconv"
 )
+
+type TURNServerConfig struct {
+	Host   string `json:"host"`
+	Port   uint16 `json:"port"`
+	Secret string `json:"secret,omitempty"`
+}
 
 type Config struct {
 	ListenAddr       string
@@ -15,9 +24,12 @@ type Config struct {
 	TURNServerPort   uint16
 	TURNSharedSecret string
 	TURNRealm        string
-	TURNCredTTL      uint32 // seconds
+	TURNCredTTL      uint32
+	TURNServers      []TURNServerConfig
 	MaxSubscribers   int
-	SSEPingInterval  int // seconds
+	SSEPingInterval  int
+	RedisURL         string
+	NodeID           string
 }
 
 func DefaultConfig() *Config {
@@ -37,8 +49,15 @@ func DefaultConfig() *Config {
 	}
 }
 
+func generateNodeID() string {
+	b := make([]byte, 8)
+	rand.Read(b)
+	return fmt.Sprintf("node-%x", b)
+}
+
 func LoadFromEnv() *Config {
 	cfg := DefaultConfig()
+
 	if v := os.Getenv("LISTEN_ADDR"); v != "" {
 		cfg.ListenAddr = v
 	}
@@ -78,5 +97,26 @@ func LoadFromEnv() *Config {
 			cfg.SSEPingInterval = n
 		}
 	}
+	if v := os.Getenv("REDIS_URL"); v != "" {
+		cfg.RedisURL = v
+	}
+	if v := os.Getenv("NODE_ID"); v != "" {
+		cfg.NodeID = v
+	} else {
+		cfg.NodeID = generateNodeID()
+	}
+	if v := os.Getenv("TURN_SERVERS"); v != "" {
+		var servers []TURNServerConfig
+		if err := json.Unmarshal([]byte(v), &servers); err == nil {
+			cfg.TURNServers = servers
+		}
+	}
+
+	if len(cfg.TURNServers) == 0 {
+		cfg.TURNServers = []TURNServerConfig{
+			{Host: cfg.TURNServerHost, Port: cfg.TURNServerPort, Secret: cfg.TURNSharedSecret},
+		}
+	}
+
 	return cfg
 }

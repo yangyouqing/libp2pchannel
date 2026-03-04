@@ -14,10 +14,11 @@ type SignalRequest struct {
 
 // SignalResponse is the JSON response returned by POST /v1/signal.
 type SignalResponse struct {
-	Type   string    `json:"type"`
-	RoomID string    `json:"room_id,omitempty"`
-	Error  string    `json:"error,omitempty"`
-	Turn   *TurnInfo `json:"turn,omitempty"`
+	Type        string     `json:"type"`
+	RoomID      string     `json:"room_id,omitempty"`
+	Error       string     `json:"error,omitempty"`
+	Turn        *TurnInfo  `json:"turn,omitempty"`
+	TurnServers []TurnInfo `json:"turn_servers,omitempty"`
 }
 
 // TurnInfo carries TURN server credentials.
@@ -31,8 +32,8 @@ type TurnInfo struct {
 
 // SSEEvent is pushed to clients over the event stream.
 type SSEEvent struct {
-	Type string // SSE event: field
-	Data string // SSE data: field (JSON)
+	Type string
+	Data string
 }
 
 // PeerInfo is the admin API representation of a connected peer.
@@ -42,6 +43,7 @@ type PeerInfo struct {
 	Role        string `json:"role,omitempty"`
 	Online      bool   `json:"online"`
 	OnlineSince string `json:"online_since,omitempty"`
+	NodeID      string `json:"node_id,omitempty"`
 }
 
 // RoomInfo is the admin API representation of a room.

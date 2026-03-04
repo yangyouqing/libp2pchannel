@@ -3,15 +3,25 @@ package handler
 import (
 	"net/http"
 	"strings"
+	"time"
+
+	"github.com/libp2pchannel/signaling-server/model"
+	"github.com/libp2pchannel/signaling-server/store"
 )
 
-// HandleAdminPeers serves GET /v1/admin/peers -- list all online peers.
 func (h *Handler) HandleAdminPeers(w http.ResponseWriter, r *http.Request) {
-	peers := h.Manager.ListPeers()
-	writeJSON(w, http.StatusOK, map[string]interface{}{"peers": peers})
+	peers, err := h.Store.ListPeers()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	infos := make([]model.PeerInfo, 0, len(peers))
+	for _, p := range peers {
+		infos = append(infos, peerMetaToInfo(&p))
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"peers": infos})
 }
 
-// HandleAdminPeerByID serves GET /v1/admin/peers/{id} -- single peer status.
 func (h *Handler) HandleAdminPeerByID(w http.ResponseWriter, r *http.Request) {
 	peerID := extractPathParam(r.URL.Path, "/v1/admin/peers/")
 	if peerID == "" {
@@ -19,24 +29,38 @@ func (h *Handler) HandleAdminPeerByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	info := h.Manager.GetPeerInfo(peerID)
-	if info == nil {
+	p, err := h.Store.GetPeer(peerID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if p == nil {
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"id":     peerID,
 			"online": false,
 		})
 		return
 	}
-	writeJSON(w, http.StatusOK, info)
+	writeJSON(w, http.StatusOK, peerMetaToInfo(p))
 }
 
-// HandleAdminRooms serves GET /v1/admin/rooms -- list all rooms.
 func (h *Handler) HandleAdminRooms(w http.ResponseWriter, r *http.Request) {
-	rooms := h.Manager.ListRooms()
-	writeJSON(w, http.StatusOK, map[string]interface{}{"rooms": rooms})
+	rooms, err := h.Store.ListRooms()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	infos := make([]model.RoomInfo, 0, len(rooms))
+	for _, rm := range rooms {
+		infos = append(infos, model.RoomInfo{
+			ID:          rm.ID,
+			Publisher:   rm.PublisherID,
+			Subscribers: rm.SubscriberIDs,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"rooms": infos})
 }
 
-// HandleAdminRoomByID serves GET /v1/admin/rooms/{id} -- single room info.
 func (h *Handler) HandleAdminRoomByID(w http.ResponseWriter, r *http.Request) {
 	roomID := extractPathParam(r.URL.Path, "/v1/admin/rooms/")
 	if roomID == "" {
@@ -44,12 +68,20 @@ func (h *Handler) HandleAdminRoomByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	info := h.Manager.GetRoomInfo(roomID)
-	if info == nil {
-		writeError(w, http.StatusNotFound, "room not found")
+	rm, err := h.Store.GetRoom(roomID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, info)
+	if rm == nil {
+		http.Error(w, `{"error":"room not found"}`, http.StatusNotFound)
+		return
+	}
+	writeJSON(w, http.StatusOK, model.RoomInfo{
+		ID:          rm.ID,
+		Publisher:   rm.PublisherID,
+		Subscribers: rm.SubscriberIDs,
+	})
 }
 
 func extractPathParam(path, prefix string) string {
@@ -61,4 +93,23 @@ func extractPathParam(path, prefix string) string {
 		param = param[:i]
 	}
 	return param
+}
+
+func peerMetaToInfo(p *store.PeerMeta) model.PeerInfo {
+	role := "standalone"
+	if p.RoomID != "" {
+		if p.IsPublisher {
+			role = "publisher"
+		} else {
+			role = "subscriber"
+		}
+	}
+	return model.PeerInfo{
+		ID:          p.ID,
+		RoomID:      p.RoomID,
+		Role:        role,
+		Online:      p.NodeID != "",
+		OnlineSince: p.OnlineAt.Format(time.RFC3339),
+		NodeID:      p.NodeID,
+	}
 }

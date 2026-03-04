@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -8,20 +9,22 @@ import (
 	"github.com/libp2pchannel/signaling-server/auth"
 	"github.com/libp2pchannel/signaling-server/config"
 	"github.com/libp2pchannel/signaling-server/model"
-	"github.com/libp2pchannel/signaling-server/room"
+	"github.com/libp2pchannel/signaling-server/pubsub"
+	"github.com/libp2pchannel/signaling-server/store"
 	"github.com/libp2pchannel/signaling-server/turn"
 )
 
-// Handler holds shared state for all HTTP handlers.
 type Handler struct {
-	Manager *room.Manager
-	Config  *config.Config
+	Store  store.Store
+	PubSub pubsub.PubSub
+	Config *config.Config
 }
 
-func NewHandler(cfg *config.Config) *Handler {
+func NewHandler(cfg *config.Config, s store.Store, ps pubsub.PubSub) *Handler {
 	return &Handler{
-		Manager: room.NewManager(cfg.MaxSubscribers),
-		Config:  cfg,
+		Store:  s,
+		PubSub: ps,
+		Config: cfg,
 	}
 }
 
@@ -35,7 +38,6 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, model.SignalResponse{Type: "error", Error: msg})
 }
 
-// HandleSignal dispatches POST /v1/signal requests.
 func (h *Handler) HandleSignal(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "POST required")
@@ -48,7 +50,6 @@ func (h *Handler) HandleSignal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate JWT from request body
 	if req.Token != "" {
 		peerID, err := auth.ValidateToken(req.Token, h.Config.JWTSecret)
 		if err != nil {
@@ -96,8 +97,8 @@ func (h *Handler) handleCreateRoom(w http.ResponseWriter, req *model.SignalReque
 		return
 	}
 
-	peer := h.Manager.EnsurePeer(req.PeerID)
-	if err := h.Manager.CreateRoom(roomID, peer); err != nil {
+	h.Store.EnsurePeer(req.PeerID, h.Config.NodeID)
+	if err := h.Store.CreateRoom(roomID, req.PeerID, h.Config.MaxSubscribers); err != nil {
 		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
@@ -115,68 +116,79 @@ func (h *Handler) handleJoinRoom(w http.ResponseWriter, req *model.SignalRequest
 		return
 	}
 
-	peer := h.Manager.EnsurePeer(req.PeerID)
-	if err := h.Manager.JoinRoom(roomID, peer); err != nil {
+	h.Store.EnsurePeer(req.PeerID, h.Config.NodeID)
+	roomMeta, err := h.Store.JoinRoom(roomID, req.PeerID)
+	if err != nil {
 		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
 
-	// Generate TURN credentials for subscriber
-	username, password := turn.GenerateCredentials(
-		h.Config.TURNSharedSecret, req.PeerID, h.Config.TURNCredTTL)
+	turnInfos := h.generateTURNCredentials(req.PeerID)
 
-	// Also generate TURN credentials for the publisher
-	rm := h.Manager.GetRoom(roomID)
-	if rm != nil && rm.Publisher != nil {
-		pubUser, pubPass := turn.GenerateCredentials(
-			h.Config.TURNSharedSecret, rm.Publisher.ID, h.Config.TURNCredTTL)
-		rm.Publisher.PushJSON("turn_credentials", model.TurnInfo{
-			Username: pubUser,
-			Password: pubPass,
-			Server:   h.Config.TURNServerHost,
-			Port:     h.Config.TURNServerPort,
-			TTL:      h.Config.TURNCredTTL,
+	// Notify publisher via pub/sub and also send TURN credentials
+	if roomMeta.PublisherID != "" {
+		pubTurns := h.generateTURNCredentials(roomMeta.PublisherID)
+		turnData, _ := json.Marshal(pubTurns[0])
+		h.publishToPeer(roomMeta.PublisherID, model.SSEEvent{
+			Type: "turn_credentials",
+			Data: string(turnData),
+		})
+
+		joinedData, _ := json.Marshal(map[string]string{"peer_id": req.PeerID})
+		h.publishToPeer(roomMeta.PublisherID, model.SSEEvent{
+			Type: "peer_joined",
+			Data: string(joinedData),
 		})
 	}
 
 	resp := model.SignalResponse{
-		Type:   "joined",
-		RoomID: roomID,
-		Turn: &model.TurnInfo{
-			Username: username,
-			Password: password,
-			Server:   h.Config.TURNServerHost,
-			Port:     h.Config.TURNServerPort,
-			TTL:      h.Config.TURNCredTTL,
-		},
+		Type:        "joined",
+		RoomID:      roomID,
+		Turn:        &turnInfos[0],
+		TurnServers: turnInfos,
 	}
 
 	writeJSON(w, http.StatusOK, resp)
 }
 
 func (h *Handler) handleLeaveRoom(w http.ResponseWriter, req *model.SignalRequest) {
-	h.Manager.LeaveRoom(req.PeerID)
+	peer, _ := h.Store.GetPeer(req.PeerID)
+	if peer != nil && peer.RoomID != "" {
+		room, _ := h.Store.GetRoom(peer.RoomID)
+		if room != nil {
+			leftData, _ := json.Marshal(map[string]string{"peer_id": req.PeerID})
+			if peer.IsPublisher {
+				for _, subID := range room.SubscriberIDs {
+					h.publishToPeer(subID, model.SSEEvent{
+						Type: "peer_left",
+						Data: string(leftData),
+					})
+				}
+			} else if room.PublisherID != "" {
+				h.publishToPeer(room.PublisherID, model.SSEEvent{
+					Type: "peer_left",
+					Data: string(leftData),
+				})
+			}
+		}
+	}
+	h.Store.LeaveRoom(req.PeerID)
 	writeJSON(w, http.StatusOK, model.SignalResponse{Type: "ok"})
 }
 
-// handleICEForward forwards an ICE offer/answer/gathering_done to the target peer via SSE.
 func (h *Handler) handleICEForward(w http.ResponseWriter, req *model.SignalRequest, eventType string) {
 	if req.To == "" {
 		writeError(w, http.StatusBadRequest, "to required")
 		return
 	}
 
-	payload := map[string]interface{}{
-		"from": req.PeerID,
-	}
+	payload := map[string]interface{}{"from": req.PeerID}
 	if req.SDP != "" {
 		payload["sdp"] = req.SDP
 	}
 
 	data, _ := json.Marshal(payload)
-	evt := model.SSEEvent{Type: eventType, Data: string(data)}
-
-	if err := h.Manager.ForwardToPeer(req.To, evt); err != nil {
+	if err := h.publishToPeer(req.To, model.SSEEvent{Type: eventType, Data: string(data)}); err != nil {
 		log.Printf("[handler] forward %s from %s to %s failed: %v",
 			eventType, req.PeerID, req.To, err)
 		writeError(w, http.StatusNotFound, err.Error())
@@ -197,9 +209,7 @@ func (h *Handler) handleICECandidate(w http.ResponseWriter, req *model.SignalReq
 		"candidate": req.Candidate,
 	}
 	data, _ := json.Marshal(payload)
-	evt := model.SSEEvent{Type: "ice_candidate", Data: string(data)}
-
-	if err := h.Manager.ForwardToPeer(req.To, evt); err != nil {
+	if err := h.publishToPeer(req.To, model.SSEEvent{Type: "ice_candidate", Data: string(data)}); err != nil {
 		writeError(w, http.StatusNotFound, err.Error())
 		return
 	}
@@ -213,21 +223,18 @@ func (h *Handler) handleFullOffer(w http.ResponseWriter, req *model.SignalReques
 		return
 	}
 
-	offer := &room.CachedICE{
+	offer := &store.CachedICE{
 		From:       req.PeerID,
 		SDP:        req.SDP,
 		Candidates: req.Candidates,
 	}
 
-	// Cache it for late-joining subscribers
 	if req.RoomID != "" {
-		h.Manager.CacheOffer(req.RoomID, offer)
+		h.Store.CacheOffer(req.RoomID, offer)
 	}
 
 	data, _ := json.Marshal(offer)
-	evt := model.SSEEvent{Type: "full_offer", Data: string(data)}
-
-	if err := h.Manager.ForwardToPeer(req.To, evt); err != nil {
+	if err := h.publishToPeer(req.To, model.SSEEvent{Type: "full_offer", Data: string(data)}); err != nil {
 		log.Printf("[handler] forward full_offer from %s to %s failed: %v",
 			req.PeerID, req.To, err)
 		writeError(w, http.StatusNotFound, err.Error())
@@ -249,9 +256,7 @@ func (h *Handler) handleFullAnswer(w http.ResponseWriter, req *model.SignalReque
 		"candidates": req.Candidates,
 	}
 	data, _ := json.Marshal(answer)
-	evt := model.SSEEvent{Type: "full_answer", Data: string(data)}
-
-	if err := h.Manager.ForwardToPeer(req.To, evt); err != nil {
+	if err := h.publishToPeer(req.To, model.SSEEvent{Type: "full_answer", Data: string(data)}); err != nil {
 		log.Printf("[handler] forward full_answer from %s to %s failed: %v",
 			req.PeerID, req.To, err)
 		writeError(w, http.StatusNotFound, err.Error())
@@ -259,4 +264,36 @@ func (h *Handler) handleFullAnswer(w http.ResponseWriter, req *model.SignalReque
 	}
 
 	writeJSON(w, http.StatusOK, model.SignalResponse{Type: "ok"})
+}
+
+func (h *Handler) generateTURNCredentials(peerID string) []model.TurnInfo {
+	infos := make([]model.TurnInfo, 0, len(h.Config.TURNServers))
+	for _, ts := range h.Config.TURNServers {
+		secret := ts.Secret
+		if secret == "" {
+			secret = h.Config.TURNSharedSecret
+		}
+		username, password := turn.GenerateCredentials(secret, peerID, h.Config.TURNCredTTL)
+		infos = append(infos, model.TurnInfo{
+			Username: username,
+			Password: password,
+			Server:   ts.Host,
+			Port:     ts.Port,
+			TTL:      h.Config.TURNCredTTL,
+		})
+	}
+	return infos
+}
+
+func (h *Handler) publishToPeer(peerID string, evt model.SSEEvent) error {
+	peer, _ := h.Store.GetPeer(peerID)
+	nodeID := ""
+	if peer != nil {
+		nodeID = peer.NodeID
+	}
+	return h.PubSub.Publish(context.Background(), pubsub.Event{
+		TargetPeerID: peerID,
+		TargetNodeID: nodeID,
+		SSEEvent:     evt,
+	})
 }

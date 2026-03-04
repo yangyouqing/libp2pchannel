@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -8,9 +9,9 @@ import (
 
 	"github.com/libp2pchannel/signaling-server/middleware"
 	"github.com/libp2pchannel/signaling-server/model"
+	"github.com/libp2pchannel/signaling-server/pubsub"
 )
 
-// HandleSSE serves the GET /v1/events SSE endpoint.
 func (h *Handler) HandleSSE(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -18,7 +19,6 @@ func (h *Handler) HandleSSE(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract peer_id from context (set by auth middleware) or query param
 	peerID, _ := r.Context().Value(middleware.PeerIDKey).(string)
 	if peerID == "" {
 		peerID = r.URL.Query().Get("peer_id")
@@ -28,19 +28,48 @@ func (h *Handler) HandleSSE(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Set SSE headers
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no") // disable nginx buffering
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.Header().Set("X-Node-ID", h.Config.NodeID)
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
 	events := make(chan model.SSEEvent, 64)
-	h.Manager.RegisterSSE(peerID, events)
-	defer h.Manager.UnregisterSSE(peerID)
 
-	log.Printf("[sse] peer %s connected", peerID)
+	h.Store.RegisterPeer(peerID, h.Config.NodeID)
+
+	if lps, ok := h.PubSub.(*pubsub.LocalPubSub); ok {
+		lps.RegisterPeer(peerID, events)
+		defer lps.UnregisterPeer(peerID)
+	}
+
+	defer func() {
+		peer, _ := h.Store.GetPeer(peerID)
+		if peer != nil && peer.RoomID != "" {
+			room, _ := h.Store.GetRoom(peer.RoomID)
+			if room != nil {
+				leftData, _ := json.Marshal(map[string]string{"peer_id": peerID})
+				if peer.IsPublisher {
+					for _, subID := range room.SubscriberIDs {
+						h.publishToPeer(subID, model.SSEEvent{
+							Type: "peer_left",
+							Data: string(leftData),
+						})
+					}
+				} else if room.PublisherID != "" {
+					h.publishToPeer(room.PublisherID, model.SSEEvent{
+						Type: "peer_left",
+						Data: string(leftData),
+					})
+				}
+			}
+		}
+		h.Store.UnregisterPeer(peerID)
+	}()
+
+	log.Printf("[sse] peer %s connected (node %s)", peerID, h.Config.NodeID)
 
 	pingInterval := time.Duration(h.Config.SSEPingInterval) * time.Second
 	if pingInterval <= 0 {

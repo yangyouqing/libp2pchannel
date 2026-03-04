@@ -14,6 +14,8 @@ import (
 	"github.com/libp2pchannel/signaling-server/handler"
 	"github.com/libp2pchannel/signaling-server/middleware"
 	"github.com/libp2pchannel/signaling-server/model"
+	"github.com/libp2pchannel/signaling-server/pubsub"
+	"github.com/libp2pchannel/signaling-server/store"
 )
 
 func setupTestServer(t *testing.T, maxSubs int) (*httptest.Server, *config.Config) {
@@ -22,8 +24,14 @@ func setupTestServer(t *testing.T, maxSubs int) (*httptest.Server, *config.Confi
 	cfg.MaxSubscribers = maxSubs
 	cfg.JWTSecret = "test-secret"
 	cfg.AdminSecret = "test-admin"
+	cfg.NodeID = "test-node"
+	cfg.TURNServers = []config.TURNServerConfig{
+		{Host: cfg.TURNServerHost, Port: cfg.TURNServerPort, Secret: cfg.TURNSharedSecret},
+	}
 
-	h := handler.NewHandler(cfg)
+	st := store.NewMemoryStore()
+	ps := pubsub.NewLocalPubSub()
+	h := handler.NewHandler(cfg, st, ps)
 	authMW := middleware.Auth(cfg.JWTSecret, cfg.AdminSecret)
 
 	mux := http.NewServeMux()
@@ -62,7 +70,6 @@ func postSignal(t *testing.T, baseURL string, req model.SignalRequest) model.Sig
 	return sresp
 }
 
-// readSSEEvent reads a single SSE event from a bufio.Reader.
 func readSSEEvent(t *testing.T, reader *bufio.Reader, timeout time.Duration) (string, string) {
 	t.Helper()
 	eventType := ""
@@ -106,7 +113,6 @@ func TestCreateAndJoinRoom(t *testing.T) {
 	pubToken := genToken(t, "publisher-1", cfg.JWTSecret)
 	subToken := genToken(t, "subscriber-1", cfg.JWTSecret)
 
-	// Connect SSE for publisher
 	pubSSEResp, err := http.Get(srv.URL + "/v1/events?peer_id=publisher-1&token=" + pubToken)
 	if err != nil {
 		t.Fatalf("SSE connect: %v", err)
@@ -114,7 +120,6 @@ func TestCreateAndJoinRoom(t *testing.T) {
 	defer pubSSEResp.Body.Close()
 	pubReader := bufio.NewReader(pubSSEResp.Body)
 
-	// Publisher creates room
 	resp := postSignal(t, srv.URL, model.SignalRequest{
 		Type: "create_room", PeerID: "publisher-1", Token: pubToken, RoomID: "test-room",
 	})
@@ -126,14 +131,12 @@ func TestCreateAndJoinRoom(t *testing.T) {
 	}
 	t.Logf("Room created: %s", resp.RoomID)
 
-	// Connect SSE for subscriber
 	subSSEResp, err := http.Get(srv.URL + "/v1/events?peer_id=subscriber-1&token=" + subToken)
 	if err != nil {
 		t.Fatalf("SSE connect: %v", err)
 	}
 	defer subSSEResp.Body.Close()
 
-	// Subscriber joins room
 	joinResp := postSignal(t, srv.URL, model.SignalRequest{
 		Type: "join_room", PeerID: "subscriber-1", Token: subToken, RoomID: "test-room",
 	})
@@ -146,10 +149,13 @@ func TestCreateAndJoinRoom(t *testing.T) {
 	t.Logf("Join response: TURN user=%s server=%s:%d",
 		joinResp.Turn.Username, joinResp.Turn.Server, joinResp.Turn.Port)
 
-	// Publisher should receive peer_joined via SSE
+	if len(joinResp.TurnServers) == 0 {
+		t.Fatal("expected TurnServers array in join response")
+	}
+	t.Logf("TurnServers count: %d", len(joinResp.TurnServers))
+
 	evtType, evtData := readSSEEvent(t, pubReader, 5*time.Second)
 
-	// The publisher may get turn_credentials first, then peer_joined
 	if evtType == "turn_credentials" {
 		t.Logf("Publisher got TURN creds first (expected)")
 		evtType, evtData = readSSEEvent(t, pubReader, 5*time.Second)
@@ -167,7 +173,6 @@ func TestICEForwarding(t *testing.T) {
 	pubToken := genToken(t, "pub1", cfg.JWTSecret)
 	subToken := genToken(t, "sub1", cfg.JWTSecret)
 
-	// Connect SSE for both
 	pubSSEResp, _ := http.Get(srv.URL + "/v1/events?peer_id=pub1&token=" + pubToken)
 	defer pubSSEResp.Body.Close()
 	pubReader := bufio.NewReader(pubSSEResp.Body)
@@ -176,7 +181,6 @@ func TestICEForwarding(t *testing.T) {
 	defer subSSEResp.Body.Close()
 	subReader := bufio.NewReader(subSSEResp.Body)
 
-	// Create + join
 	postSignal(t, srv.URL, model.SignalRequest{
 		Type: "create_room", PeerID: "pub1", Token: pubToken, RoomID: "r1",
 	})
@@ -184,11 +188,9 @@ func TestICEForwarding(t *testing.T) {
 		Type: "join_room", PeerID: "sub1", Token: subToken, RoomID: "r1",
 	})
 
-	// Drain publisher SSE (turn_credentials + peer_joined)
 	readSSEEvent(t, pubReader, 5*time.Second)
 	readSSEEvent(t, pubReader, 5*time.Second)
 
-	// Publisher sends ICE offer to subscriber
 	resp := postSignal(t, srv.URL, model.SignalRequest{
 		Type: "ice_offer", PeerID: "pub1", Token: pubToken,
 		To: "sub1", RoomID: "r1", SDP: "v=0\r\ntest-offer\r\n",
@@ -197,14 +199,12 @@ func TestICEForwarding(t *testing.T) {
 		t.Fatalf("expected ok, got %s: %s", resp.Type, resp.Error)
 	}
 
-	// Subscriber should receive it via SSE
 	evtType, evtData := readSSEEvent(t, subReader, 5*time.Second)
 	if evtType != "ice_offer" {
 		t.Fatalf("expected ice_offer, got %s", evtType)
 	}
 	t.Logf("Subscriber got: %s = %s", evtType, evtData)
 
-	// Subscriber sends ICE answer
 	resp = postSignal(t, srv.URL, model.SignalRequest{
 		Type: "ice_answer", PeerID: "sub1", Token: subToken,
 		To: "pub1", RoomID: "r1", SDP: "v=0\r\ntest-answer\r\n",
@@ -226,7 +226,6 @@ func TestAdminEndpoints(t *testing.T) {
 
 	pubToken := genToken(t, "admin-pub", cfg.JWTSecret)
 
-	// Connect SSE + create room
 	sseResp, _ := http.Get(srv.URL + "/v1/events?peer_id=admin-pub&token=" + pubToken)
 	defer sseResp.Body.Close()
 
@@ -234,7 +233,6 @@ func TestAdminEndpoints(t *testing.T) {
 		Type: "create_room", PeerID: "admin-pub", Token: pubToken, RoomID: "admin-room",
 	})
 
-	// Admin: list peers
 	req, _ := http.NewRequest("GET", srv.URL+"/v1/admin/peers", nil)
 	req.Header.Set("Authorization", "Bearer "+cfg.AdminSecret)
 	resp, err := http.DefaultClient.Do(req)
@@ -253,7 +251,6 @@ func TestAdminEndpoints(t *testing.T) {
 	}
 	t.Logf("Admin peers: %+v", peersResp["peers"])
 
-	// Admin: list rooms
 	req, _ = http.NewRequest("GET", srv.URL+"/v1/admin/rooms", nil)
 	req.Header.Set("Authorization", "Bearer "+cfg.AdminSecret)
 	resp, _ = http.DefaultClient.Do(req)
@@ -266,7 +263,6 @@ func TestAdminEndpoints(t *testing.T) {
 	}
 	t.Logf("Admin rooms: %+v", roomsResp["rooms"])
 
-	// Admin: query specific peer
 	req, _ = http.NewRequest("GET", srv.URL+"/v1/admin/peers/admin-pub", nil)
 	req.Header.Set("Authorization", "Bearer "+cfg.AdminSecret)
 	resp, _ = http.DefaultClient.Do(req)
@@ -303,7 +299,6 @@ func TestMaxSubscribers(t *testing.T) {
 
 	pubToken := genToken(t, "pub", cfg.JWTSecret)
 
-	// SSE + create room
 	sseResp, _ := http.Get(srv.URL + "/v1/events?peer_id=pub&token=" + pubToken)
 	defer sseResp.Body.Close()
 
@@ -311,7 +306,6 @@ func TestMaxSubscribers(t *testing.T) {
 		Type: "create_room", PeerID: "pub", Token: pubToken, RoomID: "limited",
 	})
 
-	// Two subscribers should succeed
 	for i := 1; i <= 2; i++ {
 		subID := "sub" + string(rune('0'+i))
 		subToken := genToken(t, subID, cfg.JWTSecret)
@@ -326,7 +320,6 @@ func TestMaxSubscribers(t *testing.T) {
 		}
 	}
 
-	// Third subscriber should be rejected
 	sub3Token := genToken(t, "sub3", cfg.JWTSecret)
 	resp := postSignal(t, srv.URL, model.SignalRequest{
 		Type: "join_room", PeerID: "sub3", Token: sub3Token, RoomID: "limited",
