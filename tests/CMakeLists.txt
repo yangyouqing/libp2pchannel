@@ -9,3 +9,7 @@ target_link_libraries(test_signaling PRIVATE p2pav)
 # --- ICE connectivity test ---
 add_executable(test_ice_connectivity test_ice_connectivity.c)
 target_link_libraries(test_ice_connectivity PRIVATE p2pav)
+
+# --- libp2pav E2E test (links shared library only, no FFmpeg/SDL) ---
+add_executable(test_p2pav_e2e test_p2pav_e2e.c)
+target_link_libraries(test_p2pav_e2e PRIVATE p2pav)

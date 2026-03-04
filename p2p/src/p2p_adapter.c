@@ -134,6 +134,9 @@ static void ice_on_state_changed(juice_agent_t *agent, juice_state_t state, void
     case JUICE_STATE_FAILED:
         peer->state = P2P_PEER_STATE_FAILED;
         break;
+    case JUICE_STATE_DISCONNECTED:
+        peer->state = P2P_PEER_STATE_CLOSED;
+        break;
     default:
         break;
     }
@@ -506,7 +509,8 @@ int p2p_peer_send_data(p2p_peer_ctx_t *peer, uint8_t type, uint8_t flags,
                        const uint8_t *payload, uint32_t payload_len)
 {
     if (!peer || !peer->ice_agent) return -1;
-    if (peer->state < P2P_PEER_STATE_ICE_CONNECTED) return -1;
+    if (peer->state < P2P_PEER_STATE_ICE_CONNECTED ||
+        peer->state >= P2P_PEER_STATE_FAILED) return -1;
 
     uint8_t buf[P2P_ICE_MTU];
     uint32_t offset = 0;
@@ -545,7 +549,8 @@ int p2p_peer_send_data(p2p_peer_ctx_t *peer, uint8_t type, uint8_t flags,
 int p2p_peer_send_idr_request(p2p_peer_ctx_t *peer)
 {
     if (!peer || !peer->ice_agent) return -1;
-    if (peer->state < P2P_PEER_STATE_ICE_CONNECTED) return -1;
+    if (peer->state < P2P_PEER_STATE_ICE_CONNECTED ||
+        peer->state >= P2P_PEER_STATE_FAILED) return -1;
     uint8_t msg = P2P_FRAME_TYPE_IDR_REQ;
     return juice_send(peer->ice_agent, (const char *)&msg, 1);
 }

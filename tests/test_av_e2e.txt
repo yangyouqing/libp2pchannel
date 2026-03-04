@@ -1,0 +1,10 @@
+写一个 libp2pav.so 的端到端传输测试 test_av_e2e.c，放在 tests/ 下：
+ 	只使用 p2pav.h 的公开 API，链接 libp2pav.so
+	单进程内创建 1 个 publisher session + 1 个 subscriber session，连接同一个信令服务器（地址通过命令行参数传入，默认 127.0.0.1:8443）
+	Publisher 不用真实编解码，生成模拟的已编码帧数据（视频：带 keyframe 标记的随机字节帧；音频：随机字节帧），通过 p2pav_video_send / p2pav_audio_send 发送
+	Subscriber 通过 p2pav_video_set_recv_callback / p2pav_audio_set_recv_callback 接收，验证：能收到视频帧、能收到音频帧、帧大小一致
+	使用 p2pav_get_timing 验证首帧延迟 < 1s
+	运行 30 秒后自动退出，使用 p2pav_get_net_stats 获取网络统计并打印
+	测试 p2pav_session_kick_peer 后 subscriber 不再收到帧
+	测试 p2pav_video_mute / p2pav_audio_mute
+	通过/失败有明确退出码

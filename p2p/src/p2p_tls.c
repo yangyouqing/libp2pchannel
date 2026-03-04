@@ -59,6 +59,8 @@ p2p_tls_ctx_t *p2p_tls_ctx_create(void)
     mbedtls_ssl_conf_authmode(&c->conf, MBEDTLS_SSL_VERIFY_NONE);
     mbedtls_ssl_conf_rng(&c->conf, mbedtls_ctr_drbg_random, &c->ctr_drbg);
     mbedtls_ssl_conf_min_tls_version(&c->conf, MBEDTLS_SSL_VERSION_TLS1_2);
+    /* Disable SSL debug callback to avoid crashes with concurrent TLS connections. */
+    mbedtls_ssl_conf_dbg(&c->conf, NULL, NULL);
 
     return c;
 
@@ -274,14 +276,23 @@ int p2p_https_get_sse(p2p_tls_conn_t *conn, const char *host,
         "\r\n",
         path, host);
 
-    if (rlen <= 0 || (size_t)rlen >= sizeof(req)) return -1;
-    if (p2p_tls_write(conn, req, rlen) != rlen) return -1;
+    if (rlen <= 0 || (size_t)rlen >= sizeof(req)) {
+        fprintf(stderr, "[sig] SSE request too long (%d bytes)\n", rlen);
+        return -1;
+    }
+    if (p2p_tls_write(conn, req, rlen) != rlen) {
+        fprintf(stderr, "[sig] SSE write failed\n");
+        return -1;
+    }
 
     char hdr_buf[4096];
     int hdr_len = 0;
     while (hdr_len < (int)sizeof(hdr_buf) - 1) {
         int n = p2p_tls_read(conn, hdr_buf + hdr_len, 1);
-        if (n <= 0) return -1;
+        if (n <= 0) {
+            fprintf(stderr, "[sig] SSE read failed at byte %d (n=%d)\n", hdr_len, n);
+            return -1;
+        }
         hdr_len++;
         if (hdr_len >= 4 &&
             hdr_buf[hdr_len-4] == '\r' && hdr_buf[hdr_len-3] == '\n' &&
@@ -291,8 +302,14 @@ int p2p_https_get_sse(p2p_tls_conn_t *conn, const char *host,
     hdr_buf[hdr_len] = '\0';
 
     int status = 0;
-    if (sscanf(hdr_buf, "HTTP/1.1 %d", &status) != 1) return -1;
-    if (status != 200) return -1;
+    if (sscanf(hdr_buf, "HTTP/1.1 %d", &status) != 1) {
+        fprintf(stderr, "[sig] SSE: cannot parse HTTP status from: %.80s\n", hdr_buf);
+        return -1;
+    }
+    if (status != 200) {
+        fprintf(stderr, "[sig] SSE: HTTP %d\n%.200s\n", status, hdr_buf);
+        return -1;
+    }
 
     return 0;
 }

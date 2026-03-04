@@ -51,8 +51,15 @@ if [[ "$P2P_OS" == "windows" ]]; then
     DEFAULT_AUDIO_DEV="Microphone"
 else
     EXE_EXT=""
-    DEFAULT_VIDEO_DEV="/dev/video0"
     DEFAULT_AUDIO_DEV="default"
+    # Auto-detect the first real (non-loopback) V4L2 camera
+    DEFAULT_VIDEO_DEV="/dev/video0"
+    for vdev in /dev/video*; do
+        if [[ -c "$vdev" ]] && v4l2-ctl -d "$vdev" --info 2>/dev/null | grep -q "uvcvideo"; then
+            DEFAULT_VIDEO_DEV="$vdev"
+            break
+        fi
+    done
 fi
 
 DEPLOY_DIR="${DEPLOY_DIR:-$PROJECT_DIR/deploy/client}"

@@ -8,7 +8,7 @@
 #     deps/                 Downloaded cross-compilation dependencies
 #       ffmpeg/             Pre-built FFmpeg MinGW-w64 libraries
 #       SDL2/               Pre-built SDL2 MinGW-w64 libraries
-#     boringssl/            Cross-compiled BoringSSL
+#     mbedtls/              Cross-compiled mbedTLS
 #     xquic/                Cross-compiled xquic
 #     p2p/                  p2p_client.exe, p2p_peer.exe
 #     signaling-server.exe  Go signaling server
@@ -171,30 +171,29 @@ export PKG_CONFIG_SYSROOT_DIR=""
 export PKG_CONFIG_LIBDIR="$FFMPEG_DIR/lib/pkgconfig:$SDL2_DIR/lib/pkgconfig"
 
 # ============================================================
-# Step 3: Cross-compile BoringSSL -> build_win/boringssl/
+# Step 3: Cross-compile mbedTLS -> build_win/mbedtls/
 # ============================================================
-BORINGSSL_SRC="$PROJECT_DIR/third_party/xquic/third_party/boringssl"
-BORINGSSL_BUILD="$BUILD_DIR/boringssl"
-BORINGSSL_LIB="$BORINGSSL_BUILD/libssl.a"
+MBEDTLS_SRC="$PROJECT_DIR/third_party/mbedtls"
+MBEDTLS_BUILD="$BUILD_DIR/mbedtls"
+MBEDTLS_LIB="$MBEDTLS_BUILD/library/libmbedcrypto.a"
 
-if [[ ! -f "$BORINGSSL_LIB" ]]; then
-    log "Cross-compiling BoringSSL..."
+if [[ ! -f "$MBEDTLS_LIB" ]]; then
+    log "Cross-compiling mbedTLS..."
 
-    if [[ ! -d "$BORINGSSL_SRC" ]]; then
-        log "Cloning BoringSSL..."
-        mkdir -p "$PROJECT_DIR/third_party/xquic/third_party"
-        git clone --depth 1 https://boringssl.googlesource.com/boringssl "$BORINGSSL_SRC"
+    if [[ ! -d "$MBEDTLS_SRC/include" ]]; then
+        die "mbedTLS source not found at $MBEDTLS_SRC. Run: git clone --depth 1 -b v3.6.2 https://github.com/Mbed-TLS/mbedtls.git $MBEDTLS_SRC"
     fi
 
-    cmake -B "$BORINGSSL_BUILD" -S "$BORINGSSL_SRC" \
+    cmake -B "$MBEDTLS_BUILD" -S "$MBEDTLS_SRC" \
         -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN_FILE" \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DOPENSSL_NO_ASM=1 \
-        -DCMAKE_POSITION_INDEPENDENT_CODE=ON
-    cmake --build "$BORINGSSL_BUILD" --target ssl crypto -j"$JOBS"
-    log "BoringSSL cross-compiled -> $BORINGSSL_BUILD/"
+        -DCMAKE_BUILD_TYPE=MinSizeRel \
+        -DCMAKE_C_FLAGS="-Os" \
+        -DENABLE_TESTING=OFF \
+        -DENABLE_PROGRAMS=OFF
+    cmake --build "$MBEDTLS_BUILD" -j"$JOBS"
+    log "mbedTLS cross-compiled -> $MBEDTLS_BUILD/"
 else
-    log "BoringSSL already cross-compiled, skipping."
+    log "mbedTLS already cross-compiled, skipping."
 fi
 
 # ============================================================
@@ -205,12 +204,11 @@ XQUIC_BUILD="$BUILD_DIR/xquic"
 XQUIC_LIB="$XQUIC_BUILD/libxquic-static.a"
 
 if [[ ! -f "$XQUIC_LIB" ]]; then
-    log "Cross-compiling xquic..."
+    log "Cross-compiling xquic (with mbedTLS)..."
 
     # Patch xquic CMakeLists.txt for MinGW cross-compilation:
     #   1. Remove -Werror (Windows block that disables it runs too late)
     #   2. Remove add_definitions(-DXQC_SYS_WINDOWS=1) to avoid redefinition
-    #      (the header already defines it based on _WIN32)
     XQUIC_CMAKE="$XQUIC_SRC/CMakeLists.txt"
     XQUIC_CMAKE_BAK="$XQUIC_CMAKE.bak.cross"
     if [[ ! -f "$XQUIC_CMAKE_BAK" ]]; then
@@ -219,14 +217,14 @@ if [[ ! -f "$XQUIC_LIB" ]]; then
     sed -i 's/-Werror //g' "$XQUIC_CMAKE"
     sed -i '/add_definitions(-DXQC_SYS_WINDOWS/d' "$XQUIC_CMAKE"
 
-    BORINGSSL_CRYPTO_LIB="$BORINGSSL_BUILD/libcrypto.a"
     cmake -B "$XQUIC_BUILD" -S "$XQUIC_SRC" \
         -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN_FILE" \
-        -DSSL_TYPE=boringssl \
-        -DSSL_PATH="$BORINGSSL_SRC" \
-        -DSSL_INC_PATH="$BORINGSSL_SRC/include" \
-        -DSSL_LIB_PATH="$BORINGSSL_LIB;$BORINGSSL_CRYPTO_LIB" \
+        -DSSL_TYPE=mbedtls \
+        -DMBEDTLS_PATH="$MBEDTLS_SRC" \
+        -DMBEDTLS_BUILD_PATH="$MBEDTLS_BUILD" \
+        -DSSL_INC_PATH="$MBEDTLS_SRC/include" \
         -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
         -DXQC_ENABLE_TESTING=OFF \
         -DCMAKE_C_FLAGS="-I${COMPAT_DIR}"
     cmake --build "$XQUIC_BUILD" --target xquic-static -j"$JOBS"
@@ -247,8 +245,8 @@ log "Cross-compiling libp2pchannel (p2p_client.exe + p2p_peer.exe)..."
 CMAKE_EXTRA_ARGS=(
     -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN_FILE"
     -DCMAKE_BUILD_TYPE=Release
-    -DBORINGSSL_BUILD_DIR="$BORINGSSL_BUILD"
-    -DBORINGSSL_SRC_DIR="$BORINGSSL_SRC"
+    -DMBEDTLS_BUILD_DIR="$MBEDTLS_BUILD"
+    -DMBEDTLS_SRC_DIR="$MBEDTLS_SRC"
     -DXQUIC_BUILD_DIR="$XQUIC_BUILD"
     -DXQUIC_SRC_DIR="$XQUIC_SRC"
     -DXQUIC_LIB_PATH="$XQUIC_BUILD"

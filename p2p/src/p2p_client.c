@@ -64,13 +64,20 @@ static client_ctx_t g_ctx;
 
 /* ---- Send helpers ---- */
 
+static int peer_is_sendable(p2p_peer_ctx_t *peer)
+{
+    return peer->ice_agent &&
+           peer->state >= P2P_PEER_STATE_ICE_CONNECTED &&
+           peer->state < P2P_PEER_STATE_FAILED;
+}
+
 static void send_to_all_peers(client_ctx_t *ctx, uint8_t type, uint8_t flags,
                               uint32_t seq, uint64_t ts,
                               const uint8_t *data, uint32_t len)
 {
     for (int i = 0; i < P2P_MAX_SUBSCRIBERS; i++) {
         p2p_peer_ctx_t *peer = &ctx->engine.peers[i];
-        if (peer->state >= P2P_PEER_STATE_ICE_CONNECTED && peer->ice_agent) {
+        if (peer_is_sendable(peer)) {
             p2p_peer_send_data(peer, type, flags, seq, ts, data, len);
         }
     }
@@ -238,6 +245,18 @@ static void on_data_recv(p2p_peer_ctx_t *peer, const p2p_frame_header_t *hdr,
 
 /* ---- Adapter callbacks ---- */
 
+static int count_active_peers(client_ctx_t *ctx)
+{
+    int n = 0;
+    for (int i = 0; i < P2P_MAX_SUBSCRIBERS; i++) {
+        p2p_peer_ctx_t *p = &ctx->engine.peers[i];
+        if (p->ice_agent && p->state >= P2P_PEER_STATE_ICE_CONNECTED &&
+            p->state < P2P_PEER_STATE_FAILED)
+            n++;
+    }
+    return n;
+}
+
 static void on_ice_state(p2p_peer_ctx_t *peer, juice_state_t state, void *user_data)
 {
     client_ctx_t *ctx = (client_ctx_t *)user_data;
@@ -252,6 +271,11 @@ static void on_ice_state(p2p_peer_ctx_t *peer, juice_state_t state, void *user_d
         send_idr_to_peer(ctx, peer);
     } else if (state == JUICE_STATE_COMPLETED) {
         fprintf(stderr, "[client] ICE completed with %s\n", peer->peer_id);
+    } else if (state == JUICE_STATE_FAILED || state == JUICE_STATE_DISCONNECTED) {
+        fprintf(stderr, "[client] peer %s ICE %s\n",
+                peer->peer_id,
+                state == JUICE_STATE_FAILED ? "failed" : "disconnected");
+        fprintf(stderr, "[client] active peers: %d\n", count_active_peers(ctx));
     }
 }
 

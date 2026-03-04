@@ -79,58 +79,61 @@ set_target_properties(p2pav PROPERTIES
     VERSION   ${PROJECT_VERSION}
     SOVERSION 1
     OUTPUT_NAME p2pav
+    WINDOWS_EXPORT_ALL_SYMBOLS ON
 )
 target_include_directories(p2pav PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
-# libjuice (PUBLIC: p2p_adapter.h exposes juice types)
-if(TARGET juice)
-    target_link_libraries(p2pav PUBLIC juice)
-else()
-    if(JUICE_LIB AND JUICE_INCLUDE)
-        target_link_libraries(p2pav PUBLIC ${JUICE_LIB})
-        target_include_directories(p2pav PUBLIC ${JUICE_INCLUDE})
+# Static helper lib for executables that need internal symbols
+add_library(p2pav_static STATIC ${P2PAV_TRANSPORT_SOURCES})
+target_include_directories(p2pav_static PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+# --- Helper macro to configure dependencies for both p2pav and p2pav_static ---
+foreach(_tls_tgt p2pav p2pav_static)
+    # libjuice
+    if(TARGET juice)
+        target_link_libraries(${_tls_tgt} PUBLIC juice)
+    else()
+        if(JUICE_LIB AND JUICE_INCLUDE)
+            target_link_libraries(${_tls_tgt} PUBLIC ${JUICE_LIB})
+            target_include_directories(${_tls_tgt} PUBLIC ${JUICE_INCLUDE})
+        endif()
     endif()
-endif()
 
-# xquic
-target_include_directories(p2pav PUBLIC "${_XQUIC_SRC_DIR}/include")
-if(EXISTS "${_XQUIC_BUILD_DIR}/include")
-    target_include_directories(p2pav PUBLIC "${_XQUIC_BUILD_DIR}/include")
-endif()
-if(TARGET xquic-static)
-    target_link_libraries(p2pav PUBLIC xquic-static)
-elseif(XQUIC_LIB)
-    target_link_libraries(p2pav PUBLIC ${XQUIC_LIB})
-endif()
+    # xquic
+    target_include_directories(${_tls_tgt} PUBLIC "${_XQUIC_SRC_DIR}/include")
+    if(EXISTS "${_XQUIC_BUILD_DIR}/include")
+        target_include_directories(${_tls_tgt} PUBLIC "${_XQUIC_BUILD_DIR}/include")
+    endif()
+    if(TARGET xquic-static)
+        target_link_libraries(${_tls_tgt} PUBLIC xquic-static)
+    elseif(XQUIC_LIB)
+        target_link_libraries(${_tls_tgt} PUBLIC ${XQUIC_LIB})
+    endif()
 
-# TLS library
-if(EXISTS "${_MBEDTLS_BUILD_DIR}/library/libmbedtls.a")
-    target_compile_definitions(p2pav PRIVATE XQC_USE_MBEDTLS=1)
-    target_link_libraries(p2pav PRIVATE
-        "${_MBEDTLS_BUILD_DIR}/library/libmbedtls.a"
-        "${_MBEDTLS_BUILD_DIR}/library/libmbedx509.a"
-        "${_MBEDTLS_BUILD_DIR}/library/libmbedcrypto.a")
-    target_include_directories(p2pav PRIVATE "${_MBEDTLS_SRC_DIR}/include")
-elseif(EXISTS "${_BORINGSSL_BUILD_DIR}/libssl.a")
-    target_link_libraries(p2pav PRIVATE
-        "${_BORINGSSL_BUILD_DIR}/libssl.a"
-        "${_BORINGSSL_BUILD_DIR}/libcrypto.a")
-    target_include_directories(p2pav PRIVATE "${_BORINGSSL_SRC_DIR}/include")
-elseif(WIN32 AND EXISTS "${_BORINGSSL_BUILD_DIR}/ssl.lib")
-    target_link_libraries(p2pav PRIVATE
-        "${_BORINGSSL_BUILD_DIR}/ssl.lib"
-        "${_BORINGSSL_BUILD_DIR}/crypto.lib")
-    target_include_directories(p2pav PRIVATE "${_BORINGSSL_SRC_DIR}/include")
-else()
-    find_package(OpenSSL REQUIRED)
-    target_link_libraries(p2pav PRIVATE OpenSSL::SSL OpenSSL::Crypto)
-endif()
+    # TLS library
+    if(EXISTS "${_MBEDTLS_BUILD_DIR}/library/libmbedtls.a")
+        target_compile_definitions(${_tls_tgt} PRIVATE XQC_USE_MBEDTLS=1)
+        target_link_libraries(${_tls_tgt} PRIVATE
+            "${_MBEDTLS_BUILD_DIR}/library/libmbedtls.a"
+            "${_MBEDTLS_BUILD_DIR}/library/libmbedx509.a"
+            "${_MBEDTLS_BUILD_DIR}/library/libmbedcrypto.a")
+        target_include_directories(${_tls_tgt} PRIVATE "${_MBEDTLS_SRC_DIR}/include")
+    elseif(EXISTS "${_BORINGSSL_BUILD_DIR}/libssl.a")
+        target_link_libraries(${_tls_tgt} PRIVATE
+            "${_BORINGSSL_BUILD_DIR}/libssl.a"
+            "${_BORINGSSL_BUILD_DIR}/libcrypto.a")
+        target_include_directories(${_tls_tgt} PRIVATE "${_BORINGSSL_SRC_DIR}/include")
+    else()
+        find_package(OpenSSL REQUIRED)
+        target_link_libraries(${_tls_tgt} PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    endif()
 
-if(WIN32)
-    target_link_libraries(p2pav PUBLIC stdc++ ws2_32)
-else()
-    target_link_libraries(p2pav PUBLIC stdc++ m Threads::Threads)
-endif()
+    if(WIN32)
+        target_link_libraries(${_tls_tgt} PUBLIC stdc++ ws2_32)
+    else()
+        target_link_libraries(${_tls_tgt} PUBLIC stdc++ m Threads::Threads)
+    endif()
+endforeach()
 
 # --- Executables (link against shared libp2pav + media dependencies) ---
 # Media-specific sources compiled directly into the executables
@@ -144,11 +147,11 @@ set(P2P_MEDIA_SOURCES
 
 add_executable(p2p_client src/p2p_client.c ${P2P_MEDIA_SOURCES})
 target_include_directories(p2p_client PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(p2p_client PRIVATE p2pav)
+target_link_libraries(p2p_client PRIVATE p2pav_static)
 
 add_executable(p2p_peer src/p2p_peer.c ${P2P_MEDIA_SOURCES})
 target_include_directories(p2p_peer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(p2p_peer PRIVATE p2pav)
+target_link_libraries(p2p_peer PRIVATE p2pav_static)
 
 # FFmpeg for executables
 if(WIN32)

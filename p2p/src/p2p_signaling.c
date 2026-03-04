@@ -463,6 +463,7 @@ int p2p_signaling_connect(p2p_signaling_client_t *c, const p2p_signaling_config_
     char host_hdr[280];
     snprintf(host_hdr, sizeof(host_hdr), "%s:%u", c->server_host, c->server_port);
 
+    fprintf(stderr, "[sig] SSE path: %s (token len=%zu)\n", sse_path, strlen(c->token));
     if (p2p_https_get_sse(c->sse_conn, host_hdr, sse_path) != 0) {
         fprintf(stderr, "[sig] SSE handshake failed\n");
         p2p_tls_close(c->sse_conn);   c->sse_conn  = NULL;
