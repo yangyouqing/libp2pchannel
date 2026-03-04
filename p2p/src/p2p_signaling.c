@@ -496,12 +496,20 @@ void p2p_signaling_disconnect(p2p_signaling_client_t *c)
 {
     if (!c) return;
     c->running = 0;
+
+    /* Shutdown the SSE socket to unblock the reader thread,
+     * but do NOT free the connection yet. */
+    if (c->sse_conn)
+        p2p_tls_shutdown(c->sse_conn);
+
+    /* Now the SSE thread's blocking read will return an error and exit. */
+    if (c->connected)
+        p2p_thread_join(c->sse_thread);
+
+    /* Safe to free TLS resources after the thread has exited. */
     if (c->sse_conn) {
         p2p_tls_close(c->sse_conn);
         c->sse_conn = NULL;
-    }
-    if (c->connected) {
-        p2p_thread_join(c->sse_thread);
     }
     if (c->post_conn) {
         p2p_tls_close(c->post_conn);

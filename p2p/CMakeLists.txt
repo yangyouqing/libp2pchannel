@@ -147,11 +147,11 @@ set(P2P_MEDIA_SOURCES
 
 add_executable(p2p_client src/p2p_client.c ${P2P_MEDIA_SOURCES})
 target_include_directories(p2p_client PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(p2p_client PRIVATE p2pav_static)
+target_link_libraries(p2p_client PRIVATE p2pav)
 
 add_executable(p2p_peer src/p2p_peer.c ${P2P_MEDIA_SOURCES})
 target_include_directories(p2p_peer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(p2p_peer PRIVATE p2pav_static)
+target_link_libraries(p2p_peer PRIVATE p2pav)
 
 # FFmpeg for executables
 if(WIN32)

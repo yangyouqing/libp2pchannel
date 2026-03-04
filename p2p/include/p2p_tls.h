@@ -17,6 +17,7 @@ void            p2p_tls_ctx_destroy(p2p_tls_ctx_t *ctx);
 
 /* TLS connection lifecycle */
 p2p_tls_conn_t *p2p_tls_connect(p2p_tls_ctx_t *ctx, const char *host, uint16_t port);
+void            p2p_tls_shutdown(p2p_tls_conn_t *conn);
 void            p2p_tls_close(p2p_tls_conn_t *conn);
 int             p2p_tls_write(p2p_tls_conn_t *conn, const void *buf, int len);
 int             p2p_tls_read(p2p_tls_conn_t *conn, void *buf, int len);

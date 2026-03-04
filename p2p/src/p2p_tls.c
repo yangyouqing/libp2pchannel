@@ -132,6 +132,12 @@ fail:
     return NULL;
 }
 
+void p2p_tls_shutdown(p2p_tls_conn_t *conn)
+{
+    if (!conn) return;
+    mbedtls_net_free(&conn->net);
+}
+
 void p2p_tls_close(p2p_tls_conn_t *conn)
 {
     if (!conn) return;
