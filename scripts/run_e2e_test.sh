@@ -39,7 +39,7 @@ pass "C components built successfully"
 
 # Step 2: Build Go signaling server
 info "Step 2: Building Go signaling server..."
-cd "$PROJECT_DIR/signaling-server"
+cd "$PROJECT_DIR/src/signaling-server"
 go build -o signaling-server . > /dev/null 2>&1
 pass "Go signaling server built successfully"
 
@@ -54,7 +54,7 @@ fi
 
 # Step 4: Run Go integration tests
 info "Step 4: Running Go signaling server integration tests..."
-cd "$PROJECT_DIR/signaling-server"
+cd "$PROJECT_DIR/src/signaling-server"
 if go test -v -count=1 ./... 2>&1 | grep -q "^ok"; then
     pass "Go signaling server integration tests"
 else
@@ -81,9 +81,9 @@ echo -e "  ${GREEN}All available tests passed!${NC}"
 echo "============================================"
 echo ""
 echo "Project structure:"
-echo "  p2p/include/    - Adapter + Publisher/Subscriber headers"
-echo "  p2p/src/        - C implementation"
-echo "  signaling-server/ - Go signaling server"
+echo "  src/p2p/include/ - Adapter + Publisher/Subscriber headers"
+echo "  src/p2p/src/     - C implementation"
+echo "  src/signaling-server/ - Go signaling server"
 echo "  conf/           - coturn configuration"
 echo "  scripts/        - Startup and test scripts"
 echo ""

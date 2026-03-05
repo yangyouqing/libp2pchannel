@@ -1,0 +1,107 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: signaling-config
+  namespace: p2p-av
+  labels:
+    app.kubernetes.io/name: signaling
+    app.kubernetes.io/part-of: p2p-av
+data:
+  LISTEN_ADDR: ":8443"
+  TLS_CERT_FILE: "/tls/tls.crt"
+  TLS_KEY_FILE: "/tls/tls.key"
+  REDIS_URL: "redis://redis.p2p-av.svc:6379/0"
+  MAX_SUBSCRIBERS: "10"
+  SSE_PING_INTERVAL: "15"
+  # Update TURN_SERVERS to match your coturn deployment.
+  # For hostNetwork coturn on the same node, use the node IP.
+  TURN_SERVERS: '[{"host":"192.168.31.80","port":3478}]'
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: signaling
+  namespace: p2p-av
+  labels:
+    app.kubernetes.io/name: signaling
+    app.kubernetes.io/part-of: p2p-av
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: signaling
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: signaling
+        app.kubernetes.io/part-of: p2p-av
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: signaling
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: signaling
+          image: p2p-signaling:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: https
+              containerPort: 8443
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: signaling-config
+          env:
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: p2p-secrets
+                  key: jwt-secret
+            - name: ADMIN_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: p2p-secrets
+                  key: admin-secret
+            - name: TURN_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: p2p-secrets
+                  key: turn-secret
+          volumeMounts:
+            - name: tls-certs
+              mountPath: /tls
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: https
+              scheme: HTTPS
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: https
+              scheme: HTTPS
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+      volumes:
+        - name: tls-certs
+          secret:
+            secretName: signaling-tls

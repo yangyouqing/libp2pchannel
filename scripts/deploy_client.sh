@@ -137,7 +137,7 @@ if ! $SKIP_BUILD; then
 fi
 
 # Verify binaries exist
-CLIENT_BIN="$BUILD_DIR/p2p/p2p_client${EXE_EXT}"
+CLIENT_BIN="$BUILD_DIR/src/p2p/p2p_client${EXE_EXT}"
 SIGNALING_BIN="$BUILD_DIR/signaling-server${EXE_EXT}"
 
 for bin in "$CLIENT_BIN" "$SIGNALING_BIN"; do
@@ -182,10 +182,10 @@ cp -f "$CERT_DIR/server.key" "$DEPLOY_DIR/certs/"
 
 # Copy shared library
 if [[ "$P2P_OS" == "windows" ]]; then
-    cp -f "$BUILD_DIR/p2p/libp2pav.dll" "$DEPLOY_DIR/lib/" 2>/dev/null || true
-    cp -f "$BUILD_DIR/p2p/p2pav.dll"    "$DEPLOY_DIR/lib/" 2>/dev/null || true
+    cp -f "$BUILD_DIR/src/p2p/libp2pav.dll" "$DEPLOY_DIR/lib/" 2>/dev/null || true
+    cp -f "$BUILD_DIR/src/p2p/p2pav.dll"    "$DEPLOY_DIR/lib/" 2>/dev/null || true
 else
-    cp -f "$BUILD_DIR/p2p/libp2pav.so"* "$DEPLOY_DIR/lib/" 2>/dev/null || true
+    cp -f "$BUILD_DIR/src/p2p/libp2pav.so"* "$DEPLOY_DIR/lib/" 2>/dev/null || true
 fi
 log "Shared library deployed to $DEPLOY_DIR/lib/"
 

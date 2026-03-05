@@ -114,7 +114,7 @@ if ! $SKIP_BUILD; then
 fi
 
 # Verify binary exists
-PEER_BIN="$BUILD_DIR/p2p/p2p_peer${EXE_EXT}"
+PEER_BIN="$BUILD_DIR/src/p2p/p2p_peer${EXE_EXT}"
 if [[ ! -f "$PEER_BIN" ]]; then
     log "ERROR: $PEER_BIN not found. Run without --skip-build first."
     exit 1
@@ -137,10 +137,10 @@ cp -f "$PEER_BIN" "$DEPLOY_DIR/bin/"
 
 # Copy shared library
 if [[ "$P2P_OS" == "windows" ]]; then
-    cp -f "$BUILD_DIR/p2p/libp2pav.dll" "$DEPLOY_DIR/lib/" 2>/dev/null || true
-    cp -f "$BUILD_DIR/p2p/p2pav.dll"    "$DEPLOY_DIR/lib/" 2>/dev/null || true
+    cp -f "$BUILD_DIR/src/p2p/libp2pav.dll" "$DEPLOY_DIR/lib/" 2>/dev/null || true
+    cp -f "$BUILD_DIR/src/p2p/p2pav.dll"    "$DEPLOY_DIR/lib/" 2>/dev/null || true
 else
-    cp -f "$BUILD_DIR/p2p/libp2pav.so"* "$DEPLOY_DIR/lib/" 2>/dev/null || true
+    cp -f "$BUILD_DIR/src/p2p/libp2pav.so"* "$DEPLOY_DIR/lib/" 2>/dev/null || true
 fi
 log "Shared library deployed to $DEPLOY_DIR/lib/"
 

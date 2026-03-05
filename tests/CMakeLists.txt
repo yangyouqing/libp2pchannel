@@ -22,12 +22,12 @@ target_link_libraries(test_p2pav_stress PRIVATE p2pav)
 # --- p2p_publisher / p2p_subscriber middleware + codec test ---
 add_executable(test_p2p_middleware
     test_p2p_middleware.c
-    ${PROJECT_SOURCE_DIR}/p2p/src/p2p_publisher.c
-    ${PROJECT_SOURCE_DIR}/p2p/src/p2p_subscriber.c
-    ${PROJECT_SOURCE_DIR}/p2p/src/p2p_av_codec.c
+    ${PROJECT_SOURCE_DIR}/src/p2p/src/p2p_publisher.c
+    ${PROJECT_SOURCE_DIR}/src/p2p/src/p2p_subscriber.c
+    ${PROJECT_SOURCE_DIR}/src/p2p/src/p2p_av_codec.c
 )
 target_include_directories(test_p2p_middleware PRIVATE
-    ${PROJECT_SOURCE_DIR}/p2p/include)
+    ${PROJECT_SOURCE_DIR}/src/p2p/include)
 target_link_libraries(test_p2p_middleware PRIVATE p2pav)
 
 pkg_check_modules(MW_AVCODEC    REQUIRED libavcodec)

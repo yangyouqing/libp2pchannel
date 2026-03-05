@@ -32,18 +32,13 @@ if(BUILD_LIBJUICE)
     add_subdirectory(third_party/libjuice)
 endif()
 
-# === coturn ===
-if(BUILD_COTURN)
-    add_subdirectory(coturn)
-endif()
-
 # === P2P adapter library ===
-add_subdirectory(p2p)
+add_subdirectory(src/p2p)
 
 # === Examples ===
 option(BUILD_EXAMPLES "Build libp2pav usage examples" ON)
 if(BUILD_EXAMPLES)
-    add_subdirectory(examples)
+    add_subdirectory(src/examples)
 endif()
 
 # === Test programs ===

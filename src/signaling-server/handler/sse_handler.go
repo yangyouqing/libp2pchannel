@@ -9,7 +9,6 @@ import (
 
 	"github.com/libp2pchannel/signaling-server/middleware"
 	"github.com/libp2pchannel/signaling-server/model"
-	"github.com/libp2pchannel/signaling-server/pubsub"
 )
 
 func (h *Handler) HandleSSE(w http.ResponseWriter, r *http.Request) {
@@ -39,11 +38,8 @@ func (h *Handler) HandleSSE(w http.ResponseWriter, r *http.Request) {
 	events := make(chan model.SSEEvent, 64)
 
 	h.Store.RegisterPeer(peerID, h.Config.NodeID)
-
-	if lps, ok := h.PubSub.(*pubsub.LocalPubSub); ok {
-		lps.RegisterPeer(peerID, events)
-		defer lps.UnregisterPeer(peerID)
-	}
+	h.PubSub.RegisterPeer(peerID, events)
+	defer h.PubSub.UnregisterPeer(peerID)
 
 	defer func() {
 		peer, _ := h.Store.GetPeer(peerID)

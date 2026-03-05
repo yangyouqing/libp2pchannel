@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sync"
 
 	"github.com/libp2pchannel/signaling-server/model"
 	"github.com/redis/go-redis/v9"
@@ -28,6 +29,8 @@ type RedisPubSub struct {
 	sub    *redis.PubSub
 	out    chan Event
 	done   chan struct{}
+	peers  map[string]chan model.SSEEvent
+	mu     sync.RWMutex
 }
 
 func NewRedisPubSub(redisURL, nodeID string) (*RedisPubSub, error) {
@@ -51,6 +54,7 @@ func NewRedisPubSub(redisURL, nodeID string) (*RedisPubSub, error) {
 		sub:    sub,
 		out:    make(chan Event, 256),
 		done:   make(chan struct{}),
+		peers:  make(map[string]chan model.SSEEvent),
 	}
 
 	go rps.readLoop()
@@ -72,18 +76,45 @@ func (r *RedisPubSub) readLoop() {
 				log.Printf("[redis-pubsub] unmarshal error: %v", err)
 				continue
 			}
-			r.out <- Event{
-				TargetPeerID: evt.TargetPeerID,
-				TargetNodeID: r.nodeID,
-				SSEEvent: model.SSEEvent{
-					Type: evt.EventType,
-					Data: evt.EventData,
-				},
+
+			sseEvt := model.SSEEvent{
+				Type: evt.EventType,
+				Data: evt.EventData,
+			}
+
+			r.mu.RLock()
+			peerCh, ok := r.peers[evt.TargetPeerID]
+			r.mu.RUnlock()
+
+			if ok {
+				select {
+				case peerCh <- sseEvt:
+				default:
+					log.Printf("[redis-pubsub] channel full for peer %s, dropping %s",
+						evt.TargetPeerID, evt.EventType)
+				}
+			} else {
+				log.Printf("[redis-pubsub] peer %s not registered locally, dropping %s",
+					evt.TargetPeerID, evt.EventType)
 			}
 		case <-r.done:
 			return
 		}
 	}
+}
+
+func (r *RedisPubSub) RegisterPeer(peerID string, ch chan model.SSEEvent) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.peers[peerID] = ch
+	log.Printf("[redis-pubsub] registered local peer %s", peerID)
+}
+
+func (r *RedisPubSub) UnregisterPeer(peerID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.peers, peerID)
+	log.Printf("[redis-pubsub] unregistered local peer %s", peerID)
 }
 
 func (r *RedisPubSub) Publish(_ context.Context, evt Event) error {

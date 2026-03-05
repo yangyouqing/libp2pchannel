@@ -123,7 +123,7 @@ log "Main project built."
 # ============================================================
 # Step 5: Build Go signaling server -> build/signaling-server
 # ============================================================
-SIGNALING_DIR="$PROJECT_DIR/signaling-server"
+SIGNALING_DIR="$PROJECT_DIR/src/signaling-server"
 SIGNALING_BIN="$BUILD_DIR/signaling-server"
 if [[ -f "$SIGNALING_DIR/main.go" ]]; then
     log "Building signaling server..."
@@ -141,8 +141,8 @@ log "Build complete. Output:"
 log "  $BUILD_DIR/"
 log "    mbedtls/library/          mbedTLS (libmbedtls.a, libmbedx509.a, libmbedcrypto.a)"
 log "    xquic/libxquic-static.a   xquic"
-log "    p2p/libp2pav.so           Shared transport library"
-log "    p2p/p2p_client            Publisher"
-log "    p2p/p2p_peer              Subscriber"
+log "    src/p2p/libp2pav.so        Shared transport library"
+log "    src/p2p/p2p_client         Publisher"
+log "    src/p2p/p2p_peer           Subscriber"
 [[ -f "$BUILD_DIR/signaling-server" ]] && \
 log "    signaling-server           Signaling server"

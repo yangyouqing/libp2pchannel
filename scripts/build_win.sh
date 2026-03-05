@@ -266,7 +266,7 @@ log "Cross-compilation complete."
 # ============================================================
 # Step 6: Cross-compile Go signaling server
 # ============================================================
-SIGNALING_DIR="$PROJECT_DIR/signaling-server"
+SIGNALING_DIR="$PROJECT_DIR/src/signaling-server"
 SIGNALING_BIN="$BUILD_DIR/signaling-server.exe"
 if [[ -f "$SIGNALING_DIR/main.go" ]]; then
     log "Cross-compiling signaling server (Go -> Windows amd64)..."
@@ -284,8 +284,8 @@ mkdir -p "$DLL_DIR"
 
 # Copy built executables
 for exe in p2p_client.exe p2p_peer.exe; do
-    if [[ -f "$BUILD_DIR/p2p/$exe" ]]; then
-        cp "$BUILD_DIR/p2p/$exe" "$DLL_DIR/"
+    if [[ -f "$BUILD_DIR/src/p2p/$exe" ]]; then
+        cp "$BUILD_DIR/src/p2p/$exe" "$DLL_DIR/"
     fi
 done
 [[ -f "$SIGNALING_BIN" ]] && cp "$SIGNALING_BIN" "$DLL_DIR/"

@@ -8,7 +8,7 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-SIG_DIR="$PROJECT_DIR/signaling-server"
+SIG_DIR="$PROJECT_DIR/src/signaling-server"
 
 set -e
 

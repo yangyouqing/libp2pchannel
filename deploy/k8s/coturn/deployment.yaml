@@ -1,0 +1,82 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coturn
+  namespace: p2p-av
+  labels:
+    app.kubernetes.io/name: coturn
+    app.kubernetes.io/part-of: p2p-av
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: coturn
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: coturn
+        app.kubernetes.io/part-of: p2p-av
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      initContainers:
+        - name: config-gen
+          image: alpine:3.19
+          command: ["sh", "-c"]
+          args:
+            - |
+              cp /config-template/turnserver.conf /etc/turnserver.conf
+              echo "static-auth-secret=$TURN_SECRET" >> /etc/turnserver.conf
+              HOST_IP=$(cat /etc/host-ip/host-ip 2>/dev/null || echo "$HOST_IP_ENV")
+              if [ -n "$HOST_IP" ]; then
+                echo "external-ip=$HOST_IP" >> /etc/turnserver.conf
+              fi
+              cat /etc/turnserver.conf
+          env:
+            - name: TURN_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: p2p-secrets
+                  key: turn-secret
+            - name: HOST_IP_ENV
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+          volumeMounts:
+            - name: config-template
+              mountPath: /config-template
+            - name: config-runtime
+              mountPath: /etc
+      containers:
+        - name: coturn
+          image: p2p-coturn:latest
+          imagePullPolicy: IfNotPresent
+          args: ["-c", "/etc/turnserver.conf"]
+          ports:
+            - name: stun-udp
+              containerPort: 3478
+              protocol: UDP
+            - name: stun-tcp
+              containerPort: 3478
+              protocol: TCP
+            - name: stun-tls
+              containerPort: 5349
+              protocol: TCP
+          volumeMounts:
+            - name: config-runtime
+              mountPath: /etc/turnserver.conf
+              subPath: turnserver.conf
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+      volumes:
+        - name: config-template
+          configMap:
+            name: coturn-config
+        - name: config-runtime
+          emptyDir: {}

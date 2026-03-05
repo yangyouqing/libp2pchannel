@@ -65,9 +65,10 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-P2P_CLIENT="$BUILD_DIR/p2p/p2p_client"
-P2P_PEER="$BUILD_DIR/p2p/p2p_peer"
+P2P_CLIENT="$BUILD_DIR/src/p2p/p2p_client"
+P2P_PEER="$BUILD_DIR/src/p2p/p2p_peer"
 SIGNALING_BIN="$BUILD_DIR/signaling-server"
+export LD_LIBRARY_PATH="$BUILD_DIR/src/p2p:${LD_LIBRARY_PATH:-}"
 CERT_DIR="$BUILD_DIR/certs"
 
 echo "============================================"

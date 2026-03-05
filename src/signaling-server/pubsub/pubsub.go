@@ -15,5 +15,7 @@ type Event struct {
 type PubSub interface {
 	Publish(ctx context.Context, evt Event) error
 	Subscribe(ctx context.Context) (<-chan Event, error)
+	RegisterPeer(peerID string, ch chan model.SSEEvent)
+	UnregisterPeer(peerID string)
 	Close() error
 }
