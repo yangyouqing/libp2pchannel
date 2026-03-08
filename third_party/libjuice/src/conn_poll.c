@@ -36,6 +36,8 @@ typedef struct conn_impl {
 	conn_state_t state;
 	socket_t udp_sock;
 	socket_t tcp_sock;
+	socket_t tcp_server_sock;
+	uint16_t tcp_server_port;
 	tcp_ice_write_context_t tcp_ice_write_context;
 	tcp_ice_read_context_t tcp_ice_read_context;
 	addr_record_t tcp_dst;
@@ -158,6 +160,9 @@ int conn_poll_prepare(conn_registry_t *registry, pfds_record_t *pfds, timestamp_
 		if (conn_impl->tcp_sock != INVALID_SOCKET) {
 			size++;
 		}
+		if (conn_impl->tcp_server_sock != INVALID_SOCKET) {
+			size++;
+		}
 	}
 
 	if (pfds->size != size) {
@@ -215,6 +220,13 @@ int conn_poll_prepare(conn_registry_t *registry, pfds_record_t *pfds, timestamp_
 					tcp_pfd->events |= POLLOUT;
 			}
 
+			i++;
+		}
+
+		if (conn_impl->tcp_server_sock != INVALID_SOCKET) {
+			struct pollfd *srv_pfd = pfds->pfds + i;
+			srv_pfd->fd = conn_impl->tcp_server_sock;
+			srv_pfd->events = POLLIN;
 			i++;
 		}
 	}
@@ -473,15 +485,50 @@ int conn_poll_process(conn_registry_t *registry, pfds_record_t *pfds) {
 		conn_poll_process_udp(agent, udp_pfd);
 		i++;
 
-		if (conn_impl->tcp_sock == INVALID_SOCKET)
-			continue;
+		if (conn_impl->tcp_sock != INVALID_SOCKET) {
+			if (i >= pfds->size) break;
+			struct pollfd *tcp_pfd = pfds->pfds + i;
+			if (tcp_pfd->fd != conn_impl->tcp_sock)
+				break;
+			conn_poll_process_tcp(agent, tcp_pfd);
+			i++;
+		}
 
-		struct pollfd *tcp_pfd = pfds->pfds + i;
-		if (tcp_pfd->fd != conn_impl->tcp_sock)
-			break;
+		if (conn_impl->tcp_server_sock != INVALID_SOCKET) {
+			if (i >= pfds->size) break;
+			struct pollfd *srv_pfd = pfds->pfds + i;
+			if (srv_pfd->fd != conn_impl->tcp_server_sock)
+				break;
 
-		conn_poll_process_tcp(agent, tcp_pfd);
-		i++;
+			if (srv_pfd->revents & POLLIN) {
+				struct sockaddr_storage peer_addr;
+				socklen_t peer_len = sizeof(peer_addr);
+				socket_t client = accept(conn_impl->tcp_server_sock, (struct sockaddr *)&peer_addr, &peer_len);
+				if (client != INVALID_SOCKET) {
+					if (conn_impl->tcp_sock != INVALID_SOCKET) {
+						closesocket(conn_impl->tcp_sock);
+					}
+#ifndef _WIN32
+					fcntl(client, F_SETFL, fcntl(client, F_GETFL, 0) | O_NONBLOCK);
+#else
+					{
+						unsigned long mode = 1;
+						ioctlsocket(client, FIONBIO, &mode);
+					}
+#endif
+					conn_impl->tcp_sock = client;
+					memset(&conn_impl->tcp_ice_write_context, 0, sizeof(tcp_ice_write_context_t));
+					memset(&conn_impl->tcp_ice_read_context, 0, sizeof(tcp_ice_read_context_t));
+					conn_impl->tcp_dst.addr = peer_addr;
+					conn_impl->tcp_dst.len = peer_len;
+					conn_impl->tcp_dst.socktype = SOCK_STREAM;
+					agent_conn_tcp_state_passive(agent, TCP_STATE_CONNECTED);
+					conn_impl->tcp_state = TCP_STATE_CONNECTED;
+					JLOG_DEBUG("ICE-TCP passive: accepted incoming connection");
+				}
+			}
+			i++;
+		}
 	}
 
 	mutex_unlock(&registry->mutex);
@@ -542,9 +589,36 @@ int conn_poll_init(juice_agent_t *agent, conn_registry_t *registry, udp_socket_c
 	mutex_init(&conn_impl->send_mutex, 0);
 	conn_impl->registry = registry;
 	conn_impl->tcp_sock = INVALID_SOCKET;
+	conn_impl->tcp_server_sock = INVALID_SOCKET;
+	conn_impl->tcp_server_port = 0;
 	conn_impl->tcp_state = TCP_STATE_DISCONNECTED;
 	memset(&conn_impl->tcp_ice_write_context, 0, sizeof(tcp_ice_write_context_t));
 	memset(&conn_impl->tcp_ice_read_context, 0, sizeof(tcp_ice_read_context_t));
+
+	if (agent->ice_tcp_mode == JUICE_ICE_TCP_MODE_PASSIVE) {
+		socket_t srv = socket(AF_INET, SOCK_STREAM, 0);
+		if (srv != INVALID_SOCKET) {
+			int reuse = 1;
+			setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, (const char *)&reuse, sizeof(reuse));
+			struct sockaddr_in bind_addr;
+			memset(&bind_addr, 0, sizeof(bind_addr));
+			bind_addr.sin_family = AF_INET;
+			bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+			bind_addr.sin_port = 0;
+			if (bind(srv, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) == 0 &&
+			    listen(srv, 4) == 0) {
+				struct sockaddr_in actual;
+				socklen_t alen = sizeof(actual);
+				getsockname(srv, (struct sockaddr *)&actual, &alen);
+				conn_impl->tcp_server_sock = srv;
+				conn_impl->tcp_server_port = ntohs(actual.sin_port);
+				JLOG_DEBUG("ICE-TCP passive: listening on port %d", conn_impl->tcp_server_port);
+			} else {
+				JLOG_WARN("ICE-TCP passive: bind/listen failed");
+				closesocket(srv);
+			}
+		}
+	}
 
 	agent->conn_impl = conn_impl;
 	return 0;
@@ -558,6 +632,8 @@ void conn_poll_cleanup(juice_agent_t *agent) {
 	mutex_destroy(&conn_impl->send_mutex);
 	closesocket(conn_impl->udp_sock);
 	closesocket(conn_impl->tcp_sock);
+	if (conn_impl->tcp_server_sock != INVALID_SOCKET)
+		closesocket(conn_impl->tcp_server_sock);
 	free(agent->conn_impl);
 	agent->conn_impl = NULL;
 }
@@ -665,6 +741,11 @@ void conn_poll_tcp_connect(juice_agent_t *agent, const addr_record_t *dst) {
 	}
 	mutex_unlock(&conn_impl->send_mutex);
 	mutex_unlock(&conn_impl->registry->mutex);
+}
+
+uint16_t conn_poll_get_tcp_listen_port(juice_agent_t *agent) {
+	conn_impl_t *conn_impl = agent->conn_impl;
+	return conn_impl ? conn_impl->tcp_server_port : 0;
 }
 
 int conn_poll_get_addrs(juice_agent_t *agent, addr_record_t *records, size_t size) {

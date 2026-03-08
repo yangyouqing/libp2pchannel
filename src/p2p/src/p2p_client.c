@@ -55,6 +55,9 @@ typedef struct {
     uint32_t             video_seq;
     uint32_t             audio_seq;
 
+    /* ICE-TCP */
+    int                  enable_tcp;
+
     /* State */
     volatile int         running;
     int                  capture_started;
@@ -404,6 +407,7 @@ static void print_usage(const char *prog)
         "  --stun HOST:PORT        STUN server (default 127.0.0.1:3478)\n"
         "  --ssl-cert FILE         SSL certificate for QUIC (default ./server.crt)\n"
         "  --ssl-key FILE          SSL private key for QUIC (default ./server.key)\n"
+        "  --enable-tcp            Enable ICE-TCP transport candidates\n"
         "  --help                  Show this help\n", prog);
 }
 
@@ -445,12 +449,13 @@ int main(int argc, char *argv[])
         {"stun",      1, NULL, 't'},
         {"ssl-cert",  1, NULL, 'c'},
         {"ssl-key",   1, NULL, 'k'},
+        {"enable-tcp",0, NULL, 'E'},
         {"help",      0, NULL, 'h'},
         {NULL, 0, NULL, 0}
     };
 
     int opt;
-    while ((opt = p2p_getopt_long(argc, argv, "s:r:p:T:v:a:t:c:k:h", long_opts, NULL)) != -1) {
+    while ((opt = p2p_getopt_long(argc, argv, "s:r:p:T:v:a:t:c:k:Eh", long_opts, NULL)) != -1) {
         switch (opt) {
         case 's': snprintf(ctx->signaling_addr, sizeof(ctx->signaling_addr), "%s", p2p_optarg); break;
         case 'r': snprintf(ctx->room_id, sizeof(ctx->room_id), "%s", p2p_optarg); break;
@@ -460,6 +465,7 @@ int main(int argc, char *argv[])
         case 'a': snprintf(ctx->audio_dev, sizeof(ctx->audio_dev), "%s", p2p_optarg); break;
         case 'c': snprintf(ctx->ssl_cert, sizeof(ctx->ssl_cert), "%s", p2p_optarg); break;
         case 'k': snprintf(ctx->ssl_key, sizeof(ctx->ssl_key), "%s", p2p_optarg); break;
+        case 'E': ctx->enable_tcp = 1; break;
         case 't': {
             char tmp[256];
             snprintf(tmp, sizeof(tmp), "%s", p2p_optarg);
@@ -498,6 +504,7 @@ int main(int argc, char *argv[])
         .stun_server_port = ctx->stun_port,
         .ssl_cert_file = ctx->ssl_cert,
         .ssl_key_file = ctx->ssl_key,
+        .enable_tcp = ctx->enable_tcp,
         .role = P2P_ROLE_PUBLISHER,
         .callbacks = {
             .on_peer_ice_state = on_ice_state,

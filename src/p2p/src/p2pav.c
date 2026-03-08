@@ -114,6 +114,7 @@ struct p2pav_session_s {
     char                     turn_password[128];
     char                     ssl_cert[512];
     char                     ssl_key[512];
+    int                      enable_tcp;
 
     /* Core */
     p2p_engine_t             engine;
@@ -292,6 +293,8 @@ p2pav_session_t *p2pav_session_create(const p2pav_session_config_t *config)
     if (config->ssl_key_file)
         snprintf(s->ssl_key, sizeof(s->ssl_key), "%s", config->ssl_key_file);
 
+    s->enable_tcp = config->enable_tcp;
+
     p2p_mutex_init(&s->idr_mutex);
     p2p_mutex_init(&s->send_mutex);
     p2p_mutex_init(&s->reasm_mutex);
@@ -396,6 +399,7 @@ p2pav_error_t p2pav_session_start(p2pav_session_t *s)
         .turn_password    = s->turn_password[0] ? s->turn_password : NULL,
         .ssl_cert_file    = s->ssl_cert[0] ? s->ssl_cert : NULL,
         .ssl_key_file     = s->ssl_key[0]  ? s->ssl_key  : NULL,
+        .enable_tcp       = s->enable_tcp,
         .role = adapter_role,
         .callbacks = {
             .on_peer_ice_state          = internal_on_ice_state,
@@ -1171,6 +1175,17 @@ static void internal_on_ice_gathering_done(p2p_peer_ctx_t *peer, void *ud)
     p2pav_session_t *s = (p2pav_session_t *)ud;
     if (!s) return;
     s->timing.ice_gathering_done_us = p2p_now_us();
+
+    char sdp[P2P_SIG_MAX_SDP_SIZE];
+
+    if (peer->offer_pending) {
+        peer->offer_pending = 0;
+        if (p2p_peer_get_local_description(peer, sdp, sizeof(sdp)) == 0) {
+            LOG_INFO("sending ICE offer to '%s' (post-gathering)", peer->peer_id);
+            p2p_signaling_send_ice_offer(&s->sig_client, peer->peer_id, sdp);
+        }
+    }
+
     p2p_signaling_send_gathering_done(&s->sig_client, peer->peer_id);
 }
 
@@ -1219,7 +1234,11 @@ static void internal_on_sig_peer_joined(p2p_signaling_client_t *c, const char *p
     if (s->session_cbs.on_peer_joined)
         s->session_cbs.on_peer_joined(s, pid, s->session_ud);
 
-    /* Publisher: initiate ICE exchange with new subscriber */
+    /* Publisher: initiate ICE exchange with new subscriber.
+     * Delay sending the offer until gathering is done so the SDP
+     * contains all candidates (including TCP passive).  Trickle-ICE
+     * candidate delivery via SSE is unreliable when the remote peer
+     * has not yet created its agent. */
     if (s->cfg.role == P2PAV_ROLE_PUBLISHER) {
         p2p_peer_ctx_t *peer = p2p_engine_add_peer(&s->engine, pid);
         if (!peer) {
@@ -1228,13 +1247,10 @@ static void internal_on_sig_peer_joined(p2p_signaling_client_t *c, const char *p
                 s->session_cbs.on_error(s, P2PAV_ERR_ROOM_FULL, pid, s->session_ud);
             return;
         }
+        peer->offer_pending = 1;
 
         s->timing.ice_gathering_start_us = p2p_now_us();
         p2p_peer_gather_candidates(peer);
-
-        char sdp[P2P_SIG_MAX_SDP_SIZE];
-        if (p2p_peer_get_local_description(peer, sdp, sizeof(sdp)) == 0)
-            p2p_signaling_send_ice_offer(&s->sig_client, pid, sdp);
     }
 }
 
@@ -1266,22 +1282,32 @@ static void internal_on_sig_ice_offer(p2p_signaling_client_t *c,
         }
     }
 
-    s->timing.ice_gathering_start_us = p2p_now_us();
     p2p_peer_set_remote_description(peer, sdp);
-    p2p_peer_gather_candidates(peer);
 
+    /* Send the answer (with ufrag/pwd) BEFORE gathering so the remote
+     * peer can authenticate incoming TCP STUN requests.  The synchronous
+     * HTTP POST ensures the signaling server has the answer before we
+     * start TCP connections via gather_candidates(). */
     char local_sdp[P2P_SIG_MAX_SDP_SIZE];
-    if (p2p_peer_get_local_description(peer, local_sdp, sizeof(local_sdp)) == 0)
+    if (p2p_peer_get_local_description(peer, local_sdp, sizeof(local_sdp)) == 0) {
+        LOG_INFO("sending ICE answer to '%s' (pre-gathering)", from);
         p2p_signaling_send_ice_answer(&s->sig_client, from, local_sdp);
+    }
+
+    s->timing.ice_gathering_start_us = p2p_now_us();
+    p2p_peer_gather_candidates(peer);
 }
 
 static void internal_on_sig_ice_answer(p2p_signaling_client_t *c,
                                         const char *from, const char *sdp, void *ud)
 {
     p2pav_session_t *s = (p2pav_session_t *)ud;
+    LOG_INFO("got ICE answer from '%s'", from);
     p2p_peer_ctx_t *peer = p2p_engine_find_peer(&s->engine, from);
     if (peer)
         p2p_peer_set_remote_description(peer, sdp);
+    else
+        LOG_WARN("no peer found for answer from '%s'", from);
 }
 
 static void internal_on_sig_ice_candidate(p2p_signaling_client_t *c,
@@ -1308,6 +1334,16 @@ static void internal_on_sig_turn(p2p_signaling_client_t *c,
                                   uint32_t ttl, void *ud)
 {
     p2pav_session_t *s = (p2pav_session_t *)ud;
+
+    /* When enable_tcp is set we're in an explicit TCP-only / UDP-blocked
+     * scenario.  Skip TURN credentials because TURN allocation uses UDP
+     * and will only add a ~25-second timeout to gathering. */
+    if (s->enable_tcp) {
+        LOG_INFO("TURN credentials skipped (ICE-TCP mode): %s:%d",
+                 server ? server : "", port);
+        return;
+    }
+
     if (server && server[0]) {
         snprintf(s->engine.turn_host, sizeof(s->engine.turn_host), "%s", server);
         s->engine.turn_port = port;

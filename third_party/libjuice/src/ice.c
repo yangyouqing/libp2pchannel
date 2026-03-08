@@ -365,6 +365,14 @@ int ice_generate_candidate_sdp(const ice_candidate_t *candidate, char *buffer, s
 			transport = "TCP";
 			suffix = "tcptype active";
 			break;
+		case  ICE_CANDIDATE_TRANSPORT_TCP_TYPE_PASSIVE:
+			transport = "TCP";
+			suffix = "tcptype passive";
+			break;
+		case  ICE_CANDIDATE_TRANSPORT_TCP_TYPE_SO:
+			transport = "TCP";
+			suffix = "tcptype so";
+			break;
 		default:
 			JLOG_ERROR("Unknown candidate transport");
 			return -1;

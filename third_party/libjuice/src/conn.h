@@ -45,6 +45,7 @@ typedef struct conn_mode_entry {
 	int (*send_func)(juice_agent_t *agent, const addr_record_t *dst, const char *data, size_t size,
 	                 int ds);
 	void (*tcp_connect_func)(juice_agent_t *agent, const addr_record_t *dst);
+	uint16_t (*get_tcp_listen_port_func)(juice_agent_t *agent);
 	int (*get_addrs_func)(juice_agent_t *agent, addr_record_t *records, size_t size);
 	int (*mux_listen_func)(conn_registry_t *registry, juice_cb_mux_incoming_t cb, void *user_ptr);
 	conn_registry_t *(*get_registry_func)(udp_socket_config_t *config);
@@ -63,6 +64,7 @@ int conn_interrupt(juice_agent_t *agent);
 int conn_send(juice_agent_t *agent, const addr_record_t *dst, const char *data, size_t size,
               int ds);
 void conn_tcp_connect(juice_agent_t *agent, const addr_record_t *dst);
+uint16_t conn_get_tcp_listen_port(juice_agent_t *agent);
 int conn_get_addrs(juice_agent_t *agent, addr_record_t *records, size_t size);
 
 #endif

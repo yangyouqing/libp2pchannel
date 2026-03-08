@@ -28,7 +28,11 @@ spec:
               cp /config-template/turnserver.conf /etc/turnserver.conf
               echo "static-auth-secret=$TURN_SECRET" >> /etc/turnserver.conf
               HOST_IP=$(cat /etc/host-ip/host-ip 2>/dev/null || echo "$HOST_IP_ENV")
-              if [ -n "$HOST_IP" ]; then
+              if [ -n "$EXTERNAL_IP" ] && [ -n "$HOST_IP" ]; then
+                echo "external-ip=$EXTERNAL_IP/$HOST_IP" >> /etc/turnserver.conf
+              elif [ -n "$EXTERNAL_IP" ]; then
+                echo "external-ip=$EXTERNAL_IP" >> /etc/turnserver.conf
+              elif [ -n "$HOST_IP" ]; then
                 echo "external-ip=$HOST_IP" >> /etc/turnserver.conf
               fi
               cat /etc/turnserver.conf
@@ -42,6 +46,8 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.hostIP
+            - name: EXTERNAL_IP
+              value: ""
           volumeMounts:
             - name: config-template
               mountPath: /config-template

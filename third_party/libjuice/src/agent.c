@@ -291,6 +291,27 @@ int agent_gather_candidates(juice_agent_t *agent) {
 		} else {
 			JLOG_WARN("No local host candidates gathered, unable to add TCP candidates");
 		}
+	} else if (agent->ice_tcp_mode == JUICE_ICE_TCP_MODE_PASSIVE) {
+		uint16_t listen_port = conn_get_tcp_listen_port(agent);
+		if (records_count > 0 && listen_port > 0) {
+			const int families[2] = {AF_INET6, AF_INET};
+			for (int i = 0; i < 2; ++i) {
+				int family = families[i];
+				for (int j = 0; j < records_count; ++j) {
+					addr_record_t *record = records + j;
+					if (record->addr.ss_family == family) {
+						addr_record_t tcp_record;
+						memcpy(&tcp_record, record, sizeof(addr_record_t));
+						tcp_record.socktype = SOCK_STREAM;
+						addr_set_port((struct sockaddr *)&tcp_record.addr, listen_port);
+						agent_add_local_tcp_passive_candidate(agent, &tcp_record);
+						break;
+					}
+				}
+			}
+		} else {
+			JLOG_WARN("No local candidates or TCP listen port, unable to add passive TCP candidates");
+		}
 	}
 
 	ice_sort_candidates(&agent->local);
@@ -870,6 +891,14 @@ void agent_register_entry_for_candidate_pair(juice_agent_t *agent, ice_candidate
 
 	if (pair->remote->type == ICE_CANDIDATE_TYPE_HOST)
 		agent_translate_host_candidate_entry(agent, entry);
+
+	if (pair->remote->transport != ICE_CANDIDATE_TRANSPORT_UDP &&
+	    agent->tcp_passive_pending) {
+		JLOG_DEBUG("Applying deferred TCP passive connected state to new entry");
+		agent->tcp_passive_pending = false;
+		pair->tcp_state = TCP_STATE_CONNECTED;
+		agent_arm_transmission(agent, entry, 0);
+	}
 }
 
 int agent_conn_tcp_state(juice_agent_t *agent, const addr_record_t *dst, tcp_state_t state) {
@@ -900,6 +929,38 @@ int agent_conn_tcp_state(juice_agent_t *agent, const addr_record_t *dst, tcp_sta
 	return -1;
 }
 
+int agent_conn_tcp_state_passive(juice_agent_t *agent, tcp_state_t state) {
+	for (int i = 0; i < agent->entries_count; ++i) {
+		agent_stun_entry_t *entry = agent->entries + i;
+		if (entry->pair && entry->pair->remote->transport != ICE_CANDIDATE_TRANSPORT_UDP) {
+			entry->pair->tcp_state = state;
+			switch (state) {
+			case TCP_STATE_CONNECTED:
+				agent_arm_transmission(agent, entry, 0);
+				break;
+			case TCP_STATE_DISCONNECTED:
+			case TCP_STATE_FAILED:
+				entry->pair->state = ICE_CANDIDATE_PAIR_STATE_FAILED;
+				entry->state = AGENT_STUN_ENTRY_STATE_FAILED;
+				entry->next_transmission = 0;
+				conn_interrupt(agent);
+				break;
+			default:
+				break;
+			}
+			return 0;
+		}
+	}
+
+	if (state == TCP_STATE_CONNECTED) {
+		JLOG_DEBUG("TCP passive connected before entry exists, deferring");
+		agent->tcp_passive_pending = true;
+		return 0;
+	}
+	JLOG_WARN("No TCP entry found for passive state update");
+	return -1;
+}
+
 int agent_bookkeeping(juice_agent_t *agent, timestamp_t *next_timestamp) {
 	JLOG_VERBOSE("Bookkeeping...");
 
@@ -916,13 +977,14 @@ int agent_bookkeeping(juice_agent_t *agent, timestamp_t *next_timestamp) {
 			if (entry->next_transmission > now)
 				continue;
 
-			if (entry->pair && entry->pair->remote->transport != ICE_CANDIDATE_TRANSPORT_UDP) {
-			    if (entry->pair->tcp_state == TCP_STATE_DISCONNECTED)
-					conn_tcp_connect(agent, &entry->record); // First attempt a TCP connection
+		if (entry->pair && entry->pair->remote->transport != ICE_CANDIDATE_TRANSPORT_UDP) {
+		    if (entry->pair->tcp_state == TCP_STATE_DISCONNECTED &&
+		        agent->ice_tcp_mode == JUICE_ICE_TCP_MODE_ACTIVE)
+				conn_tcp_connect(agent, &entry->record);
 
-				if(entry->pair->tcp_state != TCP_STATE_CONNECTED)
-					continue;
-			}
+			if(entry->pair->tcp_state != TCP_STATE_CONNECTED)
+				continue;
+		}
 
 			if (entry->retransmissions >= 0) {
 				if (JLOG_DEBUG_ENABLED) {
@@ -1563,7 +1625,13 @@ int agent_process_stun_binding(juice_agent_t *agent, const stun_message_t *msg,
 				// The ICE agent MUST check that the source and destination transport addresses in
 				// the Binding request and response are symmetric. [...] If the addresses are not
 				// symmetric, the agent MUST set the candidate pair state to Failed.
-				if (!addr_record_is_equal(src, &entry->record, true)) {
+				// RFC 6544: TCP active candidates use placeholder port 9; the
+				// actual response comes from the real ephemeral port, so only
+				// compare the IP address for TCP active remote candidates.
+				bool tcp_active_remote =
+					pair->remote &&
+					pair->remote->transport == ICE_CANDIDATE_TRANSPORT_TCP_TYPE_ACTIVE;
+				if (!addr_record_is_equal(src, &entry->record, !tcp_active_remote)) {
 					JLOG_DEBUG(
 					    "Candidate pair check failed (non-symmetric source address in response)");
 					entry->state = AGENT_STUN_ENTRY_STATE_FAILED;
@@ -2390,6 +2458,21 @@ int agent_add_local_tcp_active_candidate(juice_agent_t *agent, addr_record_t *re
 	return 0;
 }
 
+int agent_add_local_tcp_passive_candidate(juice_agent_t *agent, addr_record_t *record) {
+	ice_candidate_t candidate;
+	if (ice_create_local_candidate(ICE_CANDIDATE_TYPE_HOST, 1, agent->local.candidates_count,
+	                               record, &candidate, ICE_CANDIDATE_TRANSPORT_TCP_TYPE_PASSIVE)) {
+		JLOG_ERROR("Failed to create passive TCP candidate");
+		return -1;
+	}
+	if (ice_add_candidate(&candidate, &agent->local)) {
+		JLOG_ERROR("Failed to add passive TCP candidate to local description");
+		return -1;
+	}
+
+	return 0;
+}
+
 int agent_add_candidate_pair(juice_agent_t *agent, ice_candidate_t *local, // local may be NULL
                              ice_candidate_t *remote) {
 	ice_candidate_pair_t pair;
@@ -2405,15 +2488,22 @@ int agent_add_candidate_pair(juice_agent_t *agent, ice_candidate_t *local, // lo
 	}
 
 	if (remote->transport != ICE_CANDIDATE_TRANSPORT_UDP) {
-		if (agent->ice_tcp_mode != JUICE_ICE_TCP_MODE_ACTIVE) {
+		if (agent->ice_tcp_mode == JUICE_ICE_TCP_MODE_NONE) {
 			JLOG_WARN("ICE-TCP is disabled, ignoring TCP candidate");
 			return 0;
 		}
 
-		if (remote->transport != ICE_CANDIDATE_TRANSPORT_TCP_TYPE_PASSIVE &&
-		    remote->transport != ICE_CANDIDATE_TRANSPORT_TCP_TYPE_SO) {
-			JLOG_INFO("TCP candidate is not passive or simultaneous open, ignoring");
-			return 0;
+		if (agent->ice_tcp_mode == JUICE_ICE_TCP_MODE_ACTIVE) {
+			if (remote->transport != ICE_CANDIDATE_TRANSPORT_TCP_TYPE_PASSIVE &&
+			    remote->transport != ICE_CANDIDATE_TRANSPORT_TCP_TYPE_SO) {
+				JLOG_INFO("Active mode: TCP candidate is not passive or SO, ignoring");
+				return 0;
+			}
+		} else if (agent->ice_tcp_mode == JUICE_ICE_TCP_MODE_PASSIVE) {
+			if (remote->transport != ICE_CANDIDATE_TRANSPORT_TCP_TYPE_ACTIVE) {
+				JLOG_INFO("Passive mode: TCP candidate is not active, ignoring");
+				return 0;
+			}
 		}
 
 		for (int i = 0; i < agent->candidate_pairs_count; ++i) {
@@ -2714,8 +2804,14 @@ agent_stun_entry_t *agent_find_entry_from_record(juice_agent_t *agent, const add
 		ice_candidate_pair_t *matching_pair = NULL;
 		for (int i = 0; i < agent->candidate_pairs_count; ++i) {
 			ice_candidate_pair_t *pair = agent->ordered_pairs[i];
-			if (!pair_is_relayed(pair) &&
-			    addr_record_is_equal(&pair->remote->resolved, record, true)) {
+			if (pair_is_relayed(pair))
+				continue;
+			// RFC 6544: TCP active candidates use placeholder port 9.
+			// The real connection uses a random ephemeral port, so
+			// match by IP only when the remote candidate is TCP active.
+			bool compare_port =
+				(pair->remote->transport != ICE_CANDIDATE_TRANSPORT_TCP_TYPE_ACTIVE);
+			if (addr_record_is_equal(&pair->remote->resolved, record, compare_port)) {
 				matching_pair = pair;
 				break;
 			}

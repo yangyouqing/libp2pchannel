@@ -168,6 +168,7 @@ typedef struct {
     const char       *ssl_key_file;
 
     int               max_peers;       /* 0 = default (10) */
+    int               enable_tcp;      /* enable ICE-TCP candidates */
 } p2pav_session_config_t;
 
 typedef struct {

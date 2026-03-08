@@ -81,6 +81,10 @@ typedef struct p2p_peer_ctx_s {
     char                    peer_id[64];
 
     void                   *user_data;
+
+    /* Set by p2pav when the ICE offer/answer should be deferred until gathering done */
+    int                     offer_pending;
+    int                     answer_pending;
 } p2p_peer_ctx_t;
 
 /*
@@ -106,6 +110,7 @@ typedef struct {
     const char             *turn_password;
     const char             *ssl_cert_file;
     const char             *ssl_key_file;
+    int                     enable_tcp;
     p2p_role_t              role;
     p2p_adapter_callbacks_t callbacks;
     void                   *user_data;
@@ -148,6 +153,9 @@ typedef struct p2p_engine_s {
     /* SSL config for xquic */
     char                    ssl_cert_file[512];
     char                    ssl_key_file[512];
+
+    /* ICE-TCP */
+    int                     enable_tcp;
 } p2p_engine_t;
 
 /* ---- Lifecycle ---- */

@@ -93,6 +93,7 @@ typedef enum juice_concurrency_mode {
 typedef enum juice_ice_tcp_mode {
 	JUICE_ICE_TCP_MODE_NONE = 0, // ICE-TCP is disabled
 	JUICE_ICE_TCP_MODE_ACTIVE,   // ICE-TCP will operate as a client
+	JUICE_ICE_TCP_MODE_PASSIVE,  // ICE-TCP will operate as a server (listen)
 } juice_ice_tcp_mode_t;
 
 typedef struct juice_config {

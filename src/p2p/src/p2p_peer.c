@@ -94,6 +94,9 @@ typedef struct {
     uint64_t             first_frame_time;
     int                  got_first_frame;
 
+    /* ICE-TCP */
+    int                  enable_tcp;
+
     /* State */
     volatile int         running;
 } peer_ctx_t;
@@ -371,9 +374,12 @@ static void on_sig_ice_candidate(p2p_signaling_client_t *client,
                                  void *user_data)
 {
     peer_ctx_t *ctx = (peer_ctx_t *)user_data;
+    fprintf(stderr, "[peer] sig_ice_candidate from=%s cand=%s\n", from_peer, candidate);
     p2p_peer_ctx_t *peer = p2p_engine_find_peer(&ctx->engine, from_peer);
     if (peer) {
         p2p_peer_add_remote_candidate(peer, candidate);
+    } else {
+        fprintf(stderr, "[peer] WARNING: peer '%s' not found, dropping candidate\n", from_peer);
     }
 }
 
@@ -410,6 +416,7 @@ static void print_usage(const char *prog)
         "  --room ROOM_ID          Room name (default test-room)\n"
         "  --peer-id ID            Subscriber peer ID (default sub1)\n"
         "  --stun HOST:PORT        STUN server (default 127.0.0.1:3478)\n"
+        "  --enable-tcp            Enable ICE-TCP transport candidates\n"
         "  --help                  Show this help\n", prog);
 }
 
@@ -433,18 +440,20 @@ int main(int argc, char *argv[])
         {"room",      required_argument, NULL, 'r'},
         {"peer-id",   required_argument, NULL, 'p'},
         {"token",     required_argument, NULL, 'T'},
-        {"stun",      required_argument, NULL, 't'},
-        {"help",      no_argument,       NULL, 'h'},
+        {"stun",       required_argument, NULL, 't'},
+        {"enable-tcp", no_argument,      NULL, 'E'},
+        {"help",       no_argument,      NULL, 'h'},
         {NULL, 0, NULL, 0}
     };
 
     int opt;
-    while ((opt = p2p_getopt_long(argc, argv, "s:r:p:T:t:h", long_opts, NULL)) != -1) {
+    while ((opt = p2p_getopt_long(argc, argv, "s:r:p:T:t:Eh", long_opts, NULL)) != -1) {
         switch (opt) {
         case 's': snprintf(ctx->signaling_addr, sizeof(ctx->signaling_addr), "%s", p2p_optarg); break;
         case 'r': snprintf(ctx->room_id, sizeof(ctx->room_id), "%s", p2p_optarg); break;
         case 'p': snprintf(ctx->peer_id, sizeof(ctx->peer_id), "%s", p2p_optarg); break;
         case 'T': snprintf(ctx->token, sizeof(ctx->token), "%s", p2p_optarg); break;
+        case 'E': ctx->enable_tcp = 1; break;
         case 't': {
             char tmp[256];
             snprintf(tmp, sizeof(tmp), "%s", p2p_optarg);
@@ -499,6 +508,7 @@ int main(int argc, char *argv[])
     p2p_engine_config_t ecfg = {
         .stun_server_host = ctx->stun_host,
         .stun_server_port = ctx->stun_port,
+        .enable_tcp = ctx->enable_tcp,
         .role = P2P_ROLE_SUBSCRIBER,
         .callbacks = {
             .on_peer_ice_state = on_ice_state,

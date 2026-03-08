@@ -19,6 +19,10 @@ target_link_libraries(test_p2pav_e2e PRIVATE p2pav)
 add_executable(test_p2pav_stress test_p2pav_stress.c)
 target_link_libraries(test_p2pav_stress PRIVATE p2pav)
 
+# --- libp2pav UDP-blocked network test (Docker) ---
+add_executable(test_p2pav_udp_blocked test_p2pav_udp_blocked.c)
+target_link_libraries(test_p2pav_udp_blocked PRIVATE p2pav)
+
 # --- p2p_publisher / p2p_subscriber middleware + codec test ---
 add_executable(test_p2p_middleware
     test_p2p_middleware.c

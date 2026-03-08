@@ -1,9 +1,9 @@
 FROM golang:1.21-alpine AS builder
 ENV GOPROXY=https://goproxy.cn,direct
 WORKDIR /src
-COPY src/signaling-server/go.mod src/signaling-server/go.sum ./
+COPY src/signaling_server/go.mod src/signaling_server/go.sum ./
 RUN go mod download
-COPY src/signaling-server/ .
+COPY src/signaling_server/ .
 RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /signaling-server .
 
 FROM alpine:3.19

@@ -148,6 +148,7 @@ static void ice_on_state_changed(juice_agent_t *agent, juice_state_t state, void
 static void ice_on_candidate(juice_agent_t *agent, const char *sdp, void *user_ptr)
 {
     p2p_peer_ctx_t *peer = (p2p_peer_ctx_t *)user_ptr;
+    fprintf(stderr, "[p2p] local candidate: %s\n", sdp ? sdp : "(null)");
     if (peer && peer->engine && peer->engine->callbacks.on_peer_ice_candidate)
         peer->engine->callbacks.on_peer_ice_candidate(peer, sdp, peer->engine->user_data);
 }
@@ -272,6 +273,8 @@ int p2p_engine_init(p2p_engine_t *eng, const p2p_engine_config_t *config)
         snprintf(eng->ssl_cert_file, sizeof(eng->ssl_cert_file), "%s", config->ssl_cert_file);
     if (config->ssl_key_file)
         snprintf(eng->ssl_key_file, sizeof(eng->ssl_key_file), "%s", config->ssl_key_file);
+
+    eng->enable_tcp = config->enable_tcp;
 
     /* Init receive queue */
     if (p2p_packet_queue_init(&eng->recv_queue, P2P_PKT_QUEUE_CAP) != 0)
@@ -407,7 +410,8 @@ p2p_peer_ctx_t *p2p_engine_add_peer(p2p_engine_t *eng, const char *peer_id)
 
     juice_config_t jcfg;
     memset(&jcfg, 0, sizeof(jcfg));
-    jcfg.concurrency_mode = JUICE_CONCURRENCY_MODE_THREAD;
+    jcfg.concurrency_mode = eng->enable_tcp ? JUICE_CONCURRENCY_MODE_POLL
+                                            : JUICE_CONCURRENCY_MODE_THREAD;
 
     if (eng->stun_host[0]) {
         jcfg.stun_server_host = eng->stun_host;
@@ -435,6 +439,15 @@ p2p_peer_ctx_t *p2p_engine_add_peer(p2p_engine_t *eng, const char *peer_id)
     if (!peer->ice_agent) {
         fprintf(stderr, "p2p_engine_add_peer: juice_create failed\n");
         return NULL;
+    }
+
+    if (eng->enable_tcp) {
+        juice_ice_tcp_mode_t tcp_mode = (eng->role == P2P_ROLE_PUBLISHER)
+                                        ? JUICE_ICE_TCP_MODE_PASSIVE
+                                        : JUICE_ICE_TCP_MODE_ACTIVE;
+        juice_set_ice_tcp_mode(peer->ice_agent, tcp_mode);
+        fprintf(stderr, "p2p_engine_add_peer: ICE-TCP %s for peer %s\n",
+                tcp_mode == JUICE_ICE_TCP_MODE_PASSIVE ? "passive" : "active", peer_id);
     }
 
     eng->peer_count++;
@@ -487,7 +500,10 @@ int p2p_peer_set_remote_description(p2p_peer_ctx_t *peer, const char *sdp)
 int p2p_peer_add_remote_candidate(p2p_peer_ctx_t *peer, const char *sdp)
 {
     if (!peer || !peer->ice_agent || !sdp) return -1;
-    return juice_add_remote_candidate(peer->ice_agent, sdp);
+    fprintf(stderr, "[p2p] adding remote candidate: %s\n", sdp);
+    int ret = juice_add_remote_candidate(peer->ice_agent, sdp);
+    fprintf(stderr, "[p2p] add_remote_candidate returned %d\n", ret);
+    return ret;
 }
 
 int p2p_peer_set_remote_gathering_done(p2p_peer_ctx_t *peer)
