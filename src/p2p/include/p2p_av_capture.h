@@ -10,8 +10,9 @@ extern "C" {
 #endif
 
 /* Pixel format tags passed to the video encoder */
-#define P2P_V4L2_PIX_MJPEG  0
-#define P2P_V4L2_PIX_YUYV   1
+#define P2P_V4L2_PIX_MJPEG   0
+#define P2P_V4L2_PIX_YUYV    1
+#define P2P_V4L2_PIX_YUV420P 2
 
 typedef void (*p2p_video_frame_cb_t)(const uint8_t *data, size_t size,
                                      int width, int height, int pixfmt,
@@ -45,6 +46,7 @@ typedef struct {
         size_t  length;
     } buffers[4];
     int         n_buffers;
+    void       *pipe_handle;    /* FILE* for rpicam pipe capture */
 #else /* _WIN32 */
     void       *fmt_ctx;        /* AVFormatContext* */
     int         video_stream;   /* stream index */

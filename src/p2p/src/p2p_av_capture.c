@@ -23,6 +23,59 @@ uint64_t p2p_capture_now_us(void)
 #include <linux/videodev2.h>
 #include <alsa/asoundlib.h>
 
+/* ======== rpicam pipe-based capture (CSI cameras via libcamera) ======== */
+
+static int rpicam_capture_open(p2p_video_capture_t *cap, const p2p_video_capture_config_t *cfg)
+{
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd),
+             "rpicam-vid --codec yuv420 --width %d --height %d --framerate %d "
+             "-t 0 -n -o - 2>/dev/null",
+             cap->width, cap->height, cap->fps);
+
+    FILE *fp = popen(cmd, "r");
+    if (!fp) {
+        fprintf(stderr, "[rpicam] popen failed: %s\n", strerror(errno));
+        return -1;
+    }
+    cap->pipe_handle = fp;
+    cap->fd = -1;
+    cap->pixfmt = P2P_V4L2_PIX_YUV420P;
+    fprintf(stderr, "[rpicam] opened pipe: %dx%d @%dfps fmt=YUV420P\n",
+            cap->width, cap->height, cap->fps);
+    return 0;
+}
+
+static void *rpicam_capture_thread(void *arg)
+{
+    p2p_video_capture_t *cap = (p2p_video_capture_t *)arg;
+    FILE *fp = (FILE *)cap->pipe_handle;
+    size_t frame_size = (size_t)cap->width * cap->height * 3 / 2;
+    uint8_t *buf = malloc(frame_size);
+    if (!buf) return NULL;
+
+    while (cap->running) {
+        size_t total = 0;
+        while (total < frame_size && cap->running) {
+            size_t n = fread(buf + total, 1, frame_size - total, fp);
+            if (n == 0) {
+                if (feof(fp) || ferror(fp)) goto done;
+                p2p_sleep_ms(1);
+                continue;
+            }
+            total += n;
+        }
+        if (total == frame_size && cap->cb) {
+            uint64_t ts = p2p_capture_now_us();
+            cap->cb(buf, frame_size, cap->width, cap->height,
+                    P2P_V4L2_PIX_YUV420P, ts, cap->user_data);
+        }
+    }
+done:
+    free(buf);
+    return NULL;
+}
+
 /* ======== V4L2 Video Capture ======== */
 
 static int xioctl(int fd, unsigned long request, void *arg)
@@ -41,6 +94,11 @@ int p2p_video_capture_open(p2p_video_capture_t *cap, const p2p_video_capture_con
     cap->width = cfg->width > 0 ? cfg->width : 640;
     cap->height = cfg->height > 0 ? cfg->height : 480;
     cap->fps = cfg->fps > 0 ? cfg->fps : 30;
+    cap->fd = -1;
+
+    /* rpicam pipe mode for Raspberry Pi CSI cameras */
+    if (strncmp(cfg->device, "rpicam", 6) == 0)
+        return rpicam_capture_open(cap, cfg);
 
     cap->fd = open(cfg->device, O_RDWR | O_NONBLOCK);
     if (cap->fd < 0) {
@@ -174,7 +232,20 @@ static void *video_capture_thread(void *arg)
 
 int p2p_video_capture_start(p2p_video_capture_t *cap)
 {
-    if (!cap || cap->fd < 0) {
+    if (!cap) return -1;
+
+    /* rpicam pipe mode */
+    if (cap->pipe_handle) {
+        cap->running = 1;
+        if (p2p_thread_create(&cap->thread, rpicam_capture_thread, cap) != 0) {
+            fprintf(stderr, "[rpicam] capture thread creation failed\n");
+            cap->running = 0;
+            return -1;
+        }
+        return 0;
+    }
+
+    if (cap->fd < 0) {
         fprintf(stderr, "[v4l2] start: invalid capture handle or fd\n");
         return -1;
     }
@@ -212,6 +283,8 @@ void p2p_video_capture_stop(p2p_video_capture_t *cap)
     cap->running = 0;
     p2p_thread_join(cap->thread);
 
+    if (cap->pipe_handle) return;
+
     enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     xioctl(cap->fd, VIDIOC_STREAMOFF, &type);
 }
@@ -219,6 +292,11 @@ void p2p_video_capture_stop(p2p_video_capture_t *cap)
 void p2p_video_capture_close(p2p_video_capture_t *cap)
 {
     if (!cap) return;
+    if (cap->pipe_handle) {
+        pclose((FILE *)cap->pipe_handle);
+        cap->pipe_handle = NULL;
+        return;
+    }
     for (int i = 0; i < cap->n_buffers; i++) {
         if (cap->buffers[i].start && cap->buffers[i].start != MAP_FAILED)
             munmap(cap->buffers[i].start, cap->buffers[i].length);

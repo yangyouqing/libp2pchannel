@@ -172,6 +172,22 @@ int p2p_video_encoder_encode(p2p_video_encoder_t *enc,
         sws_scale((struct SwsContext *)enc->sws_ctx,
                   src_data, src_linesize, 0, enc->height,
                   frame->data, frame->linesize);
+    } else if (in_pixfmt == P2P_V4L2_PIX_YUV420P) {
+        int expected = enc->width * enc->height * 3 / 2;
+        if (raw_size < expected) return -1;
+
+        const uint8_t *y = raw_data;
+        const uint8_t *u = y + enc->width * enc->height;
+        const uint8_t *v = u + (enc->width / 2) * (enc->height / 2);
+        for (int row = 0; row < enc->height; row++)
+            memcpy(frame->data[0] + row * frame->linesize[0],
+                   y + row * enc->width, enc->width);
+        for (int row = 0; row < enc->height / 2; row++) {
+            memcpy(frame->data[1] + row * frame->linesize[1],
+                   u + row * (enc->width / 2), enc->width / 2);
+            memcpy(frame->data[2] + row * frame->linesize[2],
+                   v + row * (enc->width / 2), enc->width / 2);
+        }
     } else {
         return -1;
     }
