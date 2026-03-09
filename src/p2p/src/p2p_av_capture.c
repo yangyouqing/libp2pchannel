@@ -12,8 +12,9 @@ uint64_t p2p_capture_now_us(void)
 
 /* ====================================================================
  *  Linux implementation -- V4L2 video, ALSA audio
+ *  (excluded on Android where p2p_peer runs as subscriber-only)
  * ==================================================================== */
-#ifdef __linux__
+#if defined(__linux__) && !defined(__ANDROID__)
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -678,6 +679,23 @@ void p2p_audio_capture_close(p2p_audio_capture_t *cap)
     }
 }
 
+/* ====================================================================
+ *  Android stub -- subscriber-only, no capture needed
+ * ==================================================================== */
+#elif defined(__ANDROID__)
+
+int p2p_video_capture_open(p2p_video_capture_t *cap, const p2p_video_capture_config_t *cfg)
+{ (void)cap; (void)cfg; return -1; }
+int p2p_video_capture_start(p2p_video_capture_t *cap) { (void)cap; return -1; }
+void p2p_video_capture_stop(p2p_video_capture_t *cap)  { (void)cap; }
+void p2p_video_capture_close(p2p_video_capture_t *cap) { (void)cap; }
+
+int p2p_audio_capture_open(p2p_audio_capture_t *cap, const p2p_audio_capture_config_t *cfg)
+{ (void)cap; (void)cfg; return -1; }
+int p2p_audio_capture_start(p2p_audio_capture_t *cap) { (void)cap; return -1; }
+void p2p_audio_capture_stop(p2p_audio_capture_t *cap)  { (void)cap; }
+void p2p_audio_capture_close(p2p_audio_capture_t *cap) { (void)cap; }
+
 #else
-#error "Unsupported platform: define __linux__ or _WIN32"
+#error "Unsupported platform: define __linux__, __ANDROID__, or _WIN32"
 #endif

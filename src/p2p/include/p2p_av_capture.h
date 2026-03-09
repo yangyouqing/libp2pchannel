@@ -36,7 +36,7 @@ typedef struct {
 /* ---- Video capture context ---- */
 
 typedef struct {
-#ifdef __linux__
+#if defined(__linux__) && !defined(__ANDROID__)
     int         fd;
     uint32_t    v4l2_pixfmt;
     uint32_t    bytesperline;
@@ -47,7 +47,7 @@ typedef struct {
     } buffers[4];
     int         n_buffers;
     void       *pipe_handle;    /* FILE* for rpicam pipe capture */
-#else /* _WIN32 */
+#elif defined(_WIN32)
     void       *fmt_ctx;        /* AVFormatContext* */
     int         video_stream;   /* stream index */
 #endif
@@ -82,9 +82,9 @@ typedef struct {
 /* ---- Audio capture context ---- */
 
 typedef struct {
-#ifdef __linux__
+#if defined(__linux__) && !defined(__ANDROID__)
     void       *pcm_handle;    /* snd_pcm_t* */
-#else /* _WIN32 */
+#elif defined(_WIN32)
     void       *fmt_ctx;       /* AVFormatContext* */
     int         audio_stream;  /* stream index */
 #endif

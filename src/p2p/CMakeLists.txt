@@ -203,8 +203,8 @@ foreach(_tgt p2p_client p2p_peer)
     target_link_directories(${_tgt} PRIVATE ${SDL2_LIBRARY_DIRS})
 endforeach()
 
-# ALSA (Linux only) for executables
-if(NOT WIN32)
+# ALSA (Linux only, not Android) for executables
+if(NOT WIN32 AND NOT ANDROID)
     pkg_check_modules(ALSA REQUIRED alsa)
     foreach(_tgt p2p_client p2p_peer)
         target_include_directories(${_tgt} PRIVATE ${ALSA_INCLUDE_DIRS})

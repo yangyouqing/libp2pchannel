@@ -21,6 +21,39 @@
 #endif
 #include <libavutil/log.h>
 
+#ifdef __ANDROID__
+#include "SDL.h"
+#include <android/log.h>
+#include <unistd.h>
+#include <pthread.h>
+
+static void *android_log_thread(void *arg) {
+    int fd = *(int*)arg;
+    FILE *f = fdopen(fd, "r");
+    char buf[1024];
+    while (fgets(buf, sizeof(buf), f)) {
+        size_t len = strlen(buf);
+        if (len > 0 && buf[len-1] == '\n') buf[len-1] = '\0';
+        __android_log_print(ANDROID_LOG_INFO, "p2p_peer", "%s", buf);
+    }
+    fclose(f);
+    return NULL;
+}
+
+static void redirect_stdio_to_logcat(void) {
+    int pfd[2];
+    if (pipe(pfd) == 0) {
+        dup2(pfd[1], STDERR_FILENO);
+        close(pfd[1]);
+        pthread_t t;
+        int *rfd = malloc(sizeof(int));
+        *rfd = pfd[0];
+        pthread_create(&t, NULL, android_log_thread, rfd);
+        pthread_detach(t);
+    }
+}
+#endif
+
 /* Reassembly buffer for fragmented frames */
 #define REASM_MAX_SIZE (512 * 1024)
 
@@ -424,6 +457,10 @@ int main(int argc, char *argv[])
 {
     peer_ctx_t *ctx = &g_ctx;
     memset(ctx, 0, sizeof(*ctx));
+
+#ifdef __ANDROID__
+    redirect_stdio_to_logcat();
+#endif
 
     av_log_set_level(AV_LOG_FATAL);
 
