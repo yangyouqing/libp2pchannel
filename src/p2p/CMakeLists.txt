@@ -143,6 +143,7 @@ set(P2P_MEDIA_SOURCES
     src/p2p_av_capture.c
     src/p2p_av_codec.c
     src/p2p_sdl_render.c
+    src/p2p_sdl_font.c
 )
 
 add_executable(p2p_client src/p2p_client.c ${P2P_MEDIA_SOURCES})

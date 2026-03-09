@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "p2p_platform.h"
 #ifndef _WIN32
 #include <signal.h>
@@ -57,6 +58,13 @@ typedef struct {
 
     /* ICE-TCP */
     int                  enable_tcp;
+
+    /* AV mode flags */
+    int                  no_video;
+    int                  no_audio;
+
+    /* Pending peer for full_offer (sent on gathering_done) */
+    char                 pending_peer_id[64];
 
     /* State */
     volatile int         running;
@@ -181,53 +189,61 @@ static int start_capture(client_ctx_t *ctx)
 {
     if (ctx->capture_started) return 0;
 
-    /* Video capture - open first to get actual resolution */
-    p2p_video_capture_config_t vccfg = {
-        .device = ctx->video_dev,
-        .width = 640, .height = 480, .fps = 30,
-        .cb = on_video_frame, .user_data = ctx
-    };
-    if (p2p_video_capture_open(&ctx->vcap, &vccfg) != 0) {
-        fprintf(stderr, "[client] video capture open failed\n");
-        return -1;
-    }
+    if (!ctx->no_video) {
+        /* Video capture - open first to get actual resolution */
+        p2p_video_capture_config_t vccfg = {
+            .device = ctx->video_dev,
+            .width = 640, .height = 480, .fps = 30,
+            .cb = on_video_frame, .user_data = ctx
+        };
+        if (p2p_video_capture_open(&ctx->vcap, &vccfg) != 0) {
+            fprintf(stderr, "[client] video capture open failed\n");
+            return -1;
+        }
 
-    /* Video encoder - use actual capture resolution */
-    p2p_video_encoder_config_t vcfg = {
-        .width = ctx->vcap.width, .height = ctx->vcap.height, .fps = 30,
-        .bitrate = 2000000, .gop_size = 30
-    };
-    if (p2p_video_encoder_open(&ctx->venc, &vcfg) != 0) {
-        fprintf(stderr, "[client] video encoder open failed\n");
-        return -1;
-    }
+        /* Video encoder - use actual capture resolution */
+        p2p_video_encoder_config_t vcfg = {
+            .width = ctx->vcap.width, .height = ctx->vcap.height, .fps = 30,
+            .bitrate = 2000000, .gop_size = 15
+        };
+        if (p2p_video_encoder_open(&ctx->venc, &vcfg) != 0) {
+            fprintf(stderr, "[client] video encoder open failed\n");
+            return -1;
+        }
 
-    /* Audio encoder */
-    p2p_audio_encoder_config_t acfg = {
-        .sample_rate = 48000, .channels = 1,
-        .bitrate = 64000, .frame_size = 960
-    };
-    if (p2p_audio_encoder_open(&ctx->aenc, &acfg) != 0) {
-        fprintf(stderr, "[client] audio encoder open failed\n");
-        return -1;
-    }
-
-    if (p2p_video_capture_start(&ctx->vcap) != 0) {
-        fprintf(stderr, "[client] video capture start failed\n");
-        return -1;
-    }
-
-    /* Audio capture */
-    p2p_audio_capture_config_t accfg = {
-        .device = ctx->audio_dev,
-        .sample_rate = 48000, .channels = 1,
-        .period_frames = 960,
-        .cb = on_audio_frame, .user_data = ctx
-    };
-    if (p2p_audio_capture_open(&ctx->acap, &accfg) != 0) {
-        fprintf(stderr, "[client] audio capture open failed (continuing without audio)\n");
+        if (p2p_video_capture_start(&ctx->vcap) != 0) {
+            fprintf(stderr, "[client] video capture start failed\n");
+            return -1;
+        }
     } else {
-        p2p_audio_capture_start(&ctx->acap);
+        fprintf(stderr, "[client] video disabled (--no-video)\n");
+    }
+
+    if (!ctx->no_audio) {
+        /* Audio encoder */
+        p2p_audio_encoder_config_t acfg = {
+            .sample_rate = 48000, .channels = 1,
+            .bitrate = 64000, .frame_size = 960
+        };
+        if (p2p_audio_encoder_open(&ctx->aenc, &acfg) != 0) {
+            fprintf(stderr, "[client] audio encoder open failed\n");
+            return -1;
+        }
+
+        /* Audio capture */
+        p2p_audio_capture_config_t accfg = {
+            .device = ctx->audio_dev,
+            .sample_rate = 48000, .channels = 1,
+            .period_frames = 960,
+            .cb = on_audio_frame, .user_data = ctx
+        };
+        if (p2p_audio_capture_open(&ctx->acap, &accfg) != 0) {
+            fprintf(stderr, "[client] audio capture open failed (continuing without audio)\n");
+        } else {
+            p2p_audio_capture_start(&ctx->acap);
+        }
+    } else {
+        fprintf(stderr, "[client] audio disabled (--no-audio)\n");
     }
 
     ctx->capture_started = 1;
@@ -285,13 +301,15 @@ static void on_ice_state(p2p_peer_ctx_t *peer, juice_state_t state, void *user_d
 static void on_ice_candidate(p2p_peer_ctx_t *peer, const char *sdp, void *user_data)
 {
     client_ctx_t *ctx = (client_ctx_t *)user_data;
-    p2p_signaling_send_ice_candidate(&ctx->sig_client, peer->peer_id, sdp);
+    fprintf(stderr, "[client] trickle candidate to %s\n", peer->peer_id);
+    p2p_signaling_send_ice_candidate_async(&ctx->sig_client, peer->peer_id, sdp);
 }
 
 static void on_ice_gathering_done(p2p_peer_ctx_t *peer, void *user_data)
 {
     client_ctx_t *ctx = (client_ctx_t *)user_data;
-    p2p_signaling_send_gathering_done(&ctx->sig_client, peer->peer_id);
+    fprintf(stderr, "[client] gathering done, notifying %s\n", peer->peer_id);
+    p2p_signaling_send_gathering_done_async(&ctx->sig_client, peer->peer_id);
 }
 
 /* ---- Signaling callbacks ---- */
@@ -306,7 +324,13 @@ static void on_sig_connected(p2p_signaling_client_t *client, void *user_data)
 static void on_sig_room_created(p2p_signaling_client_t *client,
                                 const char *room_id, void *user_data)
 {
+    client_ctx_t *ctx = (client_ctx_t *)user_data;
     fprintf(stderr, "[client] room '%s' created, waiting for subscribers...\n", room_id);
+
+    /* Pre-start capture so camera/encoder are warm and IDR cache is ready
+     * before any peer joins -- saves 200-500ms on first frame latency. */
+    if (!ctx->capture_started)
+        start_capture(ctx);
 }
 
 static void on_sig_peer_joined(p2p_signaling_client_t *client,
@@ -315,20 +339,25 @@ static void on_sig_peer_joined(p2p_signaling_client_t *client,
     client_ctx_t *ctx = (client_ctx_t *)user_data;
     fprintf(stderr, "[client] subscriber '%s' joined, starting ICE exchange\n", peer_id);
 
+    /* Force next encoded frame to be IDR so cached IDR is fresh for the new peer */
+    if (!ctx->no_video && ctx->capture_started)
+        ctx->venc.force_idr = 1;
+
     p2p_peer_ctx_t *peer = p2p_engine_add_peer(&ctx->engine, peer_id);
     if (!peer) {
         fprintf(stderr, "[client] cannot add peer (max %d)\n", P2P_MAX_SUBSCRIBERS);
         return;
     }
 
-    /* Gather ICE candidates */
-    p2p_peer_gather_candidates(peer);
-
-    /* Send local SDP to remote peer */
+    /* Send offer immediately (async, non-blocking) so the peer can start
+     * processing while we gather candidates in parallel. */
     char sdp[P2P_SIG_MAX_SDP_SIZE];
-    if (p2p_peer_get_local_description(peer, sdp, sizeof(sdp)) == 0) {
-        p2p_signaling_send_ice_offer(&ctx->sig_client, peer_id, sdp);
-    }
+    p2p_peer_get_local_description(peer, sdp, sizeof(sdp));
+    p2p_signaling_send_ice_offer_async(&ctx->sig_client, peer_id, sdp);
+
+    snprintf(ctx->pending_peer_id, sizeof(ctx->pending_peer_id), "%s", peer_id);
+
+    p2p_peer_gather_candidates(peer);
 }
 
 static void on_sig_ice_answer(p2p_signaling_client_t *client,
@@ -395,7 +424,7 @@ static void print_usage(const char *prog)
     fprintf(stderr,
         "Usage: %s [options]\n"
         "  --signaling HOST:PORT   Signaling server address (default 127.0.0.1:8080)\n"
-        "  --room ROOM_ID          Room name (default test-room)\n"
+        "  --room ROOM_ID          Room name (if omitted, 6-char random room is generated)\n"
         "  --peer-id ID            Publisher peer ID (default pub1)\n"
 #ifdef _WIN32
         "  --video-dev DEV         Video device name (default \"Integrated Camera\")\n"
@@ -408,6 +437,8 @@ static void print_usage(const char *prog)
         "  --ssl-cert FILE         SSL certificate for QUIC (default ./server.crt)\n"
         "  --ssl-key FILE          SSL private key for QUIC (default ./server.key)\n"
         "  --enable-tcp            Enable ICE-TCP transport candidates\n"
+        "  --no-video              Audio-only mode (skip video capture/encoding)\n"
+        "  --no-audio              Video-only mode (skip audio capture/encoding)\n"
         "  --help                  Show this help\n", prog);
 }
 
@@ -424,7 +455,7 @@ int main(int argc, char *argv[])
 
     /* Defaults */
     strcpy(ctx->signaling_addr, "127.0.0.1:8443");
-    strcpy(ctx->room_id, "test-room");
+    ctx->room_id[0] = '\0';  /* empty until --room or auto-generated */
     strcpy(ctx->peer_id, "pub1");
     ctx->token[0] = '\0';
 #ifdef _WIN32
@@ -450,12 +481,14 @@ int main(int argc, char *argv[])
         {"ssl-cert",  1, NULL, 'c'},
         {"ssl-key",   1, NULL, 'k'},
         {"enable-tcp",0, NULL, 'E'},
+        {"no-video",  0, NULL, 'V'},
+        {"no-audio",  0, NULL, 'A'},
         {"help",      0, NULL, 'h'},
         {NULL, 0, NULL, 0}
     };
 
     int opt;
-    while ((opt = p2p_getopt_long(argc, argv, "s:r:p:T:v:a:t:c:k:Eh", long_opts, NULL)) != -1) {
+    while ((opt = p2p_getopt_long(argc, argv, "s:r:p:T:v:a:t:c:k:EVAh", long_opts, NULL)) != -1) {
         switch (opt) {
         case 's': snprintf(ctx->signaling_addr, sizeof(ctx->signaling_addr), "%s", p2p_optarg); break;
         case 'r': snprintf(ctx->room_id, sizeof(ctx->room_id), "%s", p2p_optarg); break;
@@ -466,6 +499,8 @@ int main(int argc, char *argv[])
         case 'c': snprintf(ctx->ssl_cert, sizeof(ctx->ssl_cert), "%s", p2p_optarg); break;
         case 'k': snprintf(ctx->ssl_key, sizeof(ctx->ssl_key), "%s", p2p_optarg); break;
         case 'E': ctx->enable_tcp = 1; break;
+        case 'V': ctx->no_video = 1; break;
+        case 'A': ctx->no_audio = 1; break;
         case 't': {
             char tmp[256];
             snprintf(tmp, sizeof(tmp), "%s", p2p_optarg);
@@ -491,6 +526,13 @@ int main(int argc, char *argv[])
     signal(SIGTERM, sig_handler);
 #endif
     p2p_mutex_init(&ctx->idr_mutex);
+
+    /* Auto-generate 6-char room_id if --room not specified */
+    if (ctx->room_id[0] == '\0') {
+        srand((unsigned)time(NULL));
+        snprintf(ctx->room_id, sizeof(ctx->room_id), "%06d", rand() % 1000000);
+        fprintf(stderr, "[client] room_id=%s (auto-generated)\n", ctx->room_id);
+    }
 
     fprintf(stderr, "[client] P2P AV Publisher starting\n");
     fprintf(stderr, "[client] signaling=%s room=%s peer=%s\n",
@@ -556,12 +598,16 @@ int main(int argc, char *argv[])
 
     /* Cleanup */
     if (ctx->capture_started) {
-        p2p_video_capture_stop(&ctx->vcap);
-        p2p_video_capture_close(&ctx->vcap);
-        p2p_audio_capture_stop(&ctx->acap);
-        p2p_audio_capture_close(&ctx->acap);
-        p2p_video_encoder_close(&ctx->venc);
-        p2p_audio_encoder_close(&ctx->aenc);
+        if (!ctx->no_video) {
+            p2p_video_capture_stop(&ctx->vcap);
+            p2p_video_capture_close(&ctx->vcap);
+            p2p_video_encoder_close(&ctx->venc);
+        }
+        if (!ctx->no_audio) {
+            p2p_audio_capture_stop(&ctx->acap);
+            p2p_audio_capture_close(&ctx->acap);
+            p2p_audio_encoder_close(&ctx->aenc);
+        }
     }
 
     p2p_signaling_disconnect(&ctx->sig_client);

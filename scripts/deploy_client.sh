@@ -1,30 +1,28 @@
 #!/usr/bin/env bash
 #
-# deploy_client.sh -- Build and deploy the P2P AV Publisher (p2p_client)
-#                     Supports Linux and Windows (via Git Bash / MSYS2)
+# deploy_client.sh -- 一键运行 p2p_client (发布端)
 #
-# Usage:
-#   ./scripts/deploy_client.sh [OPTIONS]
+# 连接远程 K8s 信令/TURN 服务器，采集本地摄像头+麦克风，通过 P2P 发送音视频。
+# 如果不指定 --room，p2p_client 自动生成 6 位随机 room_id 并打印在日志中。
+# 对端 p2p_peer 输入同一 room_id 即可加入。
 #
-# Options:
-#   --install-deps     Install system build dependencies via apt (Linux only)
-#   --deploy-dir DIR   Custom deployment directory (default: deploy/client)
-#   --start            Build, deploy, and start all services
-#   --stop             Stop running services
-#   --restart          Stop then start services
-#   --skip-build       Skip build step (use existing binaries)
-#   -h, --help         Show this help
+# 用法:
+#   ./scripts/deploy_client.sh [选项]
 #
-# Environment variables (override defaults):
-#   SIGNALING_ADDR   Signaling server address       (default: 127.0.0.1:8080)
-#   STUN_SERVER      STUN/TURN server address        (default: TURN_HOST:TURN_PORT)
-#   ROOM_ID          Room identifier                 (default: test-room)
-#   PEER_ID          Publisher peer ID                (default: pub1)
-#   VIDEO_DEV        Video device                     (Linux: /dev/video0, Windows: Integrated Camera)
-#   AUDIO_DEV        Audio device                     (Linux: default, Windows: Microphone)
-#   TURN_HOST        TURN server host                 (default: 127.0.0.1)
-#   TURN_PORT        TURN server port                 (default: 3478)
-#   TURN_SECRET      TURN shared secret               (default: p2p-turn-secret)
+# 选项:
+#   --server IP         远程服务器 IP               (默认: 106.54.30.119)
+#   --sig-port PORT     信令端口                     (默认: 30443)
+#   --stun-port PORT    STUN/TURN 端口              (默认: 3478)
+#   --room ROOM         房间 ID (不填则自动生成)
+#   --peer-id ID        发布端 ID                    (默认: pub1)
+#   --video-dev DEV     视频设备                     (默认: 自动检测)
+#   --audio-dev DEV     音频设备                     (默认: default)
+#   --admin-secret S    JWT 管理密钥
+#   --no-video          仅音频模式 (不采集/编码视频)
+#   --no-audio          仅视频模式 (不采集/编码音频)
+#   --rebuild           强制重新编译
+#   --duration SEC      运行时长 (0 = 无限)          (默认: 0)
+#   -h, --help          显示帮助
 #
 
 set -euo pipefail
@@ -33,369 +31,170 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_DIR="$PROJECT_DIR/build"
 
-# ---- Platform detection ----
-detect_platform() {
-    case "$(uname -s)" in
-        Linux*)         P2P_OS=linux ;;
-        MINGW*|MSYS*)   P2P_OS=windows ;;
-        CYGWIN*)        P2P_OS=windows ;;
-        Darwin*)        P2P_OS=macos ;;
-        *)              P2P_OS=linux ;;
-    esac
-}
-detect_platform
+# ---- 默认配置 ----
+SERVER_IP="106.54.30.119"
+SIGNALING_PORT="30443"
+STUN_PORT="3478"
+ROOM_ID=""
+PEER_ID="pub1"
+ADMIN_SECRET="eLTGSBSmlCZqar7lwkf4GFje"
+AUDIO_DEV="default"
+VIDEO_DEV=""
+FORCE_BUILD=false
+DURATION=0
+NO_VIDEO=false
+NO_AUDIO=false
 
-if [[ "$P2P_OS" == "windows" ]]; then
-    EXE_EXT=".exe"
-    DEFAULT_VIDEO_DEV="Integrated Camera"
-    DEFAULT_AUDIO_DEV="Microphone"
-else
-    EXE_EXT=""
-    DEFAULT_AUDIO_DEV="default"
-    # Auto-detect the first real (non-loopback) V4L2 camera
-    DEFAULT_VIDEO_DEV="/dev/video0"
+# ---- 路径 ----
+CLIENT_BIN="$BUILD_DIR/src/p2p/p2p_client"
+LIB_DIR="$BUILD_DIR/src/p2p"
+CERT_DIR="$BUILD_DIR/certs"
+LOG_DIR="$BUILD_DIR/logs"
+
+# ---- 工具函数 ----
+GREEN='\033[1;32m'; RED='\033[0;31m'; YELLOW='\033[0;33m'; NC='\033[0m'
+log()  { echo -e "${GREEN}[client]${NC} $*"; }
+warn() { echo -e "${YELLOW}[client]${NC} $*"; }
+die()  { echo -e "${RED}[client]${NC} $*"; exit 1; }
+
+detect_video() {
     for vdev in /dev/video*; do
-        if [[ -c "$vdev" ]] && v4l2-ctl -d "$vdev" --info 2>/dev/null | grep -q "uvcvideo"; then
-            DEFAULT_VIDEO_DEV="$vdev"
-            break
-        fi
+        [[ -c "$vdev" ]] && v4l2-ctl -d "$vdev" --info 2>/dev/null | grep -q "uvcvideo" && { echo "$vdev"; return; }
     done
-fi
+    echo "/dev/video0"
+}
 
-DEPLOY_DIR="${DEPLOY_DIR:-$PROJECT_DIR/deploy/client}"
-INSTALL_DEPS=false
-START_SERVICES=false
-STOP_SERVICES=false
-SKIP_BUILD=false
-
-SIGNALING_ADDR="${SIGNALING_ADDR:-127.0.0.1:8443}"
-JWT_SECRET="${JWT_SECRET:-p2p-jwt-secret}"
-ADMIN_SECRET="${ADMIN_SECRET:-p2p-admin-secret}"
-TURN_HOST="${TURN_HOST:-127.0.0.1}"
-TURN_PORT="${TURN_PORT:-3478}"
-STUN_SERVER="${STUN_SERVER:-${TURN_HOST}:${TURN_PORT}}"
-ROOM_ID="${ROOM_ID:-test-room}"
-PEER_ID="${PEER_ID:-pub1}"
-VIDEO_DEV="${VIDEO_DEV:-$DEFAULT_VIDEO_DEV}"
-AUDIO_DEV="${AUDIO_DEV:-$DEFAULT_AUDIO_DEV}"
-TURN_SECRET="${TURN_SECRET:-p2p-turn-secret}"
-
+# ---- 参数解析 ----
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --install-deps) INSTALL_DEPS=true; shift ;;
-        --deploy-dir)   DEPLOY_DIR="$2"; shift 2 ;;
-        --start)        START_SERVICES=true; shift ;;
-        --stop)         STOP_SERVICES=true; shift ;;
-        --restart)      STOP_SERVICES=true; START_SERVICES=true; shift ;;
-        --skip-build)   SKIP_BUILD=true; shift ;;
-        -h|--help)
-            head -30 "$0" | grep '^#' | sed 's/^# \?//'
-            echo "Detected platform: $P2P_OS"
-            exit 0 ;;
-        *) echo "Unknown option: $1"; exit 1 ;;
+        --server)       SERVER_IP="$2"; shift 2 ;;
+        --sig-port)     SIGNALING_PORT="$2"; shift 2 ;;
+        --stun-port)    STUN_PORT="$2"; shift 2 ;;
+        --room)         ROOM_ID="$2"; shift 2 ;;
+        --peer-id)      PEER_ID="$2"; shift 2 ;;
+        --video-dev)    VIDEO_DEV="$2"; shift 2 ;;
+        --audio-dev)    AUDIO_DEV="$2"; shift 2 ;;
+        --admin-secret) ADMIN_SECRET="$2"; shift 2 ;;
+        --no-video)     NO_VIDEO=true; shift ;;
+        --no-audio)     NO_AUDIO=true; shift ;;
+        --rebuild)      FORCE_BUILD=true; shift ;;
+        --duration)     DURATION="$2"; shift 2 ;;
+        -h|--help)      head -28 "$0" | grep '^#' | sed 's/^# \?//'; exit 0 ;;
+        *)              die "未知选项: $1" ;;
     esac
 done
 
-log() { echo -e "\033[1;32m[deploy_client]\033[0m $*"; }
-
-log "Platform: $P2P_OS"
+SIGNALING="${SERVER_IP}:${SIGNALING_PORT}"
+STUN="${SERVER_IP}:${STUN_PORT}"
+[[ -z "$VIDEO_DEV" ]] && VIDEO_DEV=$(detect_video)
 
 # ============================================================
-# Stop running services
+# 1. 编译 (仅在二进制不存在或 --rebuild 时)
 # ============================================================
-stop_services() {
-    log "Stopping running services..."
-    if [[ "$P2P_OS" == "windows" ]]; then
-        taskkill //F //IM "p2p_client.exe" 2>/dev/null && log "  p2p_client stopped" || true
-        taskkill //F //IM "signaling-server.exe" 2>/dev/null && log "  signaling-server stopped" || true
-    else
-        local pids
-        pids=$(pgrep -f "$DEPLOY_DIR/bin/p2p_client" 2>/dev/null || true)
-        [[ -n "$pids" ]] && kill $pids 2>/dev/null && log "  p2p_client stopped" || true
-
-        pids=$(pgrep -f "$DEPLOY_DIR/bin/signaling-server" 2>/dev/null || true)
-        [[ -n "$pids" ]] && kill $pids 2>/dev/null && log "  signaling-server stopped" || true
-    fi
-    sleep 1
-    log "Services stopped."
-}
-
-if $STOP_SERVICES && ! $START_SERVICES; then
-    stop_services
-    exit 0
+if $FORCE_BUILD || [[ ! -x "$CLIENT_BIN" ]]; then
+    log "编译项目..."
+    "$SCRIPT_DIR/build.sh"
 fi
+[[ -x "$CLIENT_BIN" ]] || die "二进制不存在: $CLIENT_BIN (请先执行 scripts/build.sh)"
 
 # ============================================================
-# Step 1: Build
+# 2. QUIC TLS 证书 (首次自动生成)
 # ============================================================
-if ! $SKIP_BUILD; then
-    BUILD_ARGS=()
-    $INSTALL_DEPS && BUILD_ARGS+=(--install-deps)
-
-    log "Building project..."
-    "$SCRIPT_DIR/build.sh" "${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"}"
-fi
-
-# Verify binaries exist
-CLIENT_BIN="$BUILD_DIR/src/p2p/p2p_client${EXE_EXT}"
-SIGNALING_BIN="$BUILD_DIR/signaling-server${EXE_EXT}"
-
-for bin in "$CLIENT_BIN" "$SIGNALING_BIN"; do
-    if [[ ! -f "$bin" ]]; then
-        log "ERROR: $bin not found. Run without --skip-build first."
-        exit 1
-    fi
-done
-
-# ============================================================
-# Step 2: Generate self-signed TLS certificate
-# ============================================================
-CERT_DIR="$BUILD_DIR/certs"
 mkdir -p "$CERT_DIR"
-if [[ ! -f "$CERT_DIR/server.crt" || ! -f "$CERT_DIR/server.key" ]]; then
-    log "Generating self-signed TLS certificate..."
+if [[ ! -f "$CERT_DIR/server.crt" ]]; then
+    log "生成 QUIC TLS 证书..."
     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
         -keyout "$CERT_DIR/server.key" -out "$CERT_DIR/server.crt" \
-        -days 365 -nodes -batch -subj "/CN=p2p-av-publisher" 2>/dev/null
-    log "Certificate generated."
+        -days 365 -nodes -batch -subj "/CN=p2p-quic" 2>/dev/null
+fi
+
+# ============================================================
+# 3. 清理残留进程 (避免摄像头占用)
+# ============================================================
+OLD_PIDS=$(pgrep -f "$CLIENT_BIN" 2>/dev/null || true)
+if [[ -n "$OLD_PIDS" ]]; then
+    warn "终止残留 p2p_client 进程: $OLD_PIDS"
+    kill $OLD_PIDS 2>/dev/null || true
+    sleep 1
+fi
+
+# ============================================================
+# 4. 检查信令服务器
+# ============================================================
+log "连接信令服务器 $SIGNALING ..."
+HEALTH=$(curl -sk --connect-timeout 5 "https://${SIGNALING}/health" 2>/dev/null || echo "{}")
+echo "$HEALTH" | grep -q '"status":"ok"' || die "信令服务器不可达: $HEALTH"
+log "信令正常"
+
+# ============================================================
+# 5. 获取 JWT Token
+# ============================================================
+log "获取 JWT Token (peer=$PEER_ID) ..."
+TOKEN_JSON=$(curl -sk --connect-timeout 10 \
+    "https://${SIGNALING}/v1/token?peer_id=${PEER_ID}" \
+    -H "Authorization: Bearer ${ADMIN_SECRET}" 2>/dev/null)
+TOKEN=$(echo "$TOKEN_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])" 2>/dev/null || true)
+TOKEN_ARG=""
+if [[ -n "$TOKEN" ]]; then
+    TOKEN_ARG="--token $TOKEN"
+    log "Token 获取成功"
 else
-    log "TLS certificate already exists, skipping."
+    warn "未能获取 Token，继续运行（无认证）"
 fi
 
 # ============================================================
-# Step 3: Stop old processes before copying (avoid "text file busy")
+# 6. 启动 p2p_client
 # ============================================================
-if [[ -d "$DEPLOY_DIR/bin" ]]; then
-    stop_services
-fi
-
-# ============================================================
-# Step 4: Assemble deployment directory
-# ============================================================
-log "Assembling deployment directory: $DEPLOY_DIR"
-mkdir -p "$DEPLOY_DIR"/{bin,lib,certs,conf,logs}
-
-cp -f "$CLIENT_BIN"      "$DEPLOY_DIR/bin/"
-cp -f "$SIGNALING_BIN"   "$DEPLOY_DIR/bin/"
-cp -f "$CERT_DIR/server.crt" "$DEPLOY_DIR/certs/"
-cp -f "$CERT_DIR/server.key" "$DEPLOY_DIR/certs/"
-
-# Copy shared library
-if [[ "$P2P_OS" == "windows" ]]; then
-    cp -f "$BUILD_DIR/src/p2p/libp2pav.dll" "$DEPLOY_DIR/lib/" 2>/dev/null || true
-    cp -f "$BUILD_DIR/src/p2p/p2pav.dll"    "$DEPLOY_DIR/lib/" 2>/dev/null || true
-else
-    cp -f "$BUILD_DIR/src/p2p/libp2pav.so"* "$DEPLOY_DIR/lib/" 2>/dev/null || true
-fi
-log "Shared library deployed to $DEPLOY_DIR/lib/"
-
-# Generate JWT token for the publisher
-log "Generating JWT token for publisher..."
-PUB_TOKEN=$("$DEPLOY_DIR/bin/signaling-server${EXE_EXT}" 2>/dev/null & SIG_PID=$!; sleep 0; kill $SIG_PID 2>/dev/null || true; echo "")
-# Use a simple token generation via the server's /v1/token endpoint, or embed in env
-# For simplicity, we'll store the JWT secret and let the launcher generate tokens
-
-# Generate signaling server TLS certificate
-SIG_CERT_DIR="$DEPLOY_DIR/certs"
-mkdir -p "$SIG_CERT_DIR"
-if [[ ! -f "$SIG_CERT_DIR/sig_server.crt" ]]; then
-    log "Generating signaling server TLS certificate..."
-    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-        -keyout "$SIG_CERT_DIR/sig_server.key" -out "$SIG_CERT_DIR/sig_server.crt" \
-        -days 365 -nodes -batch -subj "/CN=p2p-signaling" 2>/dev/null
-fi
-
-cat > "$DEPLOY_DIR/conf/client.env" <<EOF
-# P2P Client (Publisher) Configuration
-# Platform: $P2P_OS
-SIGNALING_ADDR=${SIGNALING_ADDR}
-STUN_SERVER=${STUN_SERVER}
-ROOM_ID=${ROOM_ID}
-PEER_ID=${PEER_ID}
-VIDEO_DEV=${VIDEO_DEV}
-AUDIO_DEV=${AUDIO_DEV}
-
-# Signaling server settings (HTTPS)
-LISTEN_ADDR=:${SIGNALING_ADDR##*:}
-TLS_CERT_FILE=\${SCRIPT_DIR}/certs/sig_server.crt
-TLS_KEY_FILE=\${SCRIPT_DIR}/certs/sig_server.key
-JWT_SECRET=${JWT_SECRET}
-ADMIN_SECRET=${ADMIN_SECRET}
-TURN_HOST=${TURN_HOST}
-TURN_PORT=${TURN_PORT}
-TURN_SECRET=${TURN_SECRET}
-MAX_SUBSCRIBERS=10
-EOF
-
-# ---- Generate bash launcher (works on both platforms via Git Bash) ----
-cat > "$DEPLOY_DIR/start.sh" <<'LAUNCHER'
-#!/usr/bin/env bash
-set -euo pipefail
-
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-source "$SCRIPT_DIR/conf/client.env"
-LOG_DIR="$SCRIPT_DIR/logs"
 mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/p2p_client.log"
 
-# Detect executable extension
-case "$(uname -s)" in
-    MINGW*|MSYS*|CYGWIN*) EXE_EXT=".exe" ;;
-    *)                     EXE_EXT="" ;;
-esac
+ROOM_ARG=""
+[[ -n "$ROOM_ID" ]] && ROOM_ARG="--room $ROOM_ID"
+AV_ARGS=""
+$NO_VIDEO && AV_ARGS="$AV_ARGS --no-video"
+$NO_AUDIO && AV_ARGS="$AV_ARGS --no-audio"
 
-PIDS=()
+echo ""
+echo "============================================"
+echo "  P2P Client (发布端) -> $SERVER_IP"
+echo "============================================"
+log "信令:     $SIGNALING"
+log "STUN/TURN: $STUN"
+log "视频设备:  $VIDEO_DEV"
+log "音频设备:  $AUDIO_DEV"
+[[ -n "$ROOM_ID" ]] && log "房间:     $ROOM_ID" || log "房间:     (自动生成, 见下方日志)"
+log "日志:     $LOG_FILE"
+echo ""
+
+export LD_LIBRARY_PATH="${LIB_DIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
 cleanup() {
-    echo "[launcher] Stopping services..."
-    for pid in "${PIDS[@]}"; do kill "$pid" 2>/dev/null || true; done
-    wait 2>/dev/null
-    echo "[launcher] All services stopped."
+    echo ""
+    log "正在停止 p2p_client ..."
+    kill $CLIENT_PID 2>/dev/null || true
+    wait $CLIENT_PID 2>/dev/null || true
+    echo ""
+    log "最后 10 行日志:"
+    tail -10 "$LOG_FILE" 2>/dev/null | sed 's/^/  /'
 }
+
+"$CLIENT_BIN" \
+    --signaling "$SIGNALING" \
+    $ROOM_ARG \
+    --peer-id "$PEER_ID" \
+    --video-dev "$VIDEO_DEV" \
+    --audio-dev "$AUDIO_DEV" \
+    --stun "$STUN" \
+    --ssl-cert "$CERT_DIR/server.crt" \
+    --ssl-key "$CERT_DIR/server.key" \
+    $TOKEN_ARG $AV_ARGS 2>&1 | tee "$LOG_FILE" &
+CLIENT_PID=$!
 trap cleanup EXIT INT TERM
 
-echo "[launcher] Starting signaling server (HTTPS) on $LISTEN_ADDR ..."
-LISTEN_ADDR="$LISTEN_ADDR" \
-TLS_CERT_FILE="$TLS_CERT_FILE" TLS_KEY_FILE="$TLS_KEY_FILE" \
-JWT_SECRET="$JWT_SECRET" ADMIN_SECRET="$ADMIN_SECRET" \
-TURN_HOST="$TURN_HOST" TURN_PORT="$TURN_PORT" \
-TURN_SECRET="$TURN_SECRET" MAX_SUBSCRIBERS="${MAX_SUBSCRIBERS:-10}" \
-"$SCRIPT_DIR/bin/signaling-server${EXE_EXT}" 2>&1 | tee "$LOG_DIR/signaling.log" &
-PIDS+=($!)
-sleep 2
-
-# Generate JWT token for publisher via signaling server's /v1/token endpoint
-SIG_HOST="${SIGNALING_ADDR%:*}"
-SIG_PORT="${SIGNALING_ADDR##*:}"
-[[ "$SIG_HOST" == "0.0.0.0" || "$SIG_HOST" == "" ]] && SIG_HOST="127.0.0.1"
-TOKEN_URL="https://${SIG_HOST}:${SIG_PORT}/v1/token?peer_id=${PEER_ID}"
-echo "[launcher] Requesting JWT token from $TOKEN_URL ..."
-PUB_TOKEN=$(curl -sk -H "Authorization: Bearer $ADMIN_SECRET" "$TOKEN_URL" | \
-    sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
-if [[ -z "$PUB_TOKEN" ]]; then
-    echo "[launcher] WARNING: Could not obtain JWT token, proceeding without auth"
+if [[ "$DURATION" -gt 0 ]]; then
+    log "运行 ${DURATION} 秒..."
+    sleep "$DURATION"
+else
+    log "运行中，按 Ctrl+C 停止"
+    wait $CLIENT_PID
 fi
-
-STUN_HOST="${STUN_SERVER%:*}"
-STUN_PORT="${STUN_SERVER##*:}"
-[[ "$STUN_PORT" == "$STUN_HOST" ]] && STUN_PORT=3478
-
-echo "[launcher] Starting p2p_client (publisher)..."
-echo "[launcher]   Signaling: $SIGNALING_ADDR  Room: $ROOM_ID  STUN: $STUN_HOST:$STUN_PORT"
-echo "[launcher]   Video: $VIDEO_DEV  Audio: $AUDIO_DEV"
-
-TOKEN_ARG=""
-[[ -n "$PUB_TOKEN" ]] && TOKEN_ARG="--token $PUB_TOKEN"
-
-export LD_LIBRARY_PATH="$SCRIPT_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-
-"$SCRIPT_DIR/bin/p2p_client${EXE_EXT}" \
-    --signaling "$SIGNALING_ADDR" \
-    --room "$ROOM_ID" --peer-id "$PEER_ID" \
-    --video-dev "$VIDEO_DEV" --audio-dev "$AUDIO_DEV" \
-    --stun "$STUN_HOST:$STUN_PORT" \
-    --ssl-cert "$SCRIPT_DIR/certs/server.crt" \
-    --ssl-key "$SCRIPT_DIR/certs/server.key" \
-    $TOKEN_ARG 2>&1 | tee "$LOG_DIR/p2p_client.log" &
-PIDS+=($!)
-
-echo "[launcher] Publisher running. Press Ctrl+C to stop."
-echo "[launcher] Logs: $LOG_DIR/"
-wait
-LAUNCHER
-chmod +x "$DEPLOY_DIR/start.sh"
-
-# ---- Generate Windows batch launcher ----
-if [[ "$P2P_OS" == "windows" ]]; then
-    cat > "$DEPLOY_DIR/start.bat" <<WINLAUNCHER
-@echo off
-setlocal enabledelayedexpansion
-
-set "SCRIPT_DIR=%~dp0"
-set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"
-
-:: Load config
-for /f "usebackq tokens=1* delims==" %%a in ("%SCRIPT_DIR%\\conf\\client.env") do (
-    set "line=%%a"
-    if not "!line:~0,1!"=="#" if not "%%a"=="" set "%%a=%%b"
-)
-
-if not exist "%SCRIPT_DIR%\\logs" mkdir "%SCRIPT_DIR%\\logs"
-
-echo [launcher] Starting signaling server on %LISTEN_ADDR% ...
-start "signaling-server" /B cmd /c "%SCRIPT_DIR%\\bin\\signaling-server.exe 2>&1 | tee %SCRIPT_DIR%\\logs\\signaling.log"
-timeout /t 1 /nobreak >nul
-
-for /f "tokens=1 delims=:" %%h in ("%STUN_SERVER%") do set "STUN_HOST=%%h"
-for /f "tokens=2 delims=:" %%p in ("%STUN_SERVER%") do set "STUN_PORT=%%p"
-if "%STUN_PORT%"=="" set "STUN_PORT=3478"
-
-echo [launcher] Starting p2p_client (publisher)...
-echo [launcher]   Signaling: %SIGNALING_ADDR%  Room: %ROOM_ID%  STUN: %STUN_HOST%:%STUN_PORT%
-echo [launcher]   Video: %VIDEO_DEV%  Audio: %AUDIO_DEV%
-
-"%SCRIPT_DIR%\\bin\\p2p_client.exe" ^
-    --signaling "%SIGNALING_ADDR%" ^
-    --room "%ROOM_ID%" --peer-id "%PEER_ID%" ^
-    --video-dev "%VIDEO_DEV%" --audio-dev "%AUDIO_DEV%" ^
-    --stun "%STUN_HOST%:%STUN_PORT%" ^
-    --ssl-cert "%SCRIPT_DIR%\\certs\\server.crt" ^
-    --ssl-key "%SCRIPT_DIR%\\certs\\server.key"
-
-echo [launcher] Publisher stopped.
-taskkill /F /IM signaling-server.exe 2>nul
-WINLAUNCHER
-    log "Windows batch launcher generated: start.bat"
-fi
-
-# ---- Generate stop scripts ----
-cat > "$DEPLOY_DIR/stop.sh" <<'STOPPER'
-#!/usr/bin/env bash
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-case "$(uname -s)" in
-    MINGW*|MSYS*|CYGWIN*)
-        taskkill //F //IM "p2p_client.exe" 2>/dev/null || true
-        taskkill //F //IM "signaling-server.exe" 2>/dev/null || true
-        ;;
-    *)
-        pkill -f "$SCRIPT_DIR/bin/p2p_client" 2>/dev/null || true
-        pkill -f "$SCRIPT_DIR/bin/signaling-server" 2>/dev/null || true
-        ;;
-esac
-sleep 1
-echo "[stop] Done."
-STOPPER
-chmod +x "$DEPLOY_DIR/stop.sh"
-
-if [[ "$P2P_OS" == "windows" ]]; then
-    cat > "$DEPLOY_DIR/stop.bat" <<'WINSTOPPER'
-@echo off
-echo [stop] Stopping p2p_client...
-taskkill /F /IM p2p_client.exe 2>nul
-echo [stop] Stopping signaling-server...
-taskkill /F /IM signaling-server.exe 2>nul
-timeout /t 1 /nobreak >nul
-echo [stop] Done.
-WINSTOPPER
-fi
-
-log "Deployment ready ($P2P_OS): $DEPLOY_DIR/"
-log "  bin/p2p_client${EXE_EXT}        Publisher binary"
-log "  bin/signaling-server${EXE_EXT}  Signaling server binary"
-log "  certs/                TLS certificates"
-log "  conf/client.env       Configuration"
-log "  logs/                 Runtime logs"
-if [[ "$P2P_OS" == "windows" ]]; then
-    log "  start.bat             Start all services (Windows native)"
-    log "  stop.bat              Stop all services (Windows native)"
-fi
-log "  start.sh              Start all services (bash)"
-log "  stop.sh               Stop all services (bash)"
-
-# ============================================================
-# Step 5: Optionally start
-# ============================================================
-if $START_SERVICES; then
-    log "Starting services..."
-    exec "$DEPLOY_DIR/start.sh"
-fi
-
-log "Done. Run: $DEPLOY_DIR/start.sh"

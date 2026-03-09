@@ -11,6 +11,7 @@ extern "C" {
 #endif
 
 #define P2P_SIG_MAX_MSG_SIZE    8192
+#define P2P_SIG_POST_QUEUE_SIZE 32
 #define P2P_SIG_MAX_PEER_ID     64
 #define P2P_SIG_MAX_ROOM_ID     64
 #define P2P_SIG_MAX_SDP_SIZE    4096
@@ -103,6 +104,15 @@ struct p2p_signaling_client_s {
     p2p_tls_conn_t             *post_conn;
     p2p_mutex_t                 post_mutex;   /* serialize POST requests */
     p2p_thread_t                sse_thread;
+
+    /* Async POST queue (fire-and-forget for ICE signaling) */
+    char                        post_queue[P2P_SIG_POST_QUEUE_SIZE][P2P_SIG_MAX_MSG_SIZE];
+    int                         post_queue_head;
+    int                         post_queue_tail;
+    p2p_mutex_t                 post_queue_mutex;
+    p2p_cond_t                  post_queue_cond;
+    p2p_thread_t                post_worker_thread;
+    int                         post_worker_running;
 };
 
 int  p2p_signaling_connect(p2p_signaling_client_t *client, const p2p_signaling_config_t *config);
@@ -127,6 +137,18 @@ int  p2p_signaling_send_full_offer(p2p_signaling_client_t *client,
 int  p2p_signaling_send_full_answer(p2p_signaling_client_t *client,
                                      const char *to_peer, const char *sdp,
                                      const char **candidates, int count);
+
+/* Async (fire-and-forget) variants for ICE signaling.
+ * These enqueue the POST and return immediately without waiting for the
+ * HTTP response, so callers (SSE thread, libjuice thread) are never blocked. */
+int  p2p_signaling_send_ice_offer_async(p2p_signaling_client_t *client,
+                                         const char *to_peer, const char *sdp);
+int  p2p_signaling_send_ice_answer_async(p2p_signaling_client_t *client,
+                                          const char *to_peer, const char *sdp);
+int  p2p_signaling_send_ice_candidate_async(p2p_signaling_client_t *client,
+                                              const char *to_peer, const char *candidate);
+int  p2p_signaling_send_gathering_done_async(p2p_signaling_client_t *client,
+                                               const char *to_peer);
 
 /* JSON serialization helpers (kept for compatibility) */
 int  p2p_sig_message_to_json(const p2p_sig_message_t *msg, char *buf, size_t size);

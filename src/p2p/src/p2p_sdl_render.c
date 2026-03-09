@@ -20,16 +20,49 @@ void p2p_sdl_quit(void)
     SDL_Quit();
 }
 
-int p2p_sdl_poll_events(void)
+int p2p_sdl_poll_events(p2p_sdl_events_t *out_events)
 {
+    int quit = 0;
+    if (out_events) {
+        memset(out_events, 0, sizeof(*out_events));
+    }
+
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
-        if (ev.type == SDL_QUIT)
-            return -1;
-        if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_ESCAPE)
-            return -1;
+        if (ev.type == SDL_QUIT) {
+            quit = 1;
+            if (out_events) out_events->quit = 1;
+        }
+        if (ev.type == SDL_KEYDOWN) {
+            if (ev.key.keysym.sym == SDLK_ESCAPE) {
+                quit = 1;
+                if (out_events) out_events->quit = 1;
+            }
+            if (out_events) {
+                out_events->key_down = 1;
+                out_events->key_sym = ev.key.keysym.sym;
+            }
+        }
+        if (ev.type == SDL_MOUSEBUTTONDOWN && out_events) {
+            out_events->mouse_down = 1;
+            out_events->mouse_x = ev.button.x;
+            out_events->mouse_y = ev.button.y;
+            out_events->mouse_button = ev.button.button;
+        }
     }
-    return 0;
+
+    return quit ? -1 : 0;
+}
+
+void p2p_sdl_draw_rect(void *renderer, int x, int y, int w, int h,
+                       uint8_t r, uint8_t g, uint8_t b, uint8_t a)
+{
+    SDL_Renderer *ren = (SDL_Renderer *)renderer;
+    if (!ren || w <= 0 || h <= 0) return;
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(ren, r, g, b, a);
+    SDL_Rect rect = { x, y, w, h };
+    SDL_RenderFillRect(ren, &rect);
 }
 
 /* ======== SDL Video ======== */
@@ -108,6 +141,46 @@ int p2p_sdl_video_display(p2p_sdl_video_t *v,
     SDL_RenderCopy((SDL_Renderer *)v->renderer, (SDL_Texture *)v->texture, NULL, NULL);
     SDL_RenderPresent((SDL_Renderer *)v->renderer);
     return 0;
+}
+
+int p2p_sdl_video_draw_frame(p2p_sdl_video_t *v,
+                             const uint8_t *y, const uint8_t *u, const uint8_t *v_plane,
+                             int linesize_y, int linesize_u, int linesize_v,
+                             int width, int height)
+{
+    if (!v || !v->initialized) return -1;
+
+    if (y && u && v_plane) {
+        if (width != v->tex_width || height != v->tex_height) {
+            if (v->texture) SDL_DestroyTexture((SDL_Texture *)v->texture);
+            v->texture = SDL_CreateTexture((SDL_Renderer *)v->renderer,
+                SDL_PIXELFORMAT_IYUV, SDL_TEXTUREACCESS_STREAMING,
+                width, height);
+            if (!v->texture) return -1;
+            v->tex_width = width;
+            v->tex_height = height;
+        }
+        SDL_UpdateYUVTexture((SDL_Texture *)v->texture, NULL,
+                            y, linesize_y, u, linesize_u, v_plane, linesize_v);
+    }
+
+    SDL_RenderClear((SDL_Renderer *)v->renderer);
+
+    if (v->video_area_h > 0) {
+        int rw, rh;
+        SDL_GetRendererOutputSize((SDL_Renderer *)v->renderer, &rw, &rh);
+        SDL_Rect dst = {0, 0, rw, v->video_area_h};
+        SDL_RenderCopy((SDL_Renderer *)v->renderer, (SDL_Texture *)v->texture, NULL, &dst);
+    } else {
+        SDL_RenderCopy((SDL_Renderer *)v->renderer, (SDL_Texture *)v->texture, NULL, NULL);
+    }
+    return 0;
+}
+
+void p2p_sdl_video_present(p2p_sdl_video_t *v)
+{
+    if (v && v->initialized && v->renderer)
+        SDL_RenderPresent((SDL_Renderer *)v->renderer);
 }
 
 void p2p_sdl_video_destroy(p2p_sdl_video_t *v)

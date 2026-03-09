@@ -235,6 +235,54 @@ static int post_signal(p2p_signaling_client_t *c, const char *json_body,
     return status;
 }
 
+/* Enqueue a JSON body for async POST (fire-and-forget).
+ * Returns 0 on success, -1 if queue is full or client is not running. */
+static int post_signal_async(p2p_signaling_client_t *c, const char *json_body)
+{
+    if (!c || !c->post_worker_running) return -1;
+
+    p2p_mutex_lock(&c->post_queue_mutex);
+    int next = (c->post_queue_tail + 1) % P2P_SIG_POST_QUEUE_SIZE;
+    if (next == c->post_queue_head) {
+        p2p_mutex_unlock(&c->post_queue_mutex);
+        fprintf(stderr, "[sig] async POST queue full, dropping message\n");
+        return -1;
+    }
+    snprintf(c->post_queue[c->post_queue_tail], P2P_SIG_MAX_MSG_SIZE, "%s", json_body);
+    c->post_queue_tail = next;
+    p2p_cond_signal(&c->post_queue_cond);
+    p2p_mutex_unlock(&c->post_queue_mutex);
+    return 0;
+}
+
+/* Background worker that drains the async POST queue sequentially. */
+static void *post_worker_func(void *arg)
+{
+    p2p_signaling_client_t *c = (p2p_signaling_client_t *)arg;
+    char resp[P2P_SIG_MAX_MSG_SIZE];
+
+    while (c->post_worker_running) {
+        p2p_mutex_lock(&c->post_queue_mutex);
+        while (c->post_queue_head == c->post_queue_tail && c->post_worker_running) {
+            p2p_cond_timedwait_us(&c->post_queue_cond, &c->post_queue_mutex, 500000);
+        }
+        if (!c->post_worker_running) {
+            p2p_mutex_unlock(&c->post_queue_mutex);
+            break;
+        }
+        char body[P2P_SIG_MAX_MSG_SIZE];
+        memcpy(body, c->post_queue[c->post_queue_head], P2P_SIG_MAX_MSG_SIZE);
+        c->post_queue_head = (c->post_queue_head + 1) % P2P_SIG_POST_QUEUE_SIZE;
+        p2p_mutex_unlock(&c->post_queue_mutex);
+
+        int status = post_signal(c, body, resp, sizeof(resp));
+        if (status < 200 || status >= 300) {
+            fprintf(stderr, "[sig] async POST failed HTTP %d\n", status);
+        }
+    }
+    return NULL;
+}
+
 /* Dispatch a full_offer or full_answer from SSE event data.
  * Triggers on_ice_offer/answer + on_ice_candidate*N + on_gathering_done. */
 static void dispatch_full_ice(p2p_signaling_client_t *c,
@@ -475,9 +523,35 @@ int p2p_signaling_connect(p2p_signaling_client_t *c, const p2p_signaling_config_
     c->connected = 1;
     c->running   = 1;
 
+    /* Init async POST queue */
+    c->post_queue_head = 0;
+    c->post_queue_tail = 0;
+    p2p_mutex_init(&c->post_queue_mutex);
+    p2p_cond_init(&c->post_queue_cond);
+    c->post_worker_running = 1;
+
+    /* Start POST worker thread */
+    if (p2p_thread_create(&c->post_worker_thread, post_worker_func, c) != 0) {
+        fprintf(stderr, "[sig] POST worker thread creation failed\n");
+        c->connected = 0;
+        c->running   = 0;
+        c->post_worker_running = 0;
+        p2p_mutex_destroy(&c->post_queue_mutex);
+        p2p_cond_destroy(&c->post_queue_cond);
+        p2p_tls_close(c->sse_conn);   c->sse_conn  = NULL;
+        p2p_tls_close(c->post_conn);  c->post_conn = NULL;
+        p2p_tls_ctx_destroy(c->tls_ctx); c->tls_ctx = NULL;
+        return -1;
+    }
+
     /* Start SSE reader thread */
     if (p2p_thread_create(&c->sse_thread, sse_thread_func, c) != 0) {
         fprintf(stderr, "[sig] SSE thread creation failed\n");
+        c->post_worker_running = 0;
+        p2p_cond_signal(&c->post_queue_cond);
+        p2p_thread_join(c->post_worker_thread);
+        p2p_mutex_destroy(&c->post_queue_mutex);
+        p2p_cond_destroy(&c->post_queue_cond);
         c->connected = 0;
         c->running   = 0;
         p2p_tls_close(c->sse_conn);   c->sse_conn  = NULL;
@@ -496,6 +570,15 @@ void p2p_signaling_disconnect(p2p_signaling_client_t *c)
 {
     if (!c) return;
     c->running = 0;
+
+    /* Stop POST worker thread first (before closing TLS connections) */
+    if (c->post_worker_running) {
+        c->post_worker_running = 0;
+        p2p_cond_signal(&c->post_queue_cond);
+        p2p_thread_join(c->post_worker_thread);
+        p2p_mutex_destroy(&c->post_queue_mutex);
+        p2p_cond_destroy(&c->post_queue_cond);
+    }
 
     /* Shutdown the SSE socket to unblock the reader thread,
      * but do NOT free the connection yet. */
@@ -674,4 +757,66 @@ int p2p_signaling_send_full_answer(p2p_signaling_client_t *c,
     char resp[P2P_SIG_MAX_MSG_SIZE];
     int status = post_signal(c, body, resp, sizeof(resp));
     return (status >= 200 && status < 300) ? 0 : -1;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Async (fire-and-forget) ICE signaling API                         */
+/* ------------------------------------------------------------------ */
+
+int p2p_signaling_send_ice_offer_async(p2p_signaling_client_t *c,
+                                        const char *to_peer, const char *sdp)
+{
+    if (!c || !c->connected || !to_peer || !sdp) return -1;
+
+    char body[P2P_SIG_MAX_MSG_SIZE];
+    if (build_signal_json(c, "ice_offer", to_peer, c->room_id,
+                          sdp, NULL, 0, body, sizeof(body)) != 0)
+        return -1;
+
+    return post_signal_async(c, body);
+}
+
+int p2p_signaling_send_ice_answer_async(p2p_signaling_client_t *c,
+                                         const char *to_peer, const char *sdp)
+{
+    if (!c || !c->connected || !to_peer || !sdp) return -1;
+
+    char body[P2P_SIG_MAX_MSG_SIZE];
+    if (build_signal_json(c, "ice_answer", to_peer, c->room_id,
+                          sdp, NULL, 0, body, sizeof(body)) != 0)
+        return -1;
+
+    return post_signal_async(c, body);
+}
+
+int p2p_signaling_send_ice_candidate_async(p2p_signaling_client_t *c,
+                                             const char *to_peer,
+                                             const char *candidate)
+{
+    if (!c || !c->connected || !to_peer || !candidate) return -1;
+
+    char body[P2P_SIG_MAX_MSG_SIZE];
+    char esc[P2P_SIG_MAX_SDP_SIZE * 2];
+    json_escape(candidate, esc, sizeof(esc));
+
+    int n = snprintf(body, sizeof(body),
+        "{\"type\":\"ice_candidate\",\"peer_id\":\"%s\",\"token\":\"%s\""
+        ",\"to\":\"%s\",\"room_id\":\"%s\",\"candidate\":\"%s\"}",
+        c->peer_id, c->token, to_peer, c->room_id, esc);
+    if (n <= 0 || (size_t)n >= sizeof(body)) return -1;
+
+    return post_signal_async(c, body);
+}
+
+int p2p_signaling_send_gathering_done_async(p2p_signaling_client_t *c,
+                                              const char *to_peer)
+{
+    if (!c || !c->connected || !to_peer) return -1;
+
+    char body[P2P_SIG_MAX_MSG_SIZE];
+    if (build_signal_json(c, "gathering_done", to_peer, c->room_id,
+                          NULL, NULL, 0, body, sizeof(body)) != 0)
+        return -1;
+
+    return post_signal_async(c, body);
 }
