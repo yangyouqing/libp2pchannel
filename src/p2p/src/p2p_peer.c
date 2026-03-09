@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "p2p_platform.h"
 #ifndef _WIN32
 #include <signal.h>

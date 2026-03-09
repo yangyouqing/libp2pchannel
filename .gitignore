@@ -1,5 +1,8 @@
 build/
 build_win/
+android
+android_deps
+build_android
 #deploy/
 deploy/client
 deploy/peer
