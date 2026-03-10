@@ -7,9 +7,13 @@ include(FindPkgConfig)
 add_executable(test_signaling test_signaling.c)
 target_link_libraries(test_signaling PRIVATE p2pav)
 
-# --- ICE connectivity test ---
+# --- ICE connectivity test (uses juice_* directly, needs static lib) ---
 add_executable(test_ice_connectivity test_ice_connectivity.c)
-target_link_libraries(test_ice_connectivity PRIVATE p2pav)
+target_link_libraries(test_ice_connectivity PRIVATE p2pav_static)
+
+# --- VIDEO_STOP / VIDEO_START control message test ---
+add_executable(test_video_stop test_video_stop.c)
+target_link_libraries(test_video_stop PRIVATE p2pav_static)
 
 # --- libp2pav E2E test (links shared library only, no FFmpeg/SDL) ---
 add_executable(test_p2pav_e2e test_p2pav_e2e.c)
@@ -32,7 +36,7 @@ add_executable(test_p2p_middleware
 )
 target_include_directories(test_p2p_middleware PRIVATE
     ${PROJECT_SOURCE_DIR}/src/p2p/include)
-target_link_libraries(test_p2p_middleware PRIVATE p2pav)
+target_link_libraries(test_p2p_middleware PRIVATE p2pav_static)
 
 pkg_check_modules(MW_AVCODEC    REQUIRED libavcodec)
 pkg_check_modules(MW_AVUTIL     REQUIRED libavutil)

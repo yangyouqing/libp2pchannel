@@ -128,6 +128,10 @@ typedef struct {
     uint32_t             rx_frag_total;
     uint32_t             rx_frag_dup;
 
+    /* Audio RX stats */
+    uint32_t             audio_frames_rx;
+    uint32_t             audio_frames_played;
+
     /* Timing */
     uint64_t             first_frame_time;
     uint64_t             signaling_connect_time;
@@ -254,10 +258,16 @@ static void process_complete_frame(peer_ctx_t *ctx, reasm_buf_t *rb)
             p2p_mutex_unlock(&ctx->frame_mutex);
         }
     } else if (rb->type == P2P_FRAME_TYPE_AUDIO) {
+        ctx->audio_frames_rx++;
         if (!ctx->audio_enabled) return;
         if (!ctx->adec_open) {
-            if (p2p_audio_decoder_open(&ctx->adec, 48000, 1) != 0) return;
+            fprintf(stderr, "[RX-AUDIO] opening decoder...\n");
+            if (p2p_audio_decoder_open(&ctx->adec, 48000, 1) != 0) {
+                fprintf(stderr, "[RX-AUDIO] decoder open FAILED\n");
+                return;
+            }
             ctx->adec_open = 1;
+            fprintf(stderr, "[RX-AUDIO] decoder opened OK\n");
         }
 
         int16_t *samples = NULL;
@@ -295,10 +305,11 @@ static void rx_print_stats(peer_ctx_t *ctx)
     uint64_t now = p2p_capture_now_us();
     if (now - ctx->last_rx_stat_us < 5000000ULL) return;
     ctx->last_rx_stat_us = now;
-    fprintf(stderr, "[RX-STAT] ok=%u lost=%u incomplete=%u frags=%u dup=%u\n",
+    fprintf(stderr, "[RX-STAT] v_ok=%u v_lost=%u v_inc=%u frags=%u dup=%u | a_rx=%u a_play=%u\n",
             ctx->video_frames_ok, ctx->video_frames_lost,
             ctx->video_frames_incomplete,
-            ctx->rx_frag_total, ctx->rx_frag_dup);
+            ctx->rx_frag_total, ctx->rx_frag_dup,
+            ctx->audio_frames_rx, ctx->audio_frames_played);
 }
 
 static void on_data_recv(p2p_peer_ctx_t *peer, const p2p_frame_header_t *hdr,
@@ -404,6 +415,8 @@ static void on_data_recv(p2p_peer_ctx_t *peer, const p2p_frame_header_t *hdr,
             fprintf(stderr, "[RX] seq=%u %s size=%u OK\n",
                     rb->seq, (rb->flags & P2P_FRAME_FLAG_KEY) ? "IDR" : "P", rb->total_len);
             ctx->video_frames_ok++;
+        } else if (hdr->type == P2P_FRAME_TYPE_AUDIO) {
+            fprintf(stderr, "[RX-AUDIO] seq=%u size=%u\n", rb->seq, rb->total_len);
         }
         process_complete_frame(ctx, rb);
         rb->active = 0;
@@ -538,6 +551,9 @@ int main(int argc, char *argv[])
 {
     peer_ctx_t *ctx = &g_ctx;
     memset(ctx, 0, sizeof(*ctx));
+
+    setvbuf(stderr, NULL, _IONBF, 0);
+    setvbuf(stdout, NULL, _IONBF, 0);
 
 #ifdef __ANDROID__
     redirect_stdio_to_logcat();
@@ -768,11 +784,31 @@ int main(int argc, char *argv[])
         /* Button hit test: Video toggle, Audio toggle */
         if (ev.mouse_down && ev.mouse_button == 1) {
             if (ev.mouse_x >= btn1_x && ev.mouse_x < btn1_x + btn_w &&
-                ev.mouse_y >= btn_y && ev.mouse_y < btn_y + btn_h)
+                ev.mouse_y >= btn_y && ev.mouse_y < btn_y + btn_h) {
                 ctx->video_enabled = !ctx->video_enabled;
+                p2p_peer_ctx_t *pub = p2p_engine_find_peer(&ctx->engine, ctx->pending_peer_id);
+                if (pub) {
+                    if (ctx->video_enabled)
+                        p2p_peer_send_video_start(pub);
+                    else
+                        p2p_peer_send_video_stop(pub);
+                    fprintf(stderr, "[peer] sent video %s to %s\n",
+                            ctx->video_enabled ? "START" : "STOP", ctx->pending_peer_id);
+                }
+            }
             if (ev.mouse_x >= btn2_x && ev.mouse_x < btn2_x + btn_w &&
-                ev.mouse_y >= btn_y && ev.mouse_y < btn_y + btn_h)
+                ev.mouse_y >= btn_y && ev.mouse_y < btn_y + btn_h) {
                 ctx->audio_enabled = !ctx->audio_enabled;
+                p2p_peer_ctx_t *pub = p2p_engine_find_peer(&ctx->engine, ctx->pending_peer_id);
+                if (pub) {
+                    if (ctx->audio_enabled)
+                        p2p_peer_send_audio_start(pub);
+                    else
+                        p2p_peer_send_audio_stop(pub);
+                    fprintf(stderr, "[peer] sent audio %s to %s\n",
+                            ctx->audio_enabled ? "START" : "STOP", ctx->pending_peer_id);
+                }
+            }
         }
 
         /* Refresh stats every 500ms */
@@ -824,10 +860,14 @@ int main(int argc, char *argv[])
         }
 
         if (ctx->audio_enabled && ctx->aframe.ready) {
-            p2p_sdl_audio_play(&ctx->sdl_audio,
+            int aplay_ret = p2p_sdl_audio_play(&ctx->sdl_audio,
                 ctx->aframe.samples, ctx->aframe.count);
+            fprintf(stderr, "[PLAY-AUDIO] samples=%d ret=%d played=%u\n",
+                    ctx->aframe.count, aplay_ret, ctx->audio_frames_played + 1);
             ctx->aframe.ready = 0;
+            ctx->audio_frames_played++;
         } else if (ctx->aframe.ready) {
+            fprintf(stderr, "[PLAY-AUDIO] DROPPED (audio_enabled=%d)\n", ctx->audio_enabled);
             ctx->aframe.ready = 0;
         }
         p2p_mutex_unlock(&ctx->frame_mutex);

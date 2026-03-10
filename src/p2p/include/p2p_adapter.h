@@ -24,6 +24,10 @@ extern "C" {
 #define P2P_FRAME_TYPE_AUDIO  0x02
 #define P2P_FRAME_TYPE_IDR_REQ 0x03
 #define P2P_FRAME_TYPE_DATA   0x04
+#define P2P_FRAME_TYPE_VIDEO_STOP   0x05
+#define P2P_FRAME_TYPE_VIDEO_START  0x06
+#define P2P_FRAME_TYPE_AUDIO_STOP   0x07
+#define P2P_FRAME_TYPE_AUDIO_START  0x08
 #define P2P_FRAME_FLAG_KEY    0x01
 
 typedef struct __attribute__((packed)) {
@@ -85,6 +89,10 @@ typedef struct p2p_peer_ctx_s {
     /* Set by p2pav when the ICE offer/answer should be deferred until gathering done */
     int                     offer_pending;
     int                     answer_pending;
+
+    /* Per-peer AV pause flags (set by subscriber control messages) */
+    volatile int            video_paused;
+    volatile int            audio_paused;
 } p2p_peer_ctx_t;
 
 /*
@@ -188,6 +196,12 @@ int  p2p_peer_send_data(p2p_peer_ctx_t *peer, uint8_t type, uint8_t flags,
 
 /* Send an IDR (keyframe) request to remote peer. */
 int  p2p_peer_send_idr_request(p2p_peer_ctx_t *peer);
+
+/* Send AV control messages to remote peer. */
+int  p2p_peer_send_video_stop(p2p_peer_ctx_t *peer);
+int  p2p_peer_send_video_start(p2p_peer_ctx_t *peer);
+int  p2p_peer_send_audio_stop(p2p_peer_ctx_t *peer);
+int  p2p_peer_send_audio_start(p2p_peer_ctx_t *peer);
 
 /* ---- Utility ---- */
 uint64_t p2p_now_us(void);

@@ -364,6 +364,8 @@ int p2p_audio_encoder_open(p2p_audio_encoder_t *enc, const p2p_audio_encoder_con
     return 0;
 }
 
+static int s_aenc_call_count = 0;
+
 int p2p_audio_encoder_encode(p2p_audio_encoder_t *enc,
                              const int16_t *samples, int num_samples,
                              uint8_t **out_data, int *out_size)
@@ -373,6 +375,8 @@ int p2p_audio_encoder_encode(p2p_audio_encoder_t *enc,
     AVCodecContext *ctx = (AVCodecContext *)enc->codec_ctx;
     AVFrame *frame = (AVFrame *)enc->frame;
     AVPacket *pkt = (AVPacket *)enc->pkt;
+
+    s_aenc_call_count++;
 
     av_frame_make_writable(frame);
     frame->nb_samples = num_samples;
@@ -387,14 +391,31 @@ int p2p_audio_encoder_encode(p2p_audio_encoder_t *enc,
     }
 
     int ret = avcodec_send_frame(ctx, frame);
-    if (ret < 0) return -1;
+    if (ret < 0) {
+        if (s_aenc_call_count <= 5)
+            fprintf(stderr, "[aenc] send_frame failed: %d (call #%d, samples=%d)\n",
+                    ret, s_aenc_call_count, num_samples);
+        return -1;
+    }
 
     ret = avcodec_receive_packet(ctx, pkt);
     if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+        if (s_aenc_call_count <= 5)
+            fprintf(stderr, "[aenc] receive_packet EAGAIN (call #%d, samples=%d, ctx->frame_size=%d)\n",
+                    s_aenc_call_count, num_samples, ctx->frame_size);
         *out_size = 0;
         return 0;
     }
-    if (ret < 0) return -1;
+    if (ret < 0) {
+        if (s_aenc_call_count <= 5)
+            fprintf(stderr, "[aenc] receive_packet error: %d (call #%d)\n",
+                    ret, s_aenc_call_count);
+        return -1;
+    }
+
+    if (s_aenc_call_count <= 5)
+        fprintf(stderr, "[aenc] encoded %d samples -> %d bytes (call #%d)\n",
+                num_samples, pkt->size, s_aenc_call_count);
 
     *out_data = pkt->data;
     *out_size = pkt->size;

@@ -103,7 +103,7 @@ if(ANDROID_ABI OR PLATFORM MATCHES "mac")
 endif()
 
 if(NOT (CMAKE_C_COMPILER_ID MATCHES "MSVC" OR CMAKE_CXX_COMPILER_ID MATCHES "MSVC"))
-    set(CMAKE_C_FLAGS_OPTION "-Wno-unused -Wno-pointer-sign -Wno-format-security -Wno-dangling-pointer -Wno-deprecated-declarations ")
+    set(CMAKE_C_FLAGS_OPTION "-Werror -Wno-unused -Wno-pointer-sign -Wno-format-security -Wno-dangling-pointer -Wno-deprecated-declarations ")
 endif()
 
 # C_FLAGS
@@ -116,6 +116,7 @@ endif()
 
 
 if(CMAKE_SYSTEM_NAME MATCHES "Windows")
+    add_definitions(-DXQC_SYS_WINDOWS=1)
     set(CMAKE_C_FLAGS_OPTION " ")
 endif()
 

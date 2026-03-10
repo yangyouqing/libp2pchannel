@@ -82,15 +82,28 @@ static int peer_is_sendable(p2p_peer_ctx_t *peer)
            peer->state < P2P_PEER_STATE_FAILED;
 }
 
+static int has_active_receiver(client_ctx_t *ctx, uint8_t type)
+{
+    for (int i = 0; i < P2P_MAX_SUBSCRIBERS; i++) {
+        p2p_peer_ctx_t *peer = &ctx->engine.peers[i];
+        if (!peer_is_sendable(peer)) continue;
+        if (type == P2P_FRAME_TYPE_VIDEO && peer->video_paused) continue;
+        if (type == P2P_FRAME_TYPE_AUDIO && peer->audio_paused) continue;
+        return 1;
+    }
+    return 0;
+}
+
 static void send_to_all_peers(client_ctx_t *ctx, uint8_t type, uint8_t flags,
                               uint32_t seq, uint64_t ts,
                               const uint8_t *data, uint32_t len)
 {
     for (int i = 0; i < P2P_MAX_SUBSCRIBERS; i++) {
         p2p_peer_ctx_t *peer = &ctx->engine.peers[i];
-        if (peer_is_sendable(peer)) {
-            p2p_peer_send_data(peer, type, flags, seq, ts, data, len);
-        }
+        if (!peer_is_sendable(peer)) continue;
+        if (type == P2P_FRAME_TYPE_VIDEO && peer->video_paused) continue;
+        if (type == P2P_FRAME_TYPE_AUDIO && peer->audio_paused) continue;
+        p2p_peer_send_data(peer, type, flags, seq, ts, data, len);
     }
 }
 
@@ -125,6 +138,9 @@ static void on_video_frame(const uint8_t *data, size_t size,
     int is_key = 0;
 
     s_cap_total++;
+
+    if (!has_active_receiver(ctx, P2P_FRAME_TYPE_VIDEO))
+        goto stats;
 
     int ret = p2p_video_encoder_encode(&ctx->venc, data, size, pixfmt,
                                        &out_data, &out_size, &is_key);
@@ -165,22 +181,44 @@ stats:
 
 /* ---- ALSA audio frame callback (called from capture thread) ---- */
 
+static uint32_t s_audio_cap_total = 0;
+static uint32_t s_audio_enc_ok = 0;
+static uint32_t s_audio_enc_skip = 0;
+static uint32_t s_audio_no_recv = 0;
+static uint32_t s_audio_sent = 0;
+static uint64_t s_audio_last_stat_us = 0;
+
 static void on_audio_frame(const int16_t *samples, int num_samples,
                            int channels, int sample_rate,
                            uint64_t timestamp_us, void *user_data)
 {
     client_ctx_t *ctx = (client_ctx_t *)user_data;
+
+    s_audio_cap_total++;
+
+    if (!has_active_receiver(ctx, P2P_FRAME_TYPE_AUDIO)) {
+        s_audio_no_recv++;
+        return;
+    }
+
     uint8_t *out_data = NULL;
     int out_size = 0;
 
     int ret = p2p_audio_encoder_encode(&ctx->aenc, samples, num_samples,
                                        &out_data, &out_size);
-    if (ret <= 0 || out_size <= 0) return;
+    if (ret <= 0 || out_size <= 0) {
+        s_audio_enc_skip++;
+        return;
+    }
 
+    s_audio_enc_ok++;
     uint32_t seq = p2p_atomic_fetch_add((volatile P2P_ATOMIC_INT *)&ctx->audio_seq, 1);
+
+    fprintf(stderr, "[TX-AUDIO] seq=%u size=%d samples=%d\n", seq, out_size, num_samples);
 
     send_to_all_peers(ctx, P2P_FRAME_TYPE_AUDIO, 0, seq,
                       timestamp_us, out_data, out_size);
+    s_audio_sent++;
 }
 
 /* ---- Start capture & encoding ---- */
@@ -221,26 +259,39 @@ static int start_capture(client_ctx_t *ctx)
 
     if (!ctx->no_audio) {
         /* Audio encoder */
+        fprintf(stderr, "[client] opening audio encoder...\n");
         p2p_audio_encoder_config_t acfg = {
             .sample_rate = 48000, .channels = 1,
             .bitrate = 64000, .frame_size = 960
         };
         if (p2p_audio_encoder_open(&ctx->aenc, &acfg) != 0) {
-            fprintf(stderr, "[client] audio encoder open failed\n");
-            return -1;
+            fprintf(stderr, "[client] audio encoder open FAILED\n");
+            ctx->no_audio = 1;
+        } else {
+            fprintf(stderr, "[client] audio encoder opened OK\n");
         }
 
-        /* Audio capture */
-        p2p_audio_capture_config_t accfg = {
-            .device = ctx->audio_dev,
-            .sample_rate = 48000, .channels = 1,
-            .period_frames = 960,
-            .cb = on_audio_frame, .user_data = ctx
-        };
-        if (p2p_audio_capture_open(&ctx->acap, &accfg) != 0) {
-            fprintf(stderr, "[client] audio capture open failed (continuing without audio)\n");
-        } else {
-            p2p_audio_capture_start(&ctx->acap);
+        if (!ctx->no_audio) {
+            /* Audio capture */
+            fprintf(stderr, "[client] opening audio capture device '%s'...\n", ctx->audio_dev);
+            p2p_audio_capture_config_t accfg = {
+                .device = ctx->audio_dev,
+                .sample_rate = 48000, .channels = 1,
+                .period_frames = 960,
+                .cb = on_audio_frame, .user_data = ctx
+            };
+            if (p2p_audio_capture_open(&ctx->acap, &accfg) != 0) {
+                fprintf(stderr, "[client] audio capture open FAILED (continuing without audio)\n");
+                ctx->no_audio = 1;
+            } else {
+                fprintf(stderr, "[client] audio capture opened OK, starting...\n");
+                if (p2p_audio_capture_start(&ctx->acap) != 0) {
+                    fprintf(stderr, "[client] audio capture start FAILED\n");
+                    ctx->no_audio = 1;
+                } else {
+                    fprintf(stderr, "[client] audio capture started OK\n");
+                }
+            }
         }
     } else {
         fprintf(stderr, "[client] audio disabled (--no-audio)\n");
@@ -259,6 +310,19 @@ static void on_data_recv(p2p_peer_ctx_t *peer, const p2p_frame_header_t *hdr,
     client_ctx_t *ctx = (client_ctx_t *)user_data;
     if (hdr->type == P2P_FRAME_TYPE_IDR_REQ) {
         ctx->venc.force_idr = 1;
+    } else if (hdr->type == P2P_FRAME_TYPE_VIDEO_STOP) {
+        peer->video_paused = 1;
+        fprintf(stderr, "[client] peer %s paused video\n", peer->peer_id);
+    } else if (hdr->type == P2P_FRAME_TYPE_VIDEO_START) {
+        peer->video_paused = 0;
+        ctx->venc.force_idr = 1;
+        fprintf(stderr, "[client] peer %s resumed video\n", peer->peer_id);
+    } else if (hdr->type == P2P_FRAME_TYPE_AUDIO_STOP) {
+        peer->audio_paused = 1;
+        fprintf(stderr, "[client] peer %s paused audio\n", peer->peer_id);
+    } else if (hdr->type == P2P_FRAME_TYPE_AUDIO_START) {
+        peer->audio_paused = 0;
+        fprintf(stderr, "[client] peer %s resumed audio\n", peer->peer_id);
     }
 }
 
@@ -446,6 +510,9 @@ int main(int argc, char *argv[])
 {
     client_ctx_t *ctx = &g_ctx;
     memset(ctx, 0, sizeof(*ctx));
+
+    setvbuf(stderr, NULL, _IONBF, 0);
+    setvbuf(stdout, NULL, _IONBF, 0);
 
     av_log_set_level(AV_LOG_FATAL);
 

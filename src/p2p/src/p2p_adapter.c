@@ -160,12 +160,21 @@ static void ice_on_gathering_done(juice_agent_t *agent, void *user_ptr)
         peer->engine->callbacks.on_peer_ice_gathering_done(peer, peer->engine->user_data);
 }
 
+static int is_single_byte_control(uint8_t type)
+{
+    return type == P2P_FRAME_TYPE_IDR_REQ ||
+           type == P2P_FRAME_TYPE_VIDEO_STOP ||
+           type == P2P_FRAME_TYPE_VIDEO_START ||
+           type == P2P_FRAME_TYPE_AUDIO_STOP ||
+           type == P2P_FRAME_TYPE_AUDIO_START;
+}
+
 static int is_p2p_frame(const char *data, size_t size)
 {
     if (size < 1) return 0;
     uint8_t type = (uint8_t)data[0];
-    if (type == P2P_FRAME_TYPE_IDR_REQ)
-        return (size >= 1);
+    if (is_single_byte_control(type))
+        return 1;
     if (size < P2P_FRAME_HDR_SIZE) return 0;
     return (type == P2P_FRAME_TYPE_VIDEO || type == P2P_FRAME_TYPE_AUDIO ||
             type == P2P_FRAME_TYPE_DATA);
@@ -180,11 +189,11 @@ static void ice_on_recv(juice_agent_t *agent, const char *data, size_t size, voi
     if (is_p2p_frame(data, size) &&
         peer->engine->callbacks.on_peer_data_recv) {
         uint8_t type = (uint8_t)data[0];
-        if (type == P2P_FRAME_TYPE_IDR_REQ) {
-            p2p_frame_header_t idr_hdr;
-            memset(&idr_hdr, 0, sizeof(idr_hdr));
-            idr_hdr.type = P2P_FRAME_TYPE_IDR_REQ;
-            peer->engine->callbacks.on_peer_data_recv(peer, &idr_hdr, NULL,
+        if (is_single_byte_control(type)) {
+            p2p_frame_header_t ctrl_hdr;
+            memset(&ctrl_hdr, 0, sizeof(ctrl_hdr));
+            ctrl_hdr.type = type;
+            peer->engine->callbacks.on_peer_data_recv(peer, &ctrl_hdr, NULL,
                                                        peer->engine->user_data);
             return;
         }
@@ -570,6 +579,26 @@ int p2p_peer_send_idr_request(p2p_peer_ctx_t *peer)
     uint8_t msg = P2P_FRAME_TYPE_IDR_REQ;
     return juice_send(peer->ice_agent, (const char *)&msg, 1);
 }
+
+static int p2p_peer_send_control(p2p_peer_ctx_t *peer, uint8_t type)
+{
+    if (!peer || !peer->ice_agent) return -1;
+    if (peer->state < P2P_PEER_STATE_ICE_CONNECTED ||
+        peer->state >= P2P_PEER_STATE_FAILED) return -1;
+    return juice_send(peer->ice_agent, (const char *)&type, 1);
+}
+
+int p2p_peer_send_video_stop(p2p_peer_ctx_t *peer)
+{ return p2p_peer_send_control(peer, P2P_FRAME_TYPE_VIDEO_STOP); }
+
+int p2p_peer_send_video_start(p2p_peer_ctx_t *peer)
+{ return p2p_peer_send_control(peer, P2P_FRAME_TYPE_VIDEO_START); }
+
+int p2p_peer_send_audio_stop(p2p_peer_ctx_t *peer)
+{ return p2p_peer_send_control(peer, P2P_FRAME_TYPE_AUDIO_STOP); }
+
+int p2p_peer_send_audio_start(p2p_peer_ctx_t *peer)
+{ return p2p_peer_send_control(peer, P2P_FRAME_TYPE_AUDIO_START); }
 
 /* ---- QUIC connection ---- */
 

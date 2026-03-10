@@ -88,26 +88,38 @@ add_library(p2pav_static STATIC ${P2PAV_TRANSPORT_SOURCES})
 target_include_directories(p2pav_static PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 # --- Helper macro to configure dependencies for both p2pav and p2pav_static ---
+# For shared lib (p2pav): use PRIVATE so deps don't propagate to exe consumers (DLL embeds them).
+# For static lib (p2pav_static): use PUBLIC so consumers can resolve all symbols.
 foreach(_tls_tgt p2pav p2pav_static)
-    # libjuice
+    if(${_tls_tgt} STREQUAL "p2pav")
+        set(_LINK_VIS PRIVATE)
+    else()
+        set(_LINK_VIS PUBLIC)
+    endif()
+
+    # libjuice (includes always PUBLIC for consumers; link PRIVATE for shared lib)
     if(TARGET juice)
-        target_link_libraries(${_tls_tgt} PUBLIC juice)
+        target_link_libraries(${_tls_tgt} ${_LINK_VIS} juice)
+        get_target_property(_JUICE_INC juice INTERFACE_INCLUDE_DIRECTORIES)
+        if(_JUICE_INC)
+            target_include_directories(${_tls_tgt} PUBLIC ${_JUICE_INC})
+        endif()
     else()
         if(JUICE_LIB AND JUICE_INCLUDE)
-            target_link_libraries(${_tls_tgt} PUBLIC ${JUICE_LIB})
+            target_link_libraries(${_tls_tgt} ${_LINK_VIS} ${JUICE_LIB})
             target_include_directories(${_tls_tgt} PUBLIC ${JUICE_INCLUDE})
         endif()
     endif()
 
-    # xquic
+    # xquic (includes always PUBLIC; link visibility varies)
     target_include_directories(${_tls_tgt} PUBLIC "${_XQUIC_SRC_DIR}/include")
     if(EXISTS "${_XQUIC_BUILD_DIR}/include")
         target_include_directories(${_tls_tgt} PUBLIC "${_XQUIC_BUILD_DIR}/include")
     endif()
     if(TARGET xquic-static)
-        target_link_libraries(${_tls_tgt} PUBLIC xquic-static)
+        target_link_libraries(${_tls_tgt} ${_LINK_VIS} xquic-static)
     elseif(XQUIC_LIB)
-        target_link_libraries(${_tls_tgt} PUBLIC ${XQUIC_LIB})
+        target_link_libraries(${_tls_tgt} ${_LINK_VIS} ${XQUIC_LIB})
     endif()
 
     # TLS library
@@ -129,9 +141,9 @@ foreach(_tls_tgt p2pav p2pav_static)
     endif()
 
     if(WIN32)
-        target_link_libraries(${_tls_tgt} PUBLIC stdc++ ws2_32)
+        target_link_libraries(${_tls_tgt} ${_LINK_VIS} stdc++ ws2_32)
     else()
-        target_link_libraries(${_tls_tgt} PUBLIC stdc++ m Threads::Threads)
+        target_link_libraries(${_tls_tgt} ${_LINK_VIS} stdc++ m Threads::Threads)
     endif()
 endforeach()
 
@@ -148,11 +160,14 @@ set(P2P_MEDIA_SOURCES
 
 add_executable(p2p_client src/p2p_client.c ${P2P_MEDIA_SOURCES})
 target_include_directories(p2p_client PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(p2p_client PRIVATE p2pav)
 
 add_executable(p2p_peer src/p2p_peer.c ${P2P_MEDIA_SOURCES})
 target_include_directories(p2p_peer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(p2p_peer PRIVATE p2pav)
+
+# Link executables against the static lib so media sources (p2p_publisher.c,
+# p2p_subscriber.c) that call juice_* directly can resolve those symbols.
+target_link_libraries(p2p_client PRIVATE p2pav_static)
+target_link_libraries(p2p_peer PRIVATE p2pav_static)
 
 # FFmpeg for executables
 if(WIN32)
