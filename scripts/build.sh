@@ -23,6 +23,7 @@ BUILD_DIR="$PROJECT_DIR/build"
 
 INSTALL_DEPS=false
 CLEAN=false
+DEBUG=false
 EXE_EXT=""
 JOBS="$(nproc 2>/dev/null || echo 4)"
 
@@ -30,13 +31,22 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --install-deps) INSTALL_DEPS=true; shift ;;
         --clean)        CLEAN=true; shift ;;
+        --debug)        DEBUG=true; shift ;;
         --jobs)         JOBS="$2"; shift 2 ;;
         -h|--help)
-            echo "Usage: $0 [--install-deps] [--clean] [--jobs N]"
+            echo "Usage: $0 [--install-deps] [--clean] [--debug] [--jobs N]"
             exit 0 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+if $DEBUG; then
+    BUILD_TYPE="Debug"
+    EXTRA_C_FLAGS="-g -O0 -fno-omit-frame-pointer"
+else
+    BUILD_TYPE="Release"
+    EXTRA_C_FLAGS=""
+fi
 
 log() { echo -e "\033[1;32m[build]\033[0m $*"; }
 
@@ -98,9 +108,10 @@ if [[ ! -f "$XQUIC_LIB" ]]; then
         -DMBEDTLS_PATH="$MBEDTLS_SRC" \
         -DMBEDTLS_BUILD_PATH="$MBEDTLS_BUILD" \
         -DSSL_INC_PATH="$MBEDTLS_SRC/include" \
-        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
         -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-        -DXQC_ENABLE_TESTING=OFF
+        -DXQC_ENABLE_TESTING=OFF \
+        ${EXTRA_C_FLAGS:+-DCMAKE_C_FLAGS="$EXTRA_C_FLAGS"}
     cmake --build "$XQUIC_BUILD" --target xquic-static -j"$JOBS"
     log "xquic built -> $XQUIC_BUILD/"
 else
@@ -112,11 +123,12 @@ fi
 # ============================================================
 log "Building libp2pchannel..."
 cmake -B "$BUILD_DIR" -S "$PROJECT_DIR" \
-    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
     -DMBEDTLS_BUILD_DIR="$MBEDTLS_BUILD" \
     -DMBEDTLS_SRC_DIR="$MBEDTLS_SRC" \
     -DXQUIC_BUILD_DIR="$XQUIC_BUILD" \
-    -DXQUIC_SRC_DIR="$XQUIC_SRC"
+    -DXQUIC_SRC_DIR="$XQUIC_SRC" \
+    ${EXTRA_C_FLAGS:+-DCMAKE_C_FLAGS="$EXTRA_C_FLAGS"}
 cmake --build "$BUILD_DIR" -j"$JOBS"
 log "Main project built."
 

@@ -1,7 +1,6 @@
 #ifndef P2P_ADAPTER_H
 #define P2P_ADAPTER_H
 
-#include <juice/juice.h>
 #include <xquic/xquic.h>
 #include <xquic/xqc_http3.h>
 
@@ -18,8 +17,10 @@ extern "C" {
 #define P2P_MAX_SUBSCRIBERS   10
 #define P2P_VIRTUAL_PORT_BASE 20000
 #define P2P_ICE_MTU           1200
+#define P2P_SEND_QUEUE_CAP    128
+#define P2P_VIDEO_JITTER_SIZE 8
 
-/* Direct framing header for sending AV data via ICE channel */
+/* Framing header for AV data sent via xquic DATAGRAM */
 #define P2P_FRAME_TYPE_VIDEO  0x01
 #define P2P_FRAME_TYPE_AUDIO  0x02
 #define P2P_FRAME_TYPE_IDR_REQ 0x03
@@ -31,13 +32,13 @@ extern "C" {
 #define P2P_FRAME_FLAG_KEY    0x01
 
 typedef struct __attribute__((packed)) {
-    uint8_t  type;           /* P2P_FRAME_TYPE_VIDEO or _AUDIO */
-    uint8_t  flags;          /* P2P_FRAME_FLAG_KEY for keyframes */
-    uint32_t seq;            /* sequence number */
-    uint64_t timestamp_us;   /* capture timestamp */
-    uint32_t total_len;      /* total payload size (may span multiple chunks) */
-    uint32_t frag_offset;    /* fragment offset within total payload */
-    uint16_t frag_len;       /* this fragment's payload size */
+    uint8_t  type;
+    uint8_t  flags;
+    uint32_t seq;
+    uint64_t timestamp_us;
+    uint32_t total_len;
+    uint32_t frag_offset;
+    uint16_t frag_len;
 } p2p_frame_header_t;       /* 22 bytes, followed by frag_len bytes of payload */
 
 #define P2P_FRAME_HDR_SIZE sizeof(p2p_frame_header_t)
@@ -59,7 +60,30 @@ typedef enum {
     P2P_PEER_STATE_CLOSED,
 } p2p_peer_state_t;
 
+/* Abstracted ICE state (hides libjuice types from consumers) */
+typedef enum {
+    P2P_ICE_STATE_GATHERING,
+    P2P_ICE_STATE_CONNECTING,
+    P2P_ICE_STATE_CONNECTED,
+    P2P_ICE_STATE_COMPLETED,
+    P2P_ICE_STATE_FAILED,
+    P2P_ICE_STATE_DISCONNECTED,
+} p2p_ice_state_t;
+
 struct p2p_engine_s;
+
+/* Per-peer datagram send queue (for pacing via xquic) */
+typedef struct {
+    uint8_t  data[P2P_ICE_MTU];
+    uint16_t len;
+    int      qos;
+} p2p_dgram_entry_t;
+
+typedef struct {
+    p2p_dgram_entry_t entries[P2P_SEND_QUEUE_CAP];
+    int head, tail, count;
+    p2p_mutex_t mutex;
+} p2p_dgram_send_queue_t;
 
 /*
  * Per-peer context.  On the Publisher side one of these exists for each
@@ -70,14 +94,17 @@ typedef struct p2p_peer_ctx_s {
     struct p2p_engine_s    *engine;
     p2p_peer_state_t        state;
 
-    /* libjuice ICE agent */
-    juice_agent_t          *ice_agent;
+    /* ICE agent (opaque -- internally juice_agent_t*) */
+    void                   *ice_agent;
 
     /* xquic connection */
     xqc_cid_t               cid;
     xqc_connection_t       *xqc_conn;
 
-    /* Virtual addressing for xquic – each peer gets a unique virtual port */
+    /* xquic reliable control stream */
+    xqc_stream_t           *ctrl_stream;
+
+    /* Virtual addressing for xquic */
     struct sockaddr_in      virtual_local_addr;
     struct sockaddr_in      virtual_peer_addr;
 
@@ -86,25 +113,29 @@ typedef struct p2p_peer_ctx_s {
 
     void                   *user_data;
 
-    /* Set by p2pav when the ICE offer/answer should be deferred until gathering done */
     int                     offer_pending;
     int                     answer_pending;
 
     /* Per-peer AV pause flags (set by subscriber control messages) */
     volatile int            video_paused;
     volatile int            audio_paused;
+
+    /* Set by ICE callback when ICE connects; cleared by engine thread */
+    volatile int            needs_continue_send;
+
+    /* Datagram send queue for pacing */
+    p2p_dgram_send_queue_t  send_queue;
 } p2p_peer_ctx_t;
 
 /*
  * Callbacks that the application (Publisher / Subscriber framework) implements.
  */
 typedef struct {
-    void (*on_peer_ice_state)(p2p_peer_ctx_t *peer, juice_state_t state, void *user_data);
+    void (*on_peer_ice_state)(p2p_peer_ctx_t *peer, p2p_ice_state_t state, void *user_data);
     void (*on_peer_ice_candidate)(p2p_peer_ctx_t *peer, const char *sdp, void *user_data);
     void (*on_peer_ice_gathering_done)(p2p_peer_ctx_t *peer, void *user_data);
     void (*on_peer_quic_connected)(p2p_peer_ctx_t *peer, void *user_data);
     void (*on_peer_quic_closed)(p2p_peer_ctx_t *peer, void *user_data);
-    /* Called when framed AV data arrives via direct framing */
     void (*on_peer_data_recv)(p2p_peer_ctx_t *peer, const p2p_frame_header_t *hdr,
                               const uint8_t *payload, void *user_data);
 } p2p_adapter_callbacks_t;
@@ -125,7 +156,7 @@ typedef struct {
 } p2p_engine_config_t;
 
 /*
- * Main engine – holds the xquic engine and an array of peer contexts.
+ * Main engine -- holds the xquic engine and an array of peer contexts.
  */
 typedef struct p2p_engine_s {
     p2p_role_t              role;
@@ -184,24 +215,70 @@ int  p2p_peer_add_remote_candidate(p2p_peer_ctx_t *peer, const char *sdp);
 int  p2p_peer_set_remote_gathering_done(p2p_peer_ctx_t *peer);
 int  p2p_peer_get_local_description(p2p_peer_ctx_t *peer, char *buf, size_t size);
 
+/* ---- ICE info query (hides libjuice from callers) ---- */
+typedef struct {
+    char local_cand[256];
+    char remote_cand[256];
+    char local_addr[64];
+    char remote_addr[64];
+} p2p_ice_info_t;
+
+int  p2p_get_peer_ice_info(p2p_peer_ctx_t *peer, p2p_ice_info_t *info);
+
 /* ---- QUIC connection (called after ICE connected) ---- */
 int  p2p_peer_start_quic(p2p_peer_ctx_t *peer);
 
-/* ---- Direct framing mode ---- */
+/* ---- AV data sending via xquic DATAGRAM (congestion controlled + paced) ---- */
 
-/* Send a framed AV packet through ICE. Fragments if payload > MTU. */
+int  p2p_peer_send_data_via_quic(p2p_peer_ctx_t *peer, uint8_t type, uint8_t flags,
+                                 uint32_t seq, uint64_t timestamp_us,
+                                 const uint8_t *payload, uint32_t payload_len);
+
+int  p2p_peer_flush_send_queue(p2p_peer_ctx_t *peer);
+
+/* ---- Legacy direct framing (bypasses xquic, no congestion control) ---- */
+
 int  p2p_peer_send_data(p2p_peer_ctx_t *peer, uint8_t type, uint8_t flags,
                         uint32_t seq, uint64_t timestamp_us,
                         const uint8_t *payload, uint32_t payload_len);
 
-/* Send an IDR (keyframe) request to remote peer. */
-int  p2p_peer_send_idr_request(p2p_peer_ctx_t *peer);
+/* ---- Control messages via xquic reliable STREAM ---- */
 
-/* Send AV control messages to remote peer. */
+int  p2p_peer_send_idr_request(p2p_peer_ctx_t *peer);
 int  p2p_peer_send_video_stop(p2p_peer_ctx_t *peer);
 int  p2p_peer_send_video_start(p2p_peer_ctx_t *peer);
 int  p2p_peer_send_audio_stop(p2p_peer_ctx_t *peer);
 int  p2p_peer_send_audio_start(p2p_peer_ctx_t *peer);
+
+/* ---- Video Jitter Buffer (used by receiver) ---- */
+
+typedef struct {
+    uint8_t *y, *u, *v;
+    int lsy, lsu, lsv;
+    int w, h;
+    uint64_t timestamp_us;
+    int valid;
+} p2p_jitter_frame_t;
+
+typedef struct {
+    p2p_jitter_frame_t frames[P2P_VIDEO_JITTER_SIZE];
+    int write_idx;
+    int read_idx;
+    int count;
+    uint64_t target_delay_us;
+    p2p_mutex_t mutex;
+} p2p_video_jitter_buf_t;
+
+void p2p_video_jitter_init(p2p_video_jitter_buf_t *jb, uint64_t target_delay_us);
+void p2p_video_jitter_destroy(p2p_video_jitter_buf_t *jb);
+void p2p_video_jitter_push(p2p_video_jitter_buf_t *jb,
+                           uint8_t *y, uint8_t *u, uint8_t *v,
+                           int lsy, int lsu, int lsv, int w, int h,
+                           uint64_t timestamp_us);
+int  p2p_video_jitter_pop(p2p_video_jitter_buf_t *jb, p2p_jitter_frame_t *out);
+
+/* ---- Logging (hides libjuice log level from callers) ---- */
+void p2p_adapter_set_log_level(int level);
 
 /* ---- Utility ---- */
 uint64_t p2p_now_us(void);

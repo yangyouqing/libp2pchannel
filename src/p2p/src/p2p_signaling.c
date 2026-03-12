@@ -618,6 +618,12 @@ int p2p_signaling_create_room(p2p_signaling_client_t *c, const char *room_id)
 
     char resp[P2P_SIG_MAX_MSG_SIZE];
     int status = post_signal(c, body, resp, sizeof(resp));
+    if (status == 409) {
+        fprintf(stderr, "[sig] room '%s' already exists, reusing\n", room_id);
+        if (c->callbacks.on_room_created)
+            c->callbacks.on_room_created(c, room_id, c->user_data);
+        return 0;
+    }
     if (status < 200 || status >= 300) {
         fprintf(stderr, "[sig] create_room HTTP %d: %s\n", status, resp);
         return -1;

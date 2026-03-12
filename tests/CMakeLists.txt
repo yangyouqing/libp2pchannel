@@ -15,6 +15,10 @@ target_link_libraries(test_ice_connectivity PRIVATE p2pav_static)
 add_executable(test_video_stop test_video_stop.c)
 target_link_libraries(test_video_stop PRIVATE p2pav_static)
 
+# --- Full AV control E2E test (VIDEO + AUDIO stop/start over QUIC) ---
+add_executable(test_av_control test_av_control.c)
+target_link_libraries(test_av_control PRIVATE p2pav_static)
+
 # --- libp2pav E2E test (links shared library only, no FFmpeg/SDL) ---
 add_executable(test_p2pav_e2e test_p2pav_e2e.c)
 target_link_libraries(test_p2pav_e2e PRIVATE p2pav)

@@ -14,25 +14,27 @@
  */
 
 #include "p2p_adapter.h"
-#include <juice/juice.h>
+#include "p2p_signaling.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
 
+#define MAX_CAND_LEN 256
+
 static volatile int g_running = 1;
 
 /* Publisher state */
 static volatile int g_pub_connected = 0;
 static volatile int g_pub_gathering_done = 0;
-static char g_pub_candidates[10][JUICE_MAX_CANDIDATE_SDP_STRING_LEN];
+static char g_pub_candidates[10][MAX_CAND_LEN];
 static int g_pub_candidate_count = 0;
 
 /* Subscriber state */
 static volatile int g_sub_connected = 0;
 static volatile int g_sub_gathering_done = 0;
-static char g_sub_candidates[10][JUICE_MAX_CANDIDATE_SDP_STRING_LEN];
+static char g_sub_candidates[10][MAX_CAND_LEN];
 static int g_sub_candidate_count = 0;
 
 /* Frame counters */
@@ -41,13 +43,13 @@ static volatile int g_pub_ctrl_recv_type = 0;
 
 /* --- Publisher callbacks --- */
 
-static void pub_on_ice_state(p2p_peer_ctx_t *peer, juice_state_t state, void *ud)
+static void pub_on_ice_state(p2p_peer_ctx_t *peer, p2p_ice_state_t state, void *ud)
 {
     (void)ud;
-    printf("[PUB] ICE state: %s\n", juice_state_to_string(state));
-    if (state == JUICE_STATE_CONNECTED || state == JUICE_STATE_COMPLETED)
+    printf("[PUB] ICE state: %d\n", state);
+    if (state == P2P_ICE_STATE_CONNECTED || state == P2P_ICE_STATE_COMPLETED)
         g_pub_connected = 1;
-    if (state == JUICE_STATE_FAILED) g_running = 0;
+    if (state == P2P_ICE_STATE_FAILED) g_running = 0;
 }
 
 static void pub_on_candidate(p2p_peer_ctx_t *peer, const char *sdp, void *ud)
@@ -55,7 +57,7 @@ static void pub_on_candidate(p2p_peer_ctx_t *peer, const char *sdp, void *ud)
     (void)ud;
     if (g_pub_candidate_count < 10)
         snprintf(g_pub_candidates[g_pub_candidate_count++],
-                 JUICE_MAX_CANDIDATE_SDP_STRING_LEN, "%s", sdp);
+                 MAX_CAND_LEN, "%s", sdp);
 }
 
 static void pub_on_gathering_done(p2p_peer_ctx_t *peer, void *ud)
@@ -81,13 +83,13 @@ static void pub_on_data_recv(p2p_peer_ctx_t *peer, const p2p_frame_header_t *hdr
 
 /* --- Subscriber callbacks --- */
 
-static void sub_on_ice_state(p2p_peer_ctx_t *peer, juice_state_t state, void *ud)
+static void sub_on_ice_state(p2p_peer_ctx_t *peer, p2p_ice_state_t state, void *ud)
 {
     (void)ud;
-    printf("[SUB] ICE state: %s\n", juice_state_to_string(state));
-    if (state == JUICE_STATE_CONNECTED || state == JUICE_STATE_COMPLETED)
+    printf("[SUB] ICE state: %d\n", state);
+    if (state == P2P_ICE_STATE_CONNECTED || state == P2P_ICE_STATE_COMPLETED)
         g_sub_connected = 1;
-    if (state == JUICE_STATE_FAILED) g_running = 0;
+    if (state == P2P_ICE_STATE_FAILED) g_running = 0;
 }
 
 static void sub_on_candidate(p2p_peer_ctx_t *peer, const char *sdp, void *ud)
@@ -95,7 +97,7 @@ static void sub_on_candidate(p2p_peer_ctx_t *peer, const char *sdp, void *ud)
     (void)ud;
     if (g_sub_candidate_count < 10)
         snprintf(g_sub_candidates[g_sub_candidate_count++],
-                 JUICE_MAX_CANDIDATE_SDP_STRING_LEN, "%s", sdp);
+                 MAX_CAND_LEN, "%s", sdp);
 }
 
 static void sub_on_gathering_done(p2p_peer_ctx_t *peer, void *ud)
@@ -137,7 +139,7 @@ static void sighandler(int sig) { (void)sig; g_running = 0; }
 int main(int argc, char **argv)
 {
     signal(SIGINT, sighandler);
-    juice_set_log_level(JUICE_LOG_LEVEL_WARN);
+    p2p_adapter_set_log_level(2);
 
     const char *cert = (argc > 1) ? argv[1] : "certs/server.crt";
     const char *key  = (argc > 2) ? argv[2] : "certs/server.key";
@@ -182,7 +184,7 @@ int main(int argc, char **argv)
     }
 
     /* --- Exchange SDP + candidates --- */
-    char pub_sdp[JUICE_MAX_SDP_STRING_LEN], sub_sdp[JUICE_MAX_SDP_STRING_LEN];
+    char pub_sdp[P2P_SIG_MAX_SDP_SIZE], sub_sdp[P2P_SIG_MAX_SDP_SIZE];
     p2p_peer_get_local_description(pub_peer, pub_sdp, sizeof(pub_sdp));
     p2p_peer_get_local_description(sub_peer, sub_sdp, sizeof(sub_sdp));
 

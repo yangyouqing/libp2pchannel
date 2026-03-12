@@ -78,7 +78,7 @@ static client_ctx_t g_ctx;
 static int peer_is_sendable(p2p_peer_ctx_t *peer)
 {
     return peer->ice_agent &&
-           peer->state >= P2P_PEER_STATE_ICE_CONNECTED &&
+           peer->state >= P2P_PEER_STATE_QUIC_CONNECTED &&
            peer->state < P2P_PEER_STATE_FAILED;
 }
 
@@ -103,7 +103,7 @@ static void send_to_all_peers(client_ctx_t *ctx, uint8_t type, uint8_t flags,
         if (!peer_is_sendable(peer)) continue;
         if (type == P2P_FRAME_TYPE_VIDEO && peer->video_paused) continue;
         if (type == P2P_FRAME_TYPE_AUDIO && peer->audio_paused) continue;
-        p2p_peer_send_data(peer, type, flags, seq, ts, data, len);
+        p2p_peer_send_data_via_quic(peer, type, flags, seq, ts, data, len);
     }
 }
 
@@ -113,8 +113,8 @@ static void send_idr_to_peer(client_ctx_t *ctx, p2p_peer_ctx_t *peer)
     if (ctx->idr_cache && ctx->idr_cache_size > 0) {
         uint64_t ts = p2p_capture_now_us();
         uint32_t seq = p2p_atomic_fetch_add((volatile P2P_ATOMIC_INT *)&ctx->video_seq, 1);
-        p2p_peer_send_data(peer, P2P_FRAME_TYPE_VIDEO, P2P_FRAME_FLAG_KEY,
-                           seq, ts, ctx->idr_cache, ctx->idr_cache_size);
+        p2p_peer_send_data_via_quic(peer, P2P_FRAME_TYPE_VIDEO, P2P_FRAME_FLAG_KEY,
+                                    seq, ts, ctx->idr_cache, ctx->idr_cache_size);
         fprintf(stderr, "[client] sent cached IDR (%d bytes) seq=%u to %s\n",
                 ctx->idr_cache_size, seq, peer->peer_id);
     }
@@ -201,24 +201,34 @@ static void on_audio_frame(const int16_t *samples, int num_samples,
         return;
     }
 
-    uint8_t *out_data = NULL;
-    int out_size = 0;
+    int frame_size = ctx->aenc.frame_size;
+    if (frame_size <= 0) frame_size = 960;
 
-    int ret = p2p_audio_encoder_encode(&ctx->aenc, samples, num_samples,
-                                       &out_data, &out_size);
-    if (ret <= 0 || out_size <= 0) {
-        s_audio_enc_skip++;
-        return;
+    int offset = 0;
+    while (offset + frame_size <= num_samples) {
+        uint8_t *out_data = NULL;
+        int out_size = 0;
+
+        int ret = p2p_audio_encoder_encode(&ctx->aenc,
+                                           samples + offset * channels,
+                                           frame_size,
+                                           &out_data, &out_size);
+        if (ret <= 0 || out_size <= 0) {
+            s_audio_enc_skip++;
+            offset += frame_size;
+            continue;
+        }
+
+        s_audio_enc_ok++;
+        uint32_t seq = p2p_atomic_fetch_add((volatile P2P_ATOMIC_INT *)&ctx->audio_seq, 1);
+
+        fprintf(stderr, "[TX-AUDIO] seq=%u size=%d samples=%d\n", seq, out_size, frame_size);
+
+        send_to_all_peers(ctx, P2P_FRAME_TYPE_AUDIO, 0, seq,
+                          timestamp_us, out_data, out_size);
+        s_audio_sent++;
+        offset += frame_size;
     }
-
-    s_audio_enc_ok++;
-    uint32_t seq = p2p_atomic_fetch_add((volatile P2P_ATOMIC_INT *)&ctx->audio_seq, 1);
-
-    fprintf(stderr, "[TX-AUDIO] seq=%u size=%d samples=%d\n", seq, out_size, num_samples);
-
-    send_to_all_peers(ctx, P2P_FRAME_TYPE_AUDIO, 0, seq,
-                      timestamp_us, out_data, out_size);
-    s_audio_sent++;
 }
 
 /* ---- Start capture & encoding ---- */
@@ -235,23 +245,21 @@ static int start_capture(client_ctx_t *ctx)
             .cb = on_video_frame, .user_data = ctx
         };
         if (p2p_video_capture_open(&ctx->vcap, &vccfg) != 0) {
-            fprintf(stderr, "[client] video capture open failed\n");
-            return -1;
-        }
-
-        /* Video encoder - use actual capture resolution */
-        p2p_video_encoder_config_t vcfg = {
-            .width = ctx->vcap.width, .height = ctx->vcap.height, .fps = 30,
-            .bitrate = 2000000, .gop_size = 15
-        };
-        if (p2p_video_encoder_open(&ctx->venc, &vcfg) != 0) {
-            fprintf(stderr, "[client] video encoder open failed\n");
-            return -1;
-        }
-
-        if (p2p_video_capture_start(&ctx->vcap) != 0) {
-            fprintf(stderr, "[client] video capture start failed\n");
-            return -1;
+            fprintf(stderr, "[client] video capture open FAILED (continuing without video)\n");
+            ctx->no_video = 1;
+        } else {
+            /* Video encoder - use actual capture resolution */
+            p2p_video_encoder_config_t vcfg = {
+                .width = ctx->vcap.width, .height = ctx->vcap.height, .fps = 30,
+                .bitrate = 2000000, .gop_size = 15
+            };
+            if (p2p_video_encoder_open(&ctx->venc, &vcfg) != 0) {
+                fprintf(stderr, "[client] video encoder open FAILED (continuing without video)\n");
+                ctx->no_video = 1;
+            } else if (p2p_video_capture_start(&ctx->vcap) != 0) {
+                fprintf(stderr, "[client] video capture start FAILED (continuing without video)\n");
+                ctx->no_video = 1;
+            }
         }
     } else {
         fprintf(stderr, "[client] video disabled (--no-video)\n");
@@ -333,33 +341,38 @@ static int count_active_peers(client_ctx_t *ctx)
     int n = 0;
     for (int i = 0; i < P2P_MAX_SUBSCRIBERS; i++) {
         p2p_peer_ctx_t *p = &ctx->engine.peers[i];
-        if (p->ice_agent && p->state >= P2P_PEER_STATE_ICE_CONNECTED &&
+        if (p->ice_agent && p->state >= P2P_PEER_STATE_QUIC_CONNECTED &&
             p->state < P2P_PEER_STATE_FAILED)
             n++;
     }
     return n;
 }
 
-static void on_ice_state(p2p_peer_ctx_t *peer, juice_state_t state, void *user_data)
+static void on_ice_state(p2p_peer_ctx_t *peer, p2p_ice_state_t state, void *user_data)
 {
     client_ctx_t *ctx = (client_ctx_t *)user_data;
     fprintf(stderr, "[client] peer %s ICE state -> %d\n", peer->peer_id, state);
 
-    if (state == JUICE_STATE_CONNECTED) {
-        fprintf(stderr, "[client] ICE connected with %s\n", peer->peer_id);
-
+    if (state == P2P_ICE_STATE_CONNECTED) {
+        fprintf(stderr, "[client] ICE connected with %s (awaiting QUIC handshake)\n",
+                peer->peer_id);
         if (!ctx->capture_started)
             start_capture(ctx);
-
-        send_idr_to_peer(ctx, peer);
-    } else if (state == JUICE_STATE_COMPLETED) {
+    } else if (state == P2P_ICE_STATE_COMPLETED) {
         fprintf(stderr, "[client] ICE completed with %s\n", peer->peer_id);
-    } else if (state == JUICE_STATE_FAILED || state == JUICE_STATE_DISCONNECTED) {
+    } else if (state == P2P_ICE_STATE_FAILED || state == P2P_ICE_STATE_DISCONNECTED) {
         fprintf(stderr, "[client] peer %s ICE %s\n",
                 peer->peer_id,
-                state == JUICE_STATE_FAILED ? "failed" : "disconnected");
+                state == P2P_ICE_STATE_FAILED ? "failed" : "disconnected");
         fprintf(stderr, "[client] active peers: %d\n", count_active_peers(ctx));
     }
+}
+
+static void on_quic_connected(p2p_peer_ctx_t *peer, void *user_data)
+{
+    client_ctx_t *ctx = (client_ctx_t *)user_data;
+    fprintf(stderr, "[client] QUIC connected with %s, sending IDR\n", peer->peer_id);
+    send_idr_to_peer(ctx, peer);
 }
 
 static void on_ice_candidate(p2p_peer_ctx_t *peer, const char *sdp, void *user_data)
@@ -619,6 +632,7 @@ int main(int argc, char *argv[])
             .on_peer_ice_state = on_ice_state,
             .on_peer_ice_candidate = on_ice_candidate,
             .on_peer_ice_gathering_done = on_ice_gathering_done,
+            .on_peer_quic_connected = on_quic_connected,
             .on_peer_data_recv = on_data_recv,
         },
         .user_data = ctx

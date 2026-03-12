@@ -131,7 +131,7 @@ static void tpub_sig_peer_joined(p2p_signaling_client_t *c, const char *peer_id,
     p2p_peer_ctx_t *peer = p2p_engine_add_peer(&ctx->pub->engine, peer_id);
     if (!peer) return;
 
-    char sdp[JUICE_MAX_SDP_STRING_LEN];
+    char sdp[P2P_SIG_MAX_SDP_SIZE];
     p2p_peer_get_local_description(peer, sdp, sizeof(sdp));
     p2p_signaling_send_ice_offer(c, peer_id, sdp);
     p2p_peer_gather_candidates(peer);
@@ -207,7 +207,7 @@ static void tsub_sig_ice_offer(p2p_signaling_client_t *c, const char *from,
 
     p2p_peer_set_remote_description(peer, sdp);
 
-    char answer[JUICE_MAX_SDP_STRING_LEN];
+    char answer[P2P_SIG_MAX_SDP_SIZE];
     p2p_peer_get_local_description(peer, answer, sizeof(answer));
     p2p_signaling_send_ice_answer(c, from, answer);
     p2p_peer_gather_candidates(peer);

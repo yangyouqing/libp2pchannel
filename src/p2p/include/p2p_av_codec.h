@@ -46,6 +46,10 @@ int  p2p_video_encoder_encode(p2p_video_encoder_t *enc,
                               int *is_keyframe);
 void p2p_video_encoder_close(p2p_video_encoder_t *enc);
 
+/* Dynamically change the video encoder bitrate for adaptive bitrate control.
+   Returns 0 on success, -1 on error. */
+int  p2p_video_encoder_set_bitrate(p2p_video_encoder_t *enc, int bitrate_bps);
+
 /* ---- Video Decoder (H.264) ---- */
 
 typedef struct {

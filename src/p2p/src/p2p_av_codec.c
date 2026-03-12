@@ -231,6 +231,16 @@ void p2p_video_encoder_close(p2p_video_encoder_t *enc)
     memset(enc, 0, sizeof(*enc));
 }
 
+int p2p_video_encoder_set_bitrate(p2p_video_encoder_t *enc, int bitrate_bps)
+{
+    if (!enc || !enc->codec_ctx) return -1;
+    AVCodecContext *ctx = (AVCodecContext *)enc->codec_ctx;
+    ctx->bit_rate = bitrate_bps;
+    ctx->rc_max_rate = bitrate_bps;
+    ctx->rc_buffer_size = bitrate_bps;
+    return 0;
+}
+
 /* ======== Video Decoder (H.264) ======== */
 
 int p2p_video_decoder_open(p2p_video_decoder_t *dec)

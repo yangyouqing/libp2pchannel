@@ -5,13 +5,13 @@
 
 /* ---- adapter callbacks ---- */
 
-static void sub_on_ice_state(p2p_peer_ctx_t *peer, juice_state_t state, void *user_data)
+static void sub_on_ice_state(p2p_peer_ctx_t *peer, p2p_ice_state_t state, void *user_data)
 {
     p2p_subscriber_t *sub = (p2p_subscriber_t *)user_data;
-    fprintf(stderr, "[sub] ICE state with publisher: %s\n", juice_state_to_string(state));
+    fprintf(stderr, "[sub] ICE state with publisher: %d\n", state);
 
-    if (state == JUICE_STATE_CONNECTED || state == JUICE_STATE_COMPLETED) {
-        p2p_peer_start_quic(peer);
+    if (state == P2P_ICE_STATE_CONNECTED || state == P2P_ICE_STATE_COMPLETED) {
+        fprintf(stderr, "[sub] ICE connected, QUIC auto-started\n");
     }
 }
 
@@ -72,7 +72,7 @@ static void sub_sig_ice_offer(p2p_signaling_client_t *c, const char *from,
     p2p_peer_set_remote_description(peer, sdp);
 
     /* Get local description (answer) and send back */
-    char answer[JUICE_MAX_SDP_STRING_LEN];
+    char answer[P2P_SIG_MAX_SDP_SIZE];
     p2p_peer_get_local_description(peer, answer, sizeof(answer));
     p2p_signaling_send_ice_answer(c, from, answer);
 

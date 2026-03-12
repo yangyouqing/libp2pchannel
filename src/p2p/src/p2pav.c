@@ -180,9 +180,10 @@ struct p2pav_session_s {
  *  Forward declarations for internal callbacks
  * ================================================================ */
 
-static void internal_on_ice_state(p2p_peer_ctx_t *peer, juice_state_t state, void *ud);
+static void internal_on_ice_state(p2p_peer_ctx_t *peer, p2p_ice_state_t state, void *ud);
 static void internal_on_ice_candidate(p2p_peer_ctx_t *peer, const char *sdp, void *ud);
 static void internal_on_ice_gathering_done(p2p_peer_ctx_t *peer, void *ud);
+static void internal_on_quic_connected(p2p_peer_ctx_t *peer, void *ud);
 static void internal_on_data_recv(p2p_peer_ctx_t *peer, const p2p_frame_header_t *hdr,
                                    const uint8_t *payload, void *ud);
 
@@ -240,17 +241,7 @@ const char *p2pav_error_string(p2pav_error_t err)
 void p2pav_set_log_level(p2pav_log_level_t level)
 {
     g_log_level = level;
-
-    juice_log_level_t jl = JUICE_LOG_LEVEL_WARN;
-    switch (level) {
-    case P2PAV_LOG_NONE:  jl = JUICE_LOG_LEVEL_NONE;    break;
-    case P2PAV_LOG_ERROR: jl = JUICE_LOG_LEVEL_ERROR;   break;
-    case P2PAV_LOG_WARN:  jl = JUICE_LOG_LEVEL_WARN;    break;
-    case P2PAV_LOG_INFO:  jl = JUICE_LOG_LEVEL_INFO;    break;
-    case P2PAV_LOG_DEBUG: jl = JUICE_LOG_LEVEL_DEBUG;   break;
-    case P2PAV_LOG_TRACE: jl = JUICE_LOG_LEVEL_VERBOSE; break;
-    }
-    juice_set_log_level(jl);
+    p2p_adapter_set_log_level((int)level);
 }
 
 void p2pav_set_log_callback(p2pav_log_cb_t cb, void *user_data)
@@ -405,6 +396,7 @@ p2pav_error_t p2pav_session_start(p2pav_session_t *s)
             .on_peer_ice_state          = internal_on_ice_state,
             .on_peer_ice_candidate      = internal_on_ice_candidate,
             .on_peer_ice_gathering_done = internal_on_ice_gathering_done,
+            .on_peer_quic_connected     = internal_on_quic_connected,
             .on_peer_data_recv          = internal_on_data_recv,
         },
         .user_data = s,
@@ -518,8 +510,9 @@ static void send_to_all_peers_internal(p2pav_session_t *s,
 {
     for (int i = 0; i < P2PAV_MAX_PEERS; i++) {
         p2p_peer_ctx_t *peer = &s->engine.peers[i];
-        if (peer->state >= P2P_PEER_STATE_ICE_CONNECTED && peer->ice_agent)
-            p2p_peer_send_data(peer, type, flags, seq, ts, data, len);
+        if (peer->state >= P2P_PEER_STATE_QUIC_CONNECTED &&
+            peer->state < P2P_PEER_STATE_FAILED && peer->ice_agent)
+            p2p_peer_send_data_via_quic(peer, type, flags, seq, ts, data, len);
     }
 }
 
@@ -585,7 +578,8 @@ p2pav_error_t p2pav_video_request_keyframe(p2pav_session_t *s,
     } else {
         for (int i = 0; i < P2PAV_MAX_PEERS; i++) {
             p2p_peer_ctx_t *p = &s->engine.peers[i];
-            if (p->state >= P2P_PEER_STATE_ICE_CONNECTED && p->ice_agent)
+            if (p->state >= P2P_PEER_STATE_QUIC_CONNECTED &&
+                p->state < P2P_PEER_STATE_FAILED && p->ice_agent)
                 p2p_peer_send_idr_request(p);
         }
     }
@@ -718,14 +712,15 @@ p2pav_error_t p2pav_data_send(p2pav_session_t *s,
         return P2PAV_ERR_PEER_NOT_FOUND;
 
     p2p_peer_ctx_t *peer = &s->engine.peers[ch->peer_index];
-    if (peer->state < P2P_PEER_STATE_ICE_CONNECTED || !peer->ice_agent)
+    if (peer->state < P2P_PEER_STATE_QUIC_CONNECTED ||
+        peer->state >= P2P_PEER_STATE_FAILED || !peer->ice_agent)
         return P2PAV_ERR_NOT_CONNECTED;
 
     p2p_mutex_lock(&s->send_mutex);
     uint32_t seq = s->data_seq++;
-    int ret = p2p_peer_send_data(peer, P2P_FRAME_TYPE_DATA, 0,
-                                  seq, p2p_now_us(),
-                                  (const uint8_t *)data, (uint32_t)len);
+    int ret = p2p_peer_send_data_via_quic(peer, P2P_FRAME_TYPE_DATA, 0,
+                                           seq, p2p_now_us(),
+                                           (const uint8_t *)data, (uint32_t)len);
     p2p_mutex_unlock(&s->send_mutex);
     return (ret == 0) ? P2PAV_OK : P2PAV_ERR_INTERNAL;
 }
@@ -775,21 +770,15 @@ p2pav_error_t p2pav_get_net_stats(p2pav_session_t *s,
     if (!peer) return P2PAV_ERR_NOT_CONNECTED;
 
     /* ICE candidate info for path type detection */
-    char local_cand[256] = "", remote_cand[256] = "";
-    if (peer->ice_agent) {
-        juice_get_selected_candidates(peer->ice_agent,
-                                       local_cand, sizeof(local_cand),
-                                       remote_cand, sizeof(remote_cand));
-        juice_get_selected_addresses(peer->ice_agent,
-                                      stats->local_addr, sizeof(stats->local_addr),
-                                      stats->remote_addr, sizeof(stats->remote_addr));
+    p2p_ice_info_t ice_info;
+    if (p2p_get_peer_ice_info(peer, &ice_info) == 0) {
+        snprintf(stats->local_addr, sizeof(stats->local_addr), "%s", ice_info.local_addr);
+        snprintf(stats->remote_addr, sizeof(stats->remote_addr), "%s", ice_info.remote_addr);
     }
 
-    /* Determine path type from candidate type string */
     stats->path_type = P2PAV_PATH_UNKNOWN;
-    if (local_cand[0]) {
-        /* libjuice candidate format: "a=candidate:... typ host/srflx/prflx/relay ..." */
-        const char *typ = strstr(local_cand, "typ ");
+    if (ice_info.local_cand[0]) {
+        const char *typ = strstr(ice_info.local_cand, "typ ");
         if (typ) {
             typ += 4;
             if (strncmp(typ, "relay", 5) == 0) {
@@ -850,24 +839,23 @@ p2pav_error_t p2pav_get_ice_candidates(p2pav_session_t *s,
     }
     if (!peer || !peer->ice_agent) return P2PAV_ERR_NOT_CONNECTED;
 
-    char local_sel[256] = "", remote_sel[256] = "";
-    juice_get_selected_candidates(peer->ice_agent,
-                                   local_sel, sizeof(local_sel),
-                                   remote_sel, sizeof(remote_sel));
+    p2p_ice_info_t ice_info;
+    if (p2p_get_peer_ice_info(peer, &ice_info) != 0)
+        return P2PAV_ERR_NOT_CONNECTED;
 
     if (local) {
         memset(local, 0, sizeof(*local));
-        if (local_sel[0]) {
+        if (ice_info.local_cand[0]) {
             local->count = 1;
-            const char *typ = strstr(local_sel, "typ ");
+            const char *typ = strstr(ice_info.local_cand, "typ ");
             if (typ) {
                 typ += 4;
                 char t[16] = "";
                 sscanf(typ, "%15s", t);
                 snprintf(local->candidates[0].type, sizeof(local->candidates[0].type), "%s", t);
             }
-            char addr[64] = "";
-            juice_get_selected_addresses(peer->ice_agent, addr, sizeof(addr), NULL, 0);
+            char addr[64];
+            snprintf(addr, sizeof(addr), "%s", ice_info.local_addr);
             char *colon = strrchr(addr, ':');
             if (colon) {
                 *colon = '\0';
@@ -879,17 +867,17 @@ p2pav_error_t p2pav_get_ice_candidates(p2pav_session_t *s,
 
     if (remote) {
         memset(remote, 0, sizeof(*remote));
-        if (remote_sel[0]) {
+        if (ice_info.remote_cand[0]) {
             remote->count = 1;
-            const char *typ = strstr(remote_sel, "typ ");
+            const char *typ = strstr(ice_info.remote_cand, "typ ");
             if (typ) {
                 typ += 4;
                 char t[16] = "";
                 sscanf(typ, "%15s", t);
                 snprintf(remote->candidates[0].type, sizeof(remote->candidates[0].type), "%s", t);
             }
-            char addr[64] = "";
-            juice_get_selected_addresses(peer->ice_agent, NULL, 0, addr, sizeof(addr));
+            char addr[64];
+            snprintf(addr, sizeof(addr), "%s", ice_info.remote_addr);
             char *colon = strrchr(addr, ':');
             if (colon) {
                 *colon = '\0';
@@ -1126,41 +1114,49 @@ static void internal_on_data_recv(p2p_peer_ctx_t *peer, const p2p_frame_header_t
  *  Internal: ICE callbacks
  * ================================================================ */
 
-static void internal_on_ice_state(p2p_peer_ctx_t *peer, juice_state_t state, void *ud)
+static void internal_on_ice_state(p2p_peer_ctx_t *peer, p2p_ice_state_t state, void *ud)
 {
     p2pav_session_t *s = (p2pav_session_t *)ud;
     if (!s) return;
 
     LOG_INFO("peer %s ICE state -> %d", peer->peer_id, state);
 
-    if (state == JUICE_STATE_CONNECTED || state == JUICE_STATE_COMPLETED) {
+    if (state == P2P_ICE_STATE_CONNECTED || state == P2P_ICE_STATE_COMPLETED) {
         s->timing.ice_connected_us = p2p_now_us();
-
-        /* Send cached IDR to newly connected subscriber */
-        if (s->cfg.role == P2PAV_ROLE_PUBLISHER) {
-            p2p_mutex_lock(&s->send_mutex);
-            p2p_mutex_lock(&s->idr_mutex);
-            if (s->idr_cache && s->idr_cache_size > 0) {
-                uint32_t seq = s->video_seq++;
-                p2p_peer_send_data(peer, P2P_FRAME_TYPE_VIDEO, P2P_FRAME_FLAG_KEY,
-                                   seq, p2p_now_us(),
-                                   s->idr_cache, s->idr_cache_size);
-                LOG_DBG("sent cached IDR (%d bytes) to %s",
-                        s->idr_cache_size, peer->peer_id);
-            }
-            p2p_mutex_unlock(&s->idr_mutex);
-            p2p_mutex_unlock(&s->send_mutex);
-        }
-
-        if (s->session_cbs.on_peer_ready)
-            s->session_cbs.on_peer_ready(s, peer->peer_id, s->session_ud);
     }
 
-    if (state == JUICE_STATE_FAILED) {
+    if (state == P2P_ICE_STATE_FAILED) {
         if (s->session_cbs.on_error)
             s->session_cbs.on_error(s, P2PAV_ERR_ICE_FAILED,
                                      peer->peer_id, s->session_ud);
     }
+}
+
+static void internal_on_quic_connected(p2p_peer_ctx_t *peer, void *ud)
+{
+    p2pav_session_t *s = (p2pav_session_t *)ud;
+    if (!s) return;
+
+    LOG_INFO("peer %s QUIC connected", peer->peer_id);
+
+    /* Send cached IDR to newly connected subscriber */
+    if (s->cfg.role == P2PAV_ROLE_PUBLISHER) {
+        p2p_mutex_lock(&s->send_mutex);
+        p2p_mutex_lock(&s->idr_mutex);
+        if (s->idr_cache && s->idr_cache_size > 0) {
+            uint32_t seq = s->video_seq++;
+            p2p_peer_send_data_via_quic(peer, P2P_FRAME_TYPE_VIDEO, P2P_FRAME_FLAG_KEY,
+                               seq, p2p_now_us(),
+                               s->idr_cache, s->idr_cache_size);
+            LOG_DBG("sent cached IDR (%d bytes) to %s",
+                    s->idr_cache_size, peer->peer_id);
+        }
+        p2p_mutex_unlock(&s->idr_mutex);
+        p2p_mutex_unlock(&s->send_mutex);
+    }
+
+    if (s->session_cbs.on_peer_ready)
+        s->session_cbs.on_peer_ready(s, peer->peer_id, s->session_ud);
 }
 
 static void internal_on_ice_candidate(p2p_peer_ctx_t *peer, const char *sdp, void *ud)

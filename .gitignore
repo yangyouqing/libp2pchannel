@@ -3,6 +3,7 @@ build_win/
 android
 android_deps
 build_android
+"third_party/mbedtls (新提交)"
 #deploy/
 deploy/client
 deploy/peer

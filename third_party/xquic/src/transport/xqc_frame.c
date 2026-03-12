@@ -752,6 +752,9 @@ xqc_process_crypto_frame(xqc_connection_t *conn, xqc_packet_in_t *packet_in)
     }
     xqc_stream_ready_to_read(stream);
 
+    if (conn->conn_type == XQC_CONN_TYPE_SERVER) {
+        xqc_stream_ready_to_write(stream);
+    }
 
     if (conn->conn_type == XQC_CONN_TYPE_SERVER
         && encrypt_level == XQC_ENC_LEV_INIT && conn->crypto_stream[XQC_ENC_LEV_HSK] == NULL)

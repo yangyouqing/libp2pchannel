@@ -16,6 +16,7 @@
 #include "src/tls/xqc_hkdf.h"
 #include "src/common/xqc_common.h"
 #include "src/common/xqc_malloc.h"
+#include "src/transport/xqc_conn.h"
 
 #include <mbedtls/ecdh.h>
 #include <mbedtls/md.h>
@@ -152,6 +153,10 @@ struct xqc_tls_s {
     /* Reassembly buffer for handshake messages per level */
     uint8_t                reasm[XQC_ENC_LEV_MAX][REASM_BUF_SIZE];
     size_t                 reasm_len[XQC_ENC_LEV_MAX];
+
+    /* Saved ClientHello for transcript (client only) */
+    uint8_t                saved_ch[2048];
+    size_t                 saved_ch_len;
 
     /* Random values */
     uint8_t                client_random[32];
@@ -1099,15 +1104,11 @@ client_process_server_hello(xqc_tls_t *tls, const uint8_t *msg, size_t msg_len,
     ret = transcript_init(tls, tls->md_type);
     if (ret != XQC_OK) return ret;
 
-    /* Re-hash ClientHello into transcript using "message_hash" construction.
-       (Since we initialized transcript after knowing cipher, we retroactively add CH.) */
-    /* We need to hash the stored ClientHello raw bytes */
-    /* The reasm buffer at INIT level should still have the CH */
-    /* Actually we add both CH and SH to transcript */
-
-    /* For the transcript, we need to reconstruct: we stored client_hello in reasm[INIT] before it was sent.
-       But actually the ClientHello was already sent and we didn't save it. We need to save it.
-       Let's use the workaround: the caller should have saved the CH bytes. */
+    /* Add saved ClientHello to transcript before ServerHello */
+    if (tls->saved_ch_len > 0) {
+        transcript_update(tls, tls->saved_ch, tls->saved_ch_len);
+        tls->saved_ch_len = 0;
+    }
 
     /* Update transcript with ServerHello */
     transcript_update(tls, raw_msg, raw_msg_len);
@@ -1444,9 +1445,8 @@ xqc_tls_init(xqc_tls_t *tls, xqc_proto_version_t version, const xqc_cid_t *odcid
         if (ret != XQC_OK) return ret;
 
         /* Save CH bytes for transcript (we'll add them when we know the hash) */
-        /* For now, store in reasm[INIT] */
-        memcpy(tls->reasm[XQC_ENC_LEV_INIT], ch_buf, ch_len);
-        tls->reasm_len[XQC_ENC_LEV_INIT] = ch_len;
+        memcpy(tls->saved_ch, ch_buf, ch_len);
+        tls->saved_ch_len = ch_len;
 
         /* Send ClientHello */
         if (tls->cbs->crypto_data_cb) {
@@ -1535,11 +1535,6 @@ xqc_tls_process_crypto_data(xqc_tls_t *tls, xqc_encrypt_level_t level,
         return -XQC_TLS_INTERNAL;
     }
 
-    /* For client waiting for SH: we need to add saved CH to transcript first when SH arrives */
-    if (tls->state == MTLS_CLI_WAIT_SH && level == XQC_ENC_LEV_INIT) {
-        /* Data arriving at INIT level while waiting for SH means it's ServerHello */
-    }
-
     memcpy(tls->reasm[level] + tls->reasm_len[level], crypto_data, data_len);
     tls->reasm_len[level] += data_len;
 
@@ -1551,56 +1546,11 @@ xqc_tls_process_crypto_data(xqc_tls_t *tls, xqc_encrypt_level_t level,
 
         if (tls->reasm_len[level] < total) break;
 
-        /* Before processing ServerHello on client, add saved ClientHello to transcript */
-        if (tls->state == MTLS_CLI_WAIT_SH && msg_type == TLS_HS_SERVER_HELLO) {
-            /* Initialize transcript with a tentative hash (will be confirmed by SH) */
-            /* Parse SH first to know the cipher suite, then init transcript */
-            /* Actually, we peek at the cipher suite from the SH data */
-            const uint8_t *sh_data = tls->reasm[level] + 4;
-            /* Skip: legacy_version(2) + random(32) + session_id_len(1) + session_id(N) */
-            const uint8_t *cs_ptr = sh_data + 2 + 32;
-            uint8_t sid_len = *cs_ptr++;
-            cs_ptr += sid_len;
-            uint16_t cs = get16(cs_ptr);
-
-            mbedtls_md_type_t md_t = (cs == TLS_CS_AES_256_GCM_SHA384)
-                ? MBEDTLS_MD_SHA384 : MBEDTLS_MD_SHA256;
-            tls->md_type = md_t;
-            tls->hash_len = (md_t == MBEDTLS_MD_SHA384) ? 48 : 32;
-
-            transcript_init(tls, md_t);
-
-            /* Add saved ClientHello to transcript */
-            size_t saved_ch_len = tls->reasm_len[XQC_ENC_LEV_INIT] - tls->reasm_len[level];
-            /* Actually the saved CH is at the beginning of reasm[INIT] before the SH data was appended */
-            /* We stored the CH in reasm[INIT] during xqc_tls_init, then SH was appended to reasm[INIT] too */
-            /* This is wrong - both CH and SH go to INIT level. Let me fix this. */
-            /* The saved CH was stored in reasm[INIT] at offset 0 with length saved in a variable */
-            /* We need a separate buffer for the saved CH. Let me use client_random as a flag. */
-
-            /* Actually, the CH was stored before xqc_tls_process_crypto_data was called.
-               The reasm[INIT] was set to CH bytes in xqc_tls_init.
-               Then this function appended the SH to reasm[INIT].
-               So reasm[INIT] = [CH bytes] [SH bytes]
-               The SH starts at the old reasm_len[INIT] offset. */
-
-            /* We need to know where CH ends and SH begins.
-               Before this call, reasm_len[INIT] = ch_len (set in xqc_tls_init).
-               Then we appended data_len bytes. So CH is [0..ch_len) and SH starts at ch_len. */
-
-            /* But actually, xqc_tls_process_crypto_data was called with level=INIT,
-               and we already memcpy'd the new data above this block.
-               So reasm_len[INIT] now = old_reasm_len + data_len.
-               The CH is the first old_reasm_len bytes. */
-            size_t ch_len = tls->reasm_len[level] - data_len;
-            if (ch_len > 0) {
-                transcript_update(tls, tls->reasm[level], ch_len);
-            }
-
-            /* Now remove the CH from the buffer, keep only SH */
-            memmove(tls->reasm[level], tls->reasm[level] + ch_len, data_len);
-            tls->reasm_len[level] = data_len;
-            continue; /* re-check with the corrected buffer */
+        /* Set flag BEFORE processing so xqc_crypto_stream_on_write can flush the
+         * ServerHello that server_process_client_hello will generate. */
+        if (msg_type == TLS_HS_CLIENT_HELLO && tls->user_data) {
+            xqc_connection_t *conn = (xqc_connection_t *)tls->user_data;
+            conn->conn_flag |= XQC_CONN_FLAG_TLS_CH_RECVD;
         }
 
         xqc_int_t ret = process_hs_msg(tls, level, msg_type, tls->reasm[level] + 4, msg_len);

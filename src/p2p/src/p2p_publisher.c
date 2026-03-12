@@ -5,16 +5,13 @@
 
 /* ---- adapter callbacks ---- */
 
-static void pub_on_ice_state(p2p_peer_ctx_t *peer, juice_state_t state, void *user_data)
+static void pub_on_ice_state(p2p_peer_ctx_t *peer, p2p_ice_state_t state, void *user_data)
 {
     p2p_publisher_t *pub = (p2p_publisher_t *)user_data;
-    fprintf(stderr, "[pub] peer %s ICE state: %s\n",
-            peer->peer_id, juice_state_to_string(state));
+    fprintf(stderr, "[pub] peer %s ICE state: %d\n", peer->peer_id, state);
 
-    if (state == JUICE_STATE_CONNECTED || state == JUICE_STATE_COMPLETED) {
-        /* ICE connected – start QUIC handshake.
-         * Publisher acts as QUIC "server", so just wait for the subscriber
-         * to initiate the QUIC connection.  No action needed here. */
+    if (state == P2P_ICE_STATE_CONNECTED || state == P2P_ICE_STATE_COMPLETED) {
+        fprintf(stderr, "[pub] ICE connected with %s, QUIC auto-started\n", peer->peer_id);
     }
 }
 
@@ -35,10 +32,12 @@ static void pub_on_quic_connected(p2p_peer_ctx_t *peer, void *user_data)
     p2p_publisher_t *pub = (p2p_publisher_t *)user_data;
     fprintf(stderr, "[pub] QUIC connected with subscriber %s\n", peer->peer_id);
 
-    /* Send cached IDR frame for fast first-frame delivery */
+    /* Send cached IDR frame for fast first-frame delivery via QUIC */
     p2p_mutex_lock(&pub->idr_mutex);
     if (pub->idr_cache && pub->idr_cache_size > 0) {
-        juice_send(peer->ice_agent, (const char *)pub->idr_cache, pub->idr_cache_size);
+        p2p_peer_send_data_via_quic(peer, P2P_FRAME_TYPE_VIDEO, P2P_FRAME_FLAG_KEY,
+                                    0, p2p_now_us(),
+                                    pub->idr_cache, (uint32_t)pub->idr_cache_size);
     }
     p2p_mutex_unlock(&pub->idr_mutex);
 }
@@ -81,7 +80,7 @@ static void pub_sig_peer_joined(p2p_signaling_client_t *c, const char *peer_id, 
     }
 
     /* Get local ICE description and send as offer */
-    char sdp[JUICE_MAX_SDP_STRING_LEN];
+    char sdp[P2P_SIG_MAX_SDP_SIZE];
     p2p_peer_get_local_description(peer, sdp, sizeof(sdp));
     p2p_signaling_send_ice_offer(c, peer_id, sdp);
 
@@ -225,11 +224,15 @@ int p2p_publisher_send_video(p2p_publisher_t *pub, const uint8_t *data,
         p2p_mutex_unlock(&pub->idr_mutex);
     }
 
-    /* Send to all connected subscribers */
+    /* Send to all connected subscribers via xquic DATAGRAM */
+    uint8_t flags = is_keyframe ? P2P_FRAME_FLAG_KEY : 0;
+    static uint32_t video_seq = 0;
+    uint32_t seq = video_seq++;
     for (int i = 0; i < P2P_MAX_SUBSCRIBERS; i++) {
         p2p_peer_ctx_t *peer = &pub->engine.peers[i];
         if (peer->state == P2P_PEER_STATE_QUIC_CONNECTED && peer->ice_agent) {
-            juice_send(peer->ice_agent, (const char *)data, size);
+            p2p_peer_send_data_via_quic(peer, P2P_FRAME_TYPE_VIDEO, flags,
+                                        seq, timestamp_us, data, (uint32_t)size);
         }
     }
     return 0;
@@ -240,10 +243,13 @@ int p2p_publisher_send_audio(p2p_publisher_t *pub, const uint8_t *data,
 {
     if (!pub || !data || size == 0) return -1;
 
+    static uint32_t audio_seq = 0;
+    uint32_t seq = audio_seq++;
     for (int i = 0; i < P2P_MAX_SUBSCRIBERS; i++) {
         p2p_peer_ctx_t *peer = &pub->engine.peers[i];
         if (peer->state == P2P_PEER_STATE_QUIC_CONNECTED && peer->ice_agent) {
-            juice_send(peer->ice_agent, (const char *)data, size);
+            p2p_peer_send_data_via_quic(peer, P2P_FRAME_TYPE_AUDIO, 0,
+                                        seq, timestamp_us, data, (uint32_t)size);
         }
     }
     return 0;

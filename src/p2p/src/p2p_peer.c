@@ -5,6 +5,9 @@
  *   ./p2p_peer --signaling 127.0.0.1:8080 --room test-room --peer-id sub1
  *              --stun 127.0.0.1:3478
  */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 
 #include "p2p_adapter.h"
 #include "p2p_signaling.h"
@@ -19,11 +22,60 @@
 #include <string.h>
 #include <time.h>
 #include "p2p_platform.h"
-#include <juice/juice.h>
 #ifndef _WIN32
 #include <signal.h>
+#include <execinfo.h>
+#include <ucontext.h>
 #endif
 #include <libavutil/log.h>
+
+#ifndef _WIN32
+static void crash_handler(int sig, siginfo_t *si, void *ctx)
+{
+    ucontext_t *uc = (ucontext_t *)ctx;
+    void *pc = NULL;
+    void *ret_addr = NULL;
+#if defined(__x86_64__)
+    pc = (void *)uc->uc_mcontext.gregs[REG_RIP];
+    void *rsp = (void *)uc->uc_mcontext.gregs[REG_RSP];
+    if (rsp) ret_addr = *(void **)rsp;
+    fprintf(stderr,
+        "\n=== CRASH sig=%d si_addr=%p fault_pc=%p rsp=%p ret_addr=%p ===\n",
+        sig, si->si_addr, pc, rsp, ret_addr);
+    fprintf(stderr, "  RBP=%p RBX=%p R12=%p R13=%p R14=%p R15=%p\n",
+        (void *)uc->uc_mcontext.gregs[REG_RBP],
+        (void *)uc->uc_mcontext.gregs[REG_RBX],
+        (void *)uc->uc_mcontext.gregs[REG_R12],
+        (void *)uc->uc_mcontext.gregs[REG_R13],
+        (void *)uc->uc_mcontext.gregs[REG_R14],
+        (void *)uc->uc_mcontext.gregs[REG_R15]);
+#elif defined(__aarch64__)
+    pc = (void *)uc->uc_mcontext.pc;
+    fprintf(stderr,
+        "\n=== CRASH sig=%d si_addr=%p fault_pc=%p ===\n",
+        sig, si->si_addr, pc);
+#endif
+
+    void *bt[64];
+    int n = backtrace(bt, 64);
+    if (ret_addr) bt[0] = ret_addr;
+    if (pc && pc != (void*)0) bt[1] = pc;
+    backtrace_symbols_fd(bt, n, 2);
+    _exit(128 + sig);
+}
+
+static void install_crash_handlers(void)
+{
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = crash_handler;
+    sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+}
+#endif
 
 #ifdef __ANDROID__
 #include "SDL.h"
@@ -101,20 +153,11 @@ typedef struct {
     reasm_buf_t          audio_reasm;
     p2p_mutex_t          reasm_mutex;
 
-    /* Frame queue for main-thread rendering */
-    struct {
-        uint8_t *y, *u, *v;
-        int lsy, lsu, lsv;
-        int w, h;
-        int ready;
-        int delay_ms;  /* capture-to-display delay from timestamp_us */
-    } vframe;
-    struct {
-        int16_t *samples;
-        int count;
-        int ready;
-    } aframe;
-    p2p_mutex_t          frame_mutex;
+    /* Video jitter buffer for main-thread rendering */
+    p2p_video_jitter_buf_t  video_jitter;
+    int                     video_jitter_inited;
+    int                     last_delay_ms;
+    p2p_mutex_t             frame_mutex;
 
     /* Frame loss tracking */
     uint32_t             last_video_seq;
@@ -186,18 +229,16 @@ static void get_peer_stats(peer_ctx_t *ctx, peer_net_stats_t *out)
     }
     if (!peer) return;
 
-    char local_cand[256] = "", remote_cand[256] = "";
-    juice_get_selected_candidates(peer->ice_agent,
-        local_cand, sizeof(local_cand), remote_cand, sizeof(remote_cand));
-    juice_get_selected_addresses(peer->ice_agent,
-        out->local_addr, sizeof(out->local_addr),
-        out->remote_addr, sizeof(out->remote_addr));
-
-    const char *typ = strstr(local_cand, "typ ");
-    if (typ) {
-        typ += 4;
-        if (strncmp(typ, "relay", 5) == 0)
-            out->is_relay = 1;
+    p2p_ice_info_t ice_info;
+    if (p2p_get_peer_ice_info(peer, &ice_info) == 0) {
+        snprintf(out->local_addr, sizeof(out->local_addr), "%s", ice_info.local_addr);
+        snprintf(out->remote_addr, sizeof(out->remote_addr), "%s", ice_info.remote_addr);
+        const char *typ = strstr(ice_info.local_cand, "typ ");
+        if (typ) {
+            typ += 4;
+            if (strncmp(typ, "relay", 5) == 0)
+                out->is_relay = 1;
+        }
     }
 
     if (ctx->engine.xqc_engine && peer->xqc_conn) {
@@ -236,26 +277,15 @@ static void process_complete_frame(peer_ctx_t *ctx, reasm_buf_t *rb)
                 fprintf(stderr, "[peer] first video frame decoded: %dx%d\n", w, h);
             }
 
-            p2p_mutex_lock(&ctx->frame_mutex);
-            int y_size = lsy * h;
-            int uv_h = h / 2;
-            int u_size = lsu * uv_h;
-            int v_size = lsv * uv_h;
+            if (!ctx->video_jitter_inited) {
+                p2p_video_jitter_init(&ctx->video_jitter, 33000);
+                ctx->video_jitter_inited = 1;
+            }
+            ctx->last_delay_ms = (int)((p2p_capture_now_us() - rb->timestamp_us) / 1000);
 
-            ctx->vframe.y = realloc(ctx->vframe.y, y_size);
-            ctx->vframe.u = realloc(ctx->vframe.u, u_size);
-            ctx->vframe.v = realloc(ctx->vframe.v, v_size);
-            if (ctx->vframe.y) memcpy(ctx->vframe.y, y, y_size);
-            if (ctx->vframe.u) memcpy(ctx->vframe.u, u, u_size);
-            if (ctx->vframe.v) memcpy(ctx->vframe.v, v, v_size);
-            ctx->vframe.lsy = lsy;
-            ctx->vframe.lsu = lsu;
-            ctx->vframe.lsv = lsv;
-            ctx->vframe.w = w;
-            ctx->vframe.h = h;
-            ctx->vframe.delay_ms = (int)((p2p_capture_now_us() - rb->timestamp_us) / 1000);
-            ctx->vframe.ready = 1;
-            p2p_mutex_unlock(&ctx->frame_mutex);
+            p2p_video_jitter_push(&ctx->video_jitter,
+                                  y, u, v, lsy, lsu, lsv, w, h,
+                                  rb->timestamp_us);
         }
     } else if (rb->type == P2P_FRAME_TYPE_AUDIO) {
         ctx->audio_frames_rx++;
@@ -277,14 +307,17 @@ static void process_complete_frame(peer_ctx_t *ctx, reasm_buf_t *rb)
             &samples, &num_samples);
 
         if (ret > 0 && samples && num_samples > 0) {
-            p2p_mutex_lock(&ctx->frame_mutex);
-            ctx->aframe.samples = realloc(ctx->aframe.samples,
-                                          num_samples * sizeof(int16_t));
-            if (ctx->aframe.samples)
-                memcpy(ctx->aframe.samples, samples, num_samples * sizeof(int16_t));
-            ctx->aframe.count = num_samples;
-            ctx->aframe.ready = 1;
-            p2p_mutex_unlock(&ctx->frame_mutex);
+            /* Queue audio directly to SDL -- no single-frame buffer */
+            if (ctx->sdl_audio.device_id > 0) {
+                uint32_t queued = SDL_GetQueuedAudioSize(ctx->sdl_audio.device_id);
+                uint32_t max_queue = 48000 * sizeof(int16_t) * 1 / 5;
+                if (queued > max_queue) {
+                    SDL_ClearQueuedAudio(ctx->sdl_audio.device_id);
+                }
+                SDL_QueueAudio(ctx->sdl_audio.device_id,
+                               samples, num_samples * sizeof(int16_t));
+                ctx->audio_frames_played++;
+            }
         }
     }
 }
@@ -428,13 +461,19 @@ static void on_data_recv(p2p_peer_ctx_t *peer, const p2p_frame_header_t *hdr,
 
 /* ---- Adapter callbacks ---- */
 
-static void on_ice_state(p2p_peer_ctx_t *peer, juice_state_t state, void *user_data)
+static void on_ice_state(p2p_peer_ctx_t *peer, p2p_ice_state_t state, void *user_data)
 {
     fprintf(stderr, "[peer] ICE state -> %d with %s\n", state, peer->peer_id);
 
-    if (state == JUICE_STATE_CONNECTED || state == JUICE_STATE_COMPLETED) {
-        fprintf(stderr, "[peer] ICE connected with publisher %s\n", peer->peer_id);
+    if (state == P2P_ICE_STATE_CONNECTED || state == P2P_ICE_STATE_COMPLETED) {
+        fprintf(stderr, "[peer] ICE connected with publisher %s (awaiting QUIC)\n",
+                peer->peer_id);
     }
+}
+
+static void on_quic_connected(p2p_peer_ctx_t *peer, void *user_data)
+{
+    fprintf(stderr, "[peer] QUIC connected with publisher %s\n", peer->peer_id);
 }
 
 static void on_ice_candidate(p2p_peer_ctx_t *peer, const char *sdp, void *user_data)
@@ -549,6 +588,9 @@ static void print_usage(const char *prog)
 
 int main(int argc, char *argv[])
 {
+#ifndef _WIN32
+    install_crash_handlers();
+#endif
     peer_ctx_t *ctx = &g_ctx;
     memset(ctx, 0, sizeof(*ctx));
 
@@ -717,6 +759,7 @@ int main(int argc, char *argv[])
             .on_peer_ice_state = on_ice_state,
             .on_peer_ice_candidate = on_ice_candidate,
             .on_peer_ice_gathering_done = on_ice_gathering_done,
+            .on_peer_quic_connected = on_quic_connected,
             .on_peer_data_recv = on_data_recv,
         },
         .user_data = ctx
@@ -825,9 +868,7 @@ int main(int argc, char *argv[])
 
             peer_net_stats_t ns;
             get_peer_stats(ctx, &ns);
-            p2p_mutex_lock(&ctx->frame_mutex);
-            int delay_ms = ctx->vframe.delay_ms;
-            p2p_mutex_unlock(&ctx->frame_mutex);
+            int delay_ms = ctx->last_delay_ms;
             snprintf(ctx->osd_line2, sizeof(ctx->osd_line2), "Delay: %dms", delay_ms);
             if (ns.has_quic)
                 snprintf(ctx->osd_line3, sizeof(ctx->osd_line3),
@@ -838,39 +879,29 @@ int main(int argc, char *argv[])
                          "RTT: --  Loss: --  InFlight: --");
         }
 
-        /* --- Video area (top VIDEO_H pixels) – pure video, no overlays --- */
-        p2p_mutex_lock(&ctx->frame_mutex);
-        if (ctx->video_enabled) {
-            if (ctx->vframe.ready) {
+        /* --- Video area (top VIDEO_H pixels) – pop from jitter buffer --- */
+        if (ctx->video_enabled && ctx->video_jitter_inited) {
+            p2p_jitter_frame_t jf;
+            if (p2p_video_jitter_pop(&ctx->video_jitter, &jf)) {
                 p2p_sdl_video_draw_frame(&ctx->sdl_video,
-                    ctx->vframe.y, ctx->vframe.u, ctx->vframe.v,
-                    ctx->vframe.lsy, ctx->vframe.lsu, ctx->vframe.lsv,
-                    ctx->vframe.w, ctx->vframe.h);
-                ctx->vframe.ready = 0;
+                    jf.y, jf.u, jf.v,
+                    jf.lsy, jf.lsu, jf.lsv,
+                    jf.w, jf.h);
+                free(jf.y); free(jf.u); free(jf.v);
             } else {
                 p2p_sdl_video_draw_frame(&ctx->sdl_video,
                     NULL, NULL, NULL, 0, 0, 0, 0, 0);
             }
-        } else {
-            ctx->vframe.ready = 0;
+        } else if (!ctx->video_enabled) {
             SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
             SDL_RenderClear(ren);
             p2p_sdl_draw_text(ren, win_w / 2 - 80, VIDEO_H / 2 - 8,
                               "Audio Only", 2, 160, 160, 160);
+        } else {
+            p2p_sdl_video_draw_frame(&ctx->sdl_video,
+                NULL, NULL, NULL, 0, 0, 0, 0, 0);
         }
-
-        if (ctx->audio_enabled && ctx->aframe.ready) {
-            int aplay_ret = p2p_sdl_audio_play(&ctx->sdl_audio,
-                ctx->aframe.samples, ctx->aframe.count);
-            fprintf(stderr, "[PLAY-AUDIO] samples=%d ret=%d played=%u\n",
-                    ctx->aframe.count, aplay_ret, ctx->audio_frames_played + 1);
-            ctx->aframe.ready = 0;
-            ctx->audio_frames_played++;
-        } else if (ctx->aframe.ready) {
-            fprintf(stderr, "[PLAY-AUDIO] DROPPED (audio_enabled=%d)\n", ctx->audio_enabled);
-            ctx->aframe.ready = 0;
-        }
-        p2p_mutex_unlock(&ctx->frame_mutex);
+        /* Audio is now queued directly in process_complete_frame via SDL_QueueAudio */
 
         /* --- Control panel (bottom PANEL_H pixels) – all status & buttons --- */
         p2p_sdl_draw_rect(ren, 0, panel_y, win_w, PANEL_H, 40, 40, 40, 255);
@@ -943,12 +974,8 @@ int main(int argc, char *argv[])
         p2p_sdl_quit();
     }
 
-    p2p_mutex_lock(&ctx->frame_mutex);
-    free(ctx->vframe.y);
-    free(ctx->vframe.u);
-    free(ctx->vframe.v);
-    free(ctx->aframe.samples);
-    p2p_mutex_unlock(&ctx->frame_mutex);
+    if (ctx->video_jitter_inited)
+        p2p_video_jitter_destroy(&ctx->video_jitter);
 
     p2p_mutex_destroy(&ctx->reasm_mutex);
     p2p_mutex_destroy(&ctx->frame_mutex);
