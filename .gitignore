@@ -3,12 +3,10 @@ build_win/
 android
 android_deps
 build_android
-"third_party/mbedtls (新提交)"
 #deploy/
 deploy/client
 deploy/peer
 third_party/xquic/third_party/boringssl/
-third_party/mbedtls
 signaling-server/signaling-server
 .vscode/
 .idea/
