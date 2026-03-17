@@ -35,6 +35,8 @@ typedef enum {
     P2P_SIG_MSG_PEER_LEFT,
     P2P_SIG_MSG_FULL_OFFER,
     P2P_SIG_MSG_FULL_ANSWER,
+    P2P_SIG_MSG_PUBLISHER_READY,
+    P2P_SIG_MSG_REQUEST_OFFER,
 } p2p_sig_msg_type_t;
 
 typedef struct {
@@ -76,6 +78,10 @@ typedef struct {
                                 const char *username, const char *password,
                                 const char *server, uint16_t port,
                                 uint32_t ttl, void *user_data);
+    void (*on_publisher_ready)(p2p_signaling_client_t *client, const char *publisher_id,
+                              void *user_data);
+    void (*on_request_offer)(p2p_signaling_client_t *client, const char *from_peer,
+                            void *user_data);
     void (*on_error)(p2p_signaling_client_t *client, const char *error, void *user_data);
 } p2p_signaling_callbacks_t;
 
@@ -129,6 +135,10 @@ int  p2p_signaling_send_ice_answer(p2p_signaling_client_t *client,
 int  p2p_signaling_send_ice_candidate(p2p_signaling_client_t *client,
                                        const char *to_peer, const char *candidate);
 int  p2p_signaling_send_gathering_done(p2p_signaling_client_t *client, const char *to_peer);
+
+/* Subscriber requests offer from publisher (fallback when peer_joined not received) */
+int  p2p_signaling_send_request_offer(p2p_signaling_client_t *client,
+                                       const char *to_publisher);
 
 /* Batched offer/answer: SDP + all candidates in one POST */
 int  p2p_signaling_send_full_offer(p2p_signaling_client_t *client,

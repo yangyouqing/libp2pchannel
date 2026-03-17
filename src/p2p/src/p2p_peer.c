@@ -588,6 +588,17 @@ static void on_sig_gathering_done(p2p_signaling_client_t *client,
     }
 }
 
+static void on_sig_publisher_ready(p2p_signaling_client_t *client,
+    const char *publisher_id, void *user_data)
+{
+    peer_ctx_t *ctx = (peer_ctx_t *)user_data;
+    (void)ctx;
+    fprintf(stderr, "[peer] publisher_ready: %s, sending request_offer\n", publisher_id);
+    if (publisher_id && p2p_signaling_send_request_offer(client, publisher_id) == 0) {
+        fprintf(stderr, "[peer] request_offer sent to %s\n", publisher_id);
+    }
+}
+
 static void on_sig_disconnected(p2p_signaling_client_t *client, void *user_data)
 {
     fprintf(stderr, "[peer] signaling disconnected\n");
@@ -818,6 +829,7 @@ int main(int argc, char *argv[])
             .on_ice_offer = on_sig_ice_offer,
             .on_ice_candidate = on_sig_ice_candidate,
             .on_gathering_done = on_sig_gathering_done,
+            .on_publisher_ready = on_sig_publisher_ready,
         },
         .user_data = ctx
     };

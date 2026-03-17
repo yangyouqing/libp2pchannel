@@ -137,6 +137,8 @@ static p2p_sig_msg_type_t map_event_type(const char *evt)
     if (strcmp(evt, "turn_credentials") == 0) return P2P_SIG_MSG_TURN_CREDENTIALS;
     if (strcmp(evt, "full_offer")       == 0) return P2P_SIG_MSG_FULL_OFFER;
     if (strcmp(evt, "full_answer")      == 0) return P2P_SIG_MSG_FULL_ANSWER;
+    if (strcmp(evt, "publisher_ready")   == 0) return P2P_SIG_MSG_PUBLISHER_READY;
+    if (strcmp(evt, "request_offer")    == 0) return P2P_SIG_MSG_REQUEST_OFFER;
     if (strcmp(evt, "error")            == 0) return P2P_SIG_MSG_ERROR;
     return P2P_SIG_MSG_HEARTBEAT;
 }
@@ -437,6 +439,22 @@ static void *sse_thread_func(void *arg)
         case P2P_SIG_MSG_FULL_ANSWER:
             dispatch_full_ice(c, type, event_data);
             break;
+        case P2P_SIG_MSG_PUBLISHER_READY:
+        {
+            char pub[P2P_SIG_MAX_PEER_ID] = {0};
+            json_get_string(event_data, "publisher_id", pub, sizeof(pub));
+            if (pub[0] && c->callbacks.on_publisher_ready)
+                c->callbacks.on_publisher_ready(c, pub, c->user_data);
+            break;
+        }
+        case P2P_SIG_MSG_REQUEST_OFFER:
+        {
+            char from[P2P_SIG_MAX_PEER_ID] = {0};
+            json_get_string(event_data, "from", from, sizeof(from));
+            if (from[0] && c->callbacks.on_request_offer)
+                c->callbacks.on_request_offer(c, from, c->user_data);
+            break;
+        }
         case P2P_SIG_MSG_ERROR:
         {
             char err[512] = {0};
@@ -727,6 +745,21 @@ int p2p_signaling_send_gathering_done(p2p_signaling_client_t *c, const char *to_
 
     char body[P2P_SIG_MAX_MSG_SIZE];
     if (build_signal_json(c, "gathering_done", to_peer, c->room_id,
+                          NULL, NULL, 0, body, sizeof(body)) != 0)
+        return -1;
+
+    char resp[P2P_SIG_MAX_MSG_SIZE];
+    int status = post_signal(c, body, resp, sizeof(resp));
+    return (status >= 200 && status < 300) ? 0 : -1;
+}
+
+int p2p_signaling_send_request_offer(p2p_signaling_client_t *c,
+                                       const char *to_publisher)
+{
+    if (!c || !c->connected || !to_publisher) return -1;
+
+    char body[P2P_SIG_MAX_MSG_SIZE];
+    if (build_signal_json(c, "request_offer", to_publisher, c->room_id,
                           NULL, NULL, 0, body, sizeof(body)) != 0)
         return -1;
 

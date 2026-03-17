@@ -85,6 +85,8 @@ func (h *Handler) HandleSignal(w http.ResponseWriter, r *http.Request) {
 		h.handleFullOffer(w, &req)
 	case "full_answer":
 		h.handleFullAnswer(w, &req)
+	case "request_offer":
+		h.handleICEForward(w, &req, "request_offer")
 	default:
 		writeError(w, http.StatusBadRequest, "unknown type: "+req.Type)
 	}
@@ -138,6 +140,13 @@ func (h *Handler) handleJoinRoom(w http.ResponseWriter, req *model.SignalRequest
 		h.publishToPeer(roomMeta.PublisherID, model.SSEEvent{
 			Type: "peer_joined",
 			Data: string(joinedData),
+		})
+
+		// Notify subscriber of publisher so it can request_offer as fallback
+		pubReadyData, _ := json.Marshal(map[string]string{"publisher_id": roomMeta.PublisherID})
+		h.publishToPeer(req.PeerID, model.SSEEvent{
+			Type: "publisher_ready",
+			Data: string(pubReadyData),
 		})
 	}
 

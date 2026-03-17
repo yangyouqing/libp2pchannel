@@ -135,7 +135,7 @@ log "Main project built."
 # ============================================================
 # Step 5: Build Go signaling server -> build/signaling-server
 # ============================================================
-SIGNALING_DIR="$PROJECT_DIR/src/signaling-server"
+SIGNALING_DIR="$PROJECT_DIR/src/signaling_server"
 SIGNALING_BIN="$BUILD_DIR/signaling-server"
 if [[ -f "$SIGNALING_DIR/main.go" ]]; then
     log "Building signaling server..."
