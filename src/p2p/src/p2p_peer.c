@@ -197,9 +197,16 @@ typedef struct {
 
     /* OSD cache: refresh every 500ms */
     uint64_t             last_osd_refresh_us;
+    uint64_t             last_keepalive_us;   /* PING to publisher every 10s */
     char                 osd_line1[80];
     char                 osd_line2[80];
     char                 osd_line3[80];
+
+    /* Full reconnect flag (set from engine thread, handled in main loop) */
+    volatile int         needs_full_reconnect;
+
+    /* Saved signaling config for reconnect */
+    p2p_signaling_config_t saved_sig_config;
 } peer_ctx_t;
 
 static peer_ctx_t g_ctx;
@@ -463,12 +470,26 @@ static void on_data_recv(p2p_peer_ctx_t *peer, const p2p_frame_header_t *hdr,
 
 static void on_ice_state(p2p_peer_ctx_t *peer, p2p_ice_state_t state, void *user_data)
 {
+    peer_ctx_t *ctx = (peer_ctx_t *)user_data;
     fprintf(stderr, "[peer] ICE state -> %d with %s\n", state, peer->peer_id);
 
     if (state == P2P_ICE_STATE_CONNECTED || state == P2P_ICE_STATE_COMPLETED) {
         fprintf(stderr, "[peer] ICE connected with publisher %s (awaiting QUIC)\n",
                 peer->peer_id);
+    } else if (state == P2P_ICE_STATE_FAILED || state == P2P_ICE_STATE_DISCONNECTED) {
+        fprintf(stderr, "[peer] ICE FAILED with %s, will re-join room\n", peer->peer_id);
+        (void)ctx;
     }
+}
+
+static void on_ice_restart_needed(p2p_peer_ctx_t *peer, void *user_data)
+{
+    peer_ctx_t *ctx = (peer_ctx_t *)user_data;
+    fprintf(stderr, "[peer] ICE restart needed for %s, scheduling full reconnect\n",
+            peer->peer_id);
+    peer->needs_removal = 1;
+    memset(ctx->pending_peer_id, 0, sizeof(ctx->pending_peer_id));
+    ctx->needs_full_reconnect = 1;
 }
 
 static void on_quic_connected(p2p_peer_ctx_t *peer, void *user_data)
@@ -497,7 +518,17 @@ static void on_sig_connected(p2p_signaling_client_t *client, void *user_data)
     peer_ctx_t *ctx = (peer_ctx_t *)user_data;
     ctx->signaling_connect_time = p2p_capture_now_us();
     fprintf(stderr, "[peer] signaling connected, joining room %s\n", ctx->room_id);
-    p2p_signaling_join_room(client, ctx->room_id);
+
+    for (int attempt = 0; attempt < 10; attempt++) {
+        if (p2p_signaling_join_room(client, ctx->room_id) == 0)
+            return;
+        int delay = (attempt < 3) ? 2 : 5;
+        fprintf(stderr, "[peer] join_room failed (attempt %d/10), retrying in %ds...\n",
+                attempt + 1, delay);
+        p2p_sleep_ms(delay * 1000);
+    }
+    fprintf(stderr, "[peer] join_room failed after 10 attempts, will retry from main loop\n");
+    ctx->needs_full_reconnect = 1;
 }
 
 static void on_sig_room_created(p2p_signaling_client_t *client,
@@ -761,6 +792,7 @@ int main(int argc, char *argv[])
             .on_peer_ice_gathering_done = on_ice_gathering_done,
             .on_peer_quic_connected = on_quic_connected,
             .on_peer_data_recv = on_data_recv,
+            .on_peer_ice_restart_needed = on_ice_restart_needed,
         },
         .user_data = ctx
     };
@@ -799,6 +831,10 @@ int main(int argc, char *argv[])
         p2p_sdl_quit();
         return 1;
     }
+    ctx->saved_sig_config = scfg;
+    ctx->saved_sig_config.server_url = ctx->signaling_addr;
+    ctx->saved_sig_config.peer_id = ctx->peer_id;
+    ctx->saved_sig_config.token = ctx->token[0] ? ctx->token : NULL;
 
     /* Main loop: SDL event processing + rendering (must run on main thread) */
     ctx->running = 1;
@@ -854,8 +890,33 @@ int main(int argc, char *argv[])
             }
         }
 
-        /* Refresh stats every 500ms */
+        /* Full reconnect: signaling + ICE re-negotiation */
+        if (ctx->needs_full_reconnect) {
+            ctx->needs_full_reconnect = 0;
+            fprintf(stderr, "[peer] performing full signaling reconnect...\n");
+            p2p_signaling_disconnect(&ctx->sig_client);
+            p2p_sleep_ms(1000);
+            memset(&ctx->sig_client, 0, sizeof(ctx->sig_client));
+            int rc = p2p_signaling_connect(&ctx->sig_client, &ctx->saved_sig_config);
+            if (rc != 0) {
+                fprintf(stderr, "[peer] signaling reconnect failed, will retry in 5s\n");
+                ctx->needs_full_reconnect = 1;
+                p2p_sleep_ms(4000);
+            } else {
+                fprintf(stderr, "[peer] signaling reconnected OK\n");
+            }
+        }
+
+        /* Keepalive: send PING to publisher every 10s to prevent idle timeout */
         uint64_t now_us = p2p_capture_now_us();
+        p2p_peer_ctx_t *pub = p2p_engine_find_peer(&ctx->engine, ctx->pending_peer_id);
+        if (pub && pub->state == P2P_PEER_STATE_QUIC_CONNECTED &&
+            (ctx->last_keepalive_us == 0 || now_us - ctx->last_keepalive_us >= 10000000ULL)) {
+            if (p2p_peer_send_ping(pub) == 0)
+                ctx->last_keepalive_us = now_us;
+        }
+
+        /* Refresh stats every 500ms */
         if (now_us - ctx->last_osd_refresh_us >= 500000ULL) {
             ctx->last_osd_refresh_us = now_us;
             struct tm *tm_info;

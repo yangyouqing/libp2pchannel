@@ -19,6 +19,7 @@
 #include "p2p_platform.h"
 #ifndef _WIN32
 #include <signal.h>
+#include <execinfo.h>
 #endif
 #include <libavutil/log.h>
 
@@ -331,6 +332,8 @@ static void on_data_recv(p2p_peer_ctx_t *peer, const p2p_frame_header_t *hdr,
     } else if (hdr->type == P2P_FRAME_TYPE_AUDIO_START) {
         peer->audio_paused = 0;
         fprintf(stderr, "[client] peer %s resumed audio\n", peer->peer_id);
+    } else if (hdr->type == P2P_FRAME_TYPE_PING) {
+        /* Keepalive from subscriber; no-op, ice_on_recv already updated last_ice_recv_us */
     }
 }
 
@@ -366,6 +369,13 @@ static void on_ice_state(p2p_peer_ctx_t *peer, p2p_ice_state_t state, void *user
                 state == P2P_ICE_STATE_FAILED ? "failed" : "disconnected");
         fprintf(stderr, "[client] active peers: %d\n", count_active_peers(ctx));
     }
+}
+
+static void on_ice_restart_needed_pub(p2p_peer_ctx_t *peer, void *user_data)
+{
+    (void)user_data;
+    fprintf(stderr, "[client] ICE restart needed for %s, marking for removal\n", peer->peer_id);
+    peer->needs_removal = 1;
 }
 
 static void on_quic_connected(p2p_peer_ctx_t *peer, void *user_data)
@@ -415,6 +425,13 @@ static void on_sig_peer_joined(p2p_signaling_client_t *client,
 {
     client_ctx_t *ctx = (client_ctx_t *)user_data;
     fprintf(stderr, "[client] subscriber '%s' joined, starting ICE exchange\n", peer_id);
+
+    /* If a stale peer with the same ID exists, remove it first */
+    p2p_peer_ctx_t *old = p2p_engine_find_peer(&ctx->engine, peer_id);
+    if (old) {
+        fprintf(stderr, "[client] removing stale peer '%s' before re-adding\n", peer_id);
+        p2p_engine_remove_peer(&ctx->engine, old->index);
+    }
 
     /* Force next encoded frame to be IDR so cached IDR is fresh for the new peer */
     if (!ctx->no_video && ctx->capture_started)
@@ -491,6 +508,15 @@ static void sig_handler(int sig)
 {
     (void)sig;
     g_ctx.running = 0;
+}
+
+static void crash_handler(int sig)
+{
+    void *bt[32];
+    int n = backtrace(bt, 32);
+    fprintf(stderr, "\n[CRASH] signal %d, backtrace:\n", sig);
+    backtrace_symbols_fd(bt, n, 2);
+    _exit(128 + sig);
 }
 #endif
 
@@ -604,6 +630,8 @@ int main(int argc, char *argv[])
 #else
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
+    signal(SIGSEGV, crash_handler);
+    signal(SIGABRT, crash_handler);
 #endif
     p2p_mutex_init(&ctx->idr_mutex);
 
@@ -634,6 +662,7 @@ int main(int argc, char *argv[])
             .on_peer_ice_gathering_done = on_ice_gathering_done,
             .on_peer_quic_connected = on_quic_connected,
             .on_peer_data_recv = on_data_recv,
+            .on_peer_ice_restart_needed = on_ice_restart_needed_pub,
         },
         .user_data = ctx
     };

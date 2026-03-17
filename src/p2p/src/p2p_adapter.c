@@ -140,6 +140,14 @@ static int xqc_conn_create_notify_cb(xqc_connection_t *conn,
 {
     p2p_peer_ctx_t *peer = (p2p_peer_ctx_t *)conn_user_data;
     if (peer) {
+        if (peer->xqc_conn && peer->xqc_conn != conn) {
+            fprintf(stderr, "[p2p] new conn for %s, old conn will time out naturally\n",
+                    peer->peer_id);
+        }
+        peer->ctrl_stream = NULL;
+        peer->last_ice_recv_us = 0;
+        peer->cid = *cid;
+        __sync_synchronize();
         peer->xqc_conn = conn;
         xqc_conn_set_pkt_filter_callback(conn, xqc_pkt_filter_cb, peer);
         xqc_datagram_set_user_data(conn, peer);
@@ -151,10 +159,54 @@ static int xqc_conn_close_notify_cb(xqc_connection_t *conn,
     const xqc_cid_t *cid, void *conn_user_data, void *conn_proto_data)
 {
     p2p_peer_ctx_t *peer = (p2p_peer_ctx_t *)conn_user_data;
-    if (peer) {
-        peer->ctrl_stream = NULL;
+    if (!peer) return 0;
+
+    if (peer->xqc_conn == conn) {
+        /* Set state BEFORE nulling xqc_conn to prevent capture thread
+         * from passing state check then using a stale conn pointer */
+        int ice_alive = 0;
+        if (peer->ice_agent) {
+            juice_state_t js = juice_get_state((juice_agent_t *)peer->ice_agent);
+            ice_alive = (js == JUICE_STATE_CONNECTED || js == JUICE_STATE_COMPLETED);
+        }
+
+        if (ice_alive) {
+            peer->state = P2P_PEER_STATE_ICE_CONNECTED;
+            __sync_synchronize();
+            peer->xqc_conn = NULL;
+            peer->ctrl_stream = NULL;
+            peer->quic_restart_fail_count++;
+            if (peer->engine && peer->engine->role == P2P_ROLE_SUBSCRIBER) {
+                if (peer->quic_restart_fail_count > 3) {
+                    fprintf(stderr, "[p2p] QUIC failed %d times with %s, escalating to ICE restart\n",
+                            peer->quic_restart_fail_count, peer->peer_id);
+                    peer->needs_ice_restart = 1;
+                    peer->needs_quic_restart = 0;
+                    peer->quic_restart_fail_count = 0;
+                } else {
+                    peer->needs_quic_restart = 1;
+                    fprintf(stderr, "[p2p] QUIC closed with %s, ICE alive, will reconnect QUIC (attempt %d)\n",
+                            peer->peer_id, peer->quic_restart_fail_count);
+                }
+            } else {
+                fprintf(stderr, "[p2p] QUIC closed with %s (server waits for reconnect)\n",
+                        peer->peer_id);
+            }
+        } else {
+            peer->state = P2P_PEER_STATE_FAILED;
+            __sync_synchronize();
+            peer->xqc_conn = NULL;
+            peer->ctrl_stream = NULL;
+            peer->needs_quic_restart = 0;
+            peer->needs_ice_restart = 1;
+            fprintf(stderr, "[p2p] QUIC closed with %s, ICE dead, need full reconnect\n",
+                    peer->peer_id);
+        }
         if (peer->engine && peer->engine->callbacks.on_peer_quic_closed)
             peer->engine->callbacks.on_peer_quic_closed(peer, peer->engine->user_data);
+    } else {
+        fprintf(stderr, "[p2p] stale QUIC conn closed for %s (superseded)\n",
+                peer->peer_id);
     }
     return 0;
 }
@@ -165,6 +217,8 @@ static void xqc_conn_handshake_finished_cb(xqc_connection_t *conn,
     p2p_peer_ctx_t *peer = (p2p_peer_ctx_t *)conn_user_data;
     if (!peer) return;
     peer->state = P2P_PEER_STATE_QUIC_CONNECTED;
+    peer->last_ice_recv_us = p2p_now_us();
+    peer->quic_restart_fail_count = 0;
     fprintf(stderr, "[p2p] QUIC handshake finished with peer %s\n", peer->peer_id);
     if (peer->engine && peer->engine->callbacks.on_peer_quic_connected)
         peer->engine->callbacks.on_peer_quic_connected(peer, peer->engine->user_data);
@@ -342,10 +396,17 @@ static void ice_on_recv(juice_agent_t *agent, const char *data, size_t size, voi
     p2p_peer_ctx_t *peer = (p2p_peer_ctx_t *)user_ptr;
     if (!peer || !peer->engine) return;
 
-    fprintf(stderr, "[p2p-dbg] ice_on_recv: peer=%s size=%zu first_byte=0x%02x ice_state=%d\n",
-            peer->peer_id, size, (unsigned)(unsigned char)data[0], peer->state);
-    p2p_packet_queue_push(&peer->engine->recv_queue,
-                          (const uint8_t *)data, size, p2p_now_us(), peer->index);
+    uint64_t now = p2p_now_us();
+    if (size > 0)
+        peer->last_ice_recv_us = now;  /* any packet = peer alive (STUN, QUIC, etc.) */
+    int ret = p2p_packet_queue_push(&peer->engine->recv_queue,
+                                    (const uint8_t *)data, size, now, peer->index);
+    if (ret < 0) {
+        static int drop_cnt = 0;
+        if (++drop_cnt % 500 == 1)
+            fprintf(stderr, "[p2p] recv_queue FULL, dropped %d packets so far (peer=%s)\n",
+                    drop_cnt, peer->peer_id);
+    }
 }
 
 /* ---------- xquic engine thread ---------- */
@@ -358,14 +419,8 @@ static void process_recv_queue(p2p_engine_t *eng)
         if (pkt.agent_idx < 0 || pkt.agent_idx >= P2P_MAX_SUBSCRIBERS)
             continue;
         p2p_peer_ctx_t *peer = &eng->peers[pkt.agent_idx];
-        if (peer->state < P2P_PEER_STATE_ICE_CONNECTED) {
-            fprintf(stderr, "[p2p-dbg] dropping pkt: peer=%s state=%d (ICE not completed)\n",
-                    peer->peer_id, peer->state);
+        if (peer->state < P2P_PEER_STATE_ICE_CONNECTED)
             continue;
-        }
-        fprintf(stderr, "[p2p-dbg] process_recv: peer=%s size=%zu recv_time=%llu first_byte=0x%02x\n",
-                peer->peer_id, pkt.size, (unsigned long long)pkt.recv_time_us,
-                (unsigned)pkt.data[0]);
         xqc_engine_packet_process(eng->xqc_engine, pkt.data, pkt.size,
             (struct sockaddr *)&peer->virtual_local_addr, sizeof(peer->virtual_local_addr),
             (struct sockaddr *)&peer->virtual_peer_addr, sizeof(peer->virtual_peer_addr),
@@ -374,6 +429,7 @@ static void process_recv_queue(p2p_engine_t *eng)
     }
     if (batch > 0) {
         xqc_engine_finish_recv(eng->xqc_engine);
+        xqc_engine_main_logic(eng->xqc_engine);
     }
 }
 
@@ -392,18 +448,122 @@ static void process_continue_send(p2p_engine_t *eng)
     }
 }
 
+static void process_quic_restart(p2p_engine_t *eng)
+{
+    for (int i = 0; i < eng->peer_count; i++) {
+        p2p_peer_ctx_t *peer = &eng->peers[i];
+
+        if (peer->needs_ice_restart) {
+            peer->needs_ice_restart = 0;
+            peer->needs_quic_restart = 0;
+            fprintf(stderr, "[p2p] ICE dead for %s, requesting full reconnect via signaling\n",
+                    peer->peer_id);
+            if (eng->callbacks.on_peer_ice_restart_needed)
+                eng->callbacks.on_peer_ice_restart_needed(peer, eng->user_data);
+            continue;
+        }
+
+        if (peer->needs_quic_restart && peer->state == P2P_PEER_STATE_ICE_CONNECTED) {
+            /* Double-check ICE is truly alive before attempting QUIC */
+            if (peer->ice_agent) {
+                juice_state_t js = juice_get_state((juice_agent_t *)peer->ice_agent);
+                if (js != JUICE_STATE_CONNECTED && js != JUICE_STATE_COMPLETED) {
+                    fprintf(stderr, "[p2p] ICE not connected (state=%d) for %s, skip QUIC restart\n",
+                            (int)js, peer->peer_id);
+                    peer->needs_quic_restart = 0;
+                    peer->needs_ice_restart = 1;
+                    continue;
+                }
+            }
+            peer->needs_quic_restart = 0;
+            fprintf(stderr, "[p2p] attempting QUIC reconnect with %s\n", peer->peer_id);
+            if (p2p_peer_start_quic(peer) != 0)
+                fprintf(stderr, "[p2p] QUIC reconnect failed for %s\n", peer->peer_id);
+        }
+    }
+}
+
+#define P2P_MANUAL_IDLE_TIMEOUT_US  (60ULL * 1000000)  /* 60s: avoid false timeout when sub has no packet loss */
+
+static void process_manual_idle_check(p2p_engine_t *eng)
+{
+    if (eng->role != P2P_ROLE_PUBLISHER) return;
+    uint64_t now = p2p_now_us();
+    static uint64_t last_dbg = 0;
+    int do_dbg = (now - last_dbg > 3000000);
+    if (do_dbg) last_dbg = now;
+    for (int i = 0; i < eng->peer_count; i++) {
+        p2p_peer_ctx_t *peer = &eng->peers[i];
+        if (do_dbg && peer->peer_id[0])
+            fprintf(stderr, "[idle-dbg] %s state=%d conn=%p last=%llu now=%llu\n",
+                    peer->peer_id, peer->state, (void*)peer->xqc_conn,
+                    (unsigned long long)peer->last_ice_recv_us, (unsigned long long)now);
+        if (peer->state != P2P_PEER_STATE_QUIC_CONNECTED || !peer->xqc_conn)
+            continue;
+        uint64_t last = peer->last_ice_recv_us;
+        if (last == 0 || last > now)
+            continue;
+        uint64_t elapsed = now - last;
+        if (elapsed > P2P_MANUAL_IDLE_TIMEOUT_US) {
+            fprintf(stderr, "[p2p] manual idle timeout for %s (no data for %llums), closing\n",
+                    peer->peer_id, (unsigned long long)(elapsed / 1000));
+            xqc_conn_close(eng->xqc_engine, &peer->cid);
+            peer->xqc_conn = NULL;
+            peer->ctrl_stream = NULL;
+            peer->state = P2P_PEER_STATE_ICE_CONNECTED;
+            peer->last_ice_recv_us = 0;
+        }
+    }
+}
+
 static void *engine_thread_func(void *arg)
 {
     p2p_engine_t *eng = (p2p_engine_t *)arg;
+    uint64_t last_main_logic_us = 0;
     while (eng->engine_running) {
+        static uint64_t loop_dbg = 0;
+        uint64_t loop_now = p2p_now_us();
+        if (loop_now - loop_dbg > 5000000) {
+            loop_dbg = loop_now;
+            fprintf(stderr, "[loop-dbg] alive t=%llu\n", (unsigned long long)loop_now);
+        }
         process_recv_queue(eng);
         process_continue_send(eng);
+        process_manual_idle_check(eng);
+        process_quic_restart(eng);
+
+        /* Flush queued datagrams (enqueued by capture thread) */
+        for (int i = 0; i < P2P_MAX_SUBSCRIBERS; i++) {
+            p2p_peer_ctx_t *p = &eng->peers[i];
+            if (p->xqc_conn && p->state == P2P_PEER_STATE_QUIC_CONNECTED
+                && p->send_queue.count > 0)
+                p2p_peer_flush_send_queue(p);
+        }
+
+        /* Deferred peer removal (safe point after all iteration) */
+        for (int i = 0; i < P2P_MAX_SUBSCRIBERS; i++) {
+            if (eng->peers[i].needs_removal) {
+                eng->peers[i].needs_removal = 0;
+                fprintf(stderr, "[p2p] deferred removal of peer %s (idx %d)\n",
+                        eng->peers[i].peer_id, i);
+                p2p_engine_remove_peer(eng, i);
+            }
+        }
 
         p2p_mutex_lock(&eng->timer_mutex);
         uint64_t now = p2p_now_us();
+
+        int run_main = 0;
         if (eng->next_wakeup_us > 0 && now >= eng->next_wakeup_us) {
             eng->next_wakeup_us = 0;
+            run_main = 1;
+        }
+        if (now - last_main_logic_us >= 5000) {
+            run_main = 1;
+        }
+        if (run_main) {
             p2p_mutex_unlock(&eng->timer_mutex);
+            last_main_logic_us = now;
             xqc_engine_main_logic(eng->xqc_engine);
             continue;
         }
@@ -541,8 +701,9 @@ int p2p_engine_init(p2p_engine_t *eng, const p2p_engine_config_t *config)
         srv_settings.cc_params.customize_on = 1;
         srv_settings.cc_params.init_cwnd = 32;
         srv_settings.cc_params.min_cwnd = 4;
-        srv_settings.idle_time_out = 30000;
-        srv_settings.init_idle_time_out = 10000;
+        srv_settings.idle_time_out = 120000;
+        srv_settings.init_idle_time_out = 120000;
+        srv_settings.sndq_packets_used_max = 200000;
         xqc_server_set_conn_settings(eng->xqc_engine, &srv_settings);
     }
 
@@ -747,6 +908,10 @@ int p2p_peer_flush_send_queue(p2p_peer_ctx_t *peer)
     p2p_dgram_send_queue_t *q = &peer->send_queue;
     p2p_mutex_lock(&q->mutex);
     while (q->count > 0) {
+        if (!peer->xqc_conn) {
+            p2p_mutex_unlock(&q->mutex);
+            return -1;
+        }
         p2p_dgram_entry_t *e = &q->entries[q->head];
         uint64_t dgram_id = 0;
         xqc_int_t ret = xqc_datagram_send(peer->xqc_conn, e->data, e->len,
@@ -770,15 +935,7 @@ static int enqueue_dgram(p2p_peer_ctx_t *peer, const uint8_t *data, uint16_t len
     p2p_dgram_send_queue_t *q = &peer->send_queue;
     p2p_mutex_lock(&q->mutex);
 
-    /* Try direct send first */
-    uint64_t dgram_id = 0;
-    xqc_int_t ret = xqc_datagram_send(peer->xqc_conn, (void *)data, len,
-                                       &dgram_id, (xqc_data_qos_level_t)qos);
-    if (ret == 0) {
-        p2p_mutex_unlock(&q->mutex);
-        return 0;
-    }
-    if (ret != -XQC_EAGAIN) {
+    if (!peer->xqc_conn || peer->state != P2P_PEER_STATE_QUIC_CONNECTED) {
         p2p_mutex_unlock(&q->mutex);
         return -1;
     }
@@ -802,10 +959,13 @@ int p2p_peer_send_data_via_quic(p2p_peer_ctx_t *peer, uint8_t type, uint8_t flag
                                 uint32_t seq, uint64_t timestamp_us,
                                 const uint8_t *payload, uint32_t payload_len)
 {
-    if (!peer || !peer->xqc_conn) return -1;
+    if (!peer) return -1;
     if (peer->state != P2P_PEER_STATE_QUIC_CONNECTED) return -1;
+    __sync_synchronize();
+    xqc_connection_t *conn = peer->xqc_conn;
+    if (!conn) return -1;
 
-    size_t mss = xqc_datagram_get_mss(peer->xqc_conn);
+    size_t mss = xqc_datagram_get_mss(conn);
     if (mss == 0) {
         /* Peer doesn't support DATAGRAM, fall back to legacy */
         return p2p_peer_send_data(peer, type, flags, seq, timestamp_us, payload, payload_len);
@@ -905,8 +1065,9 @@ int p2p_peer_send_data(p2p_peer_ctx_t *peer, uint8_t type, uint8_t flags,
 
 static int p2p_peer_send_control_reliable(p2p_peer_ctx_t *peer, uint8_t type)
 {
-    if (!peer || !peer->xqc_conn) return -1;
-    if (peer->state < P2P_PEER_STATE_QUIC_CONNECTED ||
+    if (!peer) return -1;
+    xqc_connection_t *conn = peer->xqc_conn;
+    if (!conn || peer->state < P2P_PEER_STATE_QUIC_CONNECTED ||
         peer->state >= P2P_PEER_STATE_FAILED) return -1;
 
     /* Create control stream on first use */
@@ -954,6 +1115,9 @@ int p2p_peer_send_audio_stop(p2p_peer_ctx_t *peer)
 int p2p_peer_send_audio_start(p2p_peer_ctx_t *peer)
 { return p2p_peer_send_control_reliable(peer, P2P_FRAME_TYPE_AUDIO_START); }
 
+int p2p_peer_send_ping(p2p_peer_ctx_t *peer)
+{ return p2p_peer_send_control_reliable(peer, P2P_FRAME_TYPE_PING); }
+
 /* ---- QUIC connection ---- */
 
 int p2p_peer_start_quic(p2p_peer_ctx_t *peer)
@@ -978,8 +1142,9 @@ int p2p_peer_start_quic(p2p_peer_ctx_t *peer)
         settings.cc_params.customize_on = 1;
         settings.cc_params.init_cwnd = 32;
         settings.cc_params.min_cwnd = 4;
-        settings.idle_time_out = 30000;
-        settings.init_idle_time_out = 10000;
+        settings.idle_time_out = 15000;
+        settings.init_idle_time_out = 15000;
+        settings.sndq_packets_used_max = 200000;
 
         xqc_conn_ssl_config_t conn_ssl;
         memset(&conn_ssl, 0, sizeof(conn_ssl));

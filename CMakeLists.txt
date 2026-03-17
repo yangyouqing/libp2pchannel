@@ -29,6 +29,7 @@ set(XQUIC_SRC_DIR "${CMAKE_SOURCE_DIR}/third_party/xquic" CACHE PATH
 if(BUILD_LIBJUICE)
     set(NO_TESTS ON CACHE BOOL "" FORCE)
     set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    set(DISABLE_CONSENT_FRESHNESS OFF CACHE BOOL "Re-enable ICE consent freshness to detect path failures" FORCE)
     add_subdirectory(third_party/libjuice)
 endif()
 

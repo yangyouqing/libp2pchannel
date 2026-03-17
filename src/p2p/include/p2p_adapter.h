@@ -29,6 +29,7 @@ extern "C" {
 #define P2P_FRAME_TYPE_VIDEO_START  0x06
 #define P2P_FRAME_TYPE_AUDIO_STOP   0x07
 #define P2P_FRAME_TYPE_AUDIO_START  0x08
+#define P2P_FRAME_TYPE_PING         0x09
 #define P2P_FRAME_FLAG_KEY    0x01
 
 typedef struct __attribute__((packed)) {
@@ -123,6 +124,25 @@ typedef struct p2p_peer_ctx_s {
     /* Set by ICE callback when ICE connects; cleared by engine thread */
     volatile int            needs_continue_send;
 
+    /* Set when QUIC is closed by idle timeout; engine thread will reconnect */
+    volatile int            needs_quic_restart;
+
+    /* Set when both QUIC and ICE are dead; app must re-negotiate via signaling */
+    volatile int            needs_ice_restart;
+
+    /* Set by callback to defer peer removal to engine thread's safe point */
+    volatile int            needs_removal;
+
+    /* Consecutive QUIC reconnect failures (escalates to ICE restart) */
+    int                     quic_restart_fail_count;
+
+    /* Stale CID to close (deferred from callback to engine thread) */
+    xqc_cid_t               stale_cid;
+    volatile int            needs_stale_close;
+
+    /* Timestamp of last received ICE packet (microseconds) for manual idle check */
+    volatile uint64_t       last_ice_recv_us;
+
     /* Datagram send queue for pacing */
     p2p_dgram_send_queue_t  send_queue;
 } p2p_peer_ctx_t;
@@ -138,6 +158,7 @@ typedef struct {
     void (*on_peer_quic_closed)(p2p_peer_ctx_t *peer, void *user_data);
     void (*on_peer_data_recv)(p2p_peer_ctx_t *peer, const p2p_frame_header_t *hdr,
                               const uint8_t *payload, void *user_data);
+    void (*on_peer_ice_restart_needed)(p2p_peer_ctx_t *peer, void *user_data);
 } p2p_adapter_callbacks_t;
 
 typedef struct {
@@ -249,6 +270,7 @@ int  p2p_peer_send_video_stop(p2p_peer_ctx_t *peer);
 int  p2p_peer_send_video_start(p2p_peer_ctx_t *peer);
 int  p2p_peer_send_audio_stop(p2p_peer_ctx_t *peer);
 int  p2p_peer_send_audio_start(p2p_peer_ctx_t *peer);
+int  p2p_peer_send_ping(p2p_peer_ctx_t *peer);
 
 /* ---- Video Jitter Buffer (used by receiver) ---- */
 
