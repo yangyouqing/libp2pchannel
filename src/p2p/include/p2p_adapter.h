@@ -124,6 +124,9 @@ typedef struct p2p_peer_ctx_s {
     /* Set by ICE callback when ICE connects; cleared by engine thread */
     volatile int            needs_continue_send;
 
+    /* Set by ICE COMPLETED callback; engine thread will call p2p_peer_start_quic */
+    volatile int            needs_quic_start;
+
     /* Set when QUIC is closed by idle timeout; engine thread will reconnect */
     volatile int            needs_quic_restart;
 

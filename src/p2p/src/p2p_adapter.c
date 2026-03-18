@@ -361,7 +361,8 @@ static void ice_on_state_changed(juice_agent_t *agent, juice_state_t state, void
     case JUICE_STATE_COMPLETED:
         if (peer->state < P2P_PEER_STATE_ICE_CONNECTED)
             peer->state = P2P_PEER_STATE_ICE_CONNECTED;
-        p2p_peer_start_quic(peer);
+        /* Defer xqc_connect to engine thread (xquic is not thread-safe) */
+        peer->needs_quic_start = 1;
         schedule_continue_send(peer);
         break;
     case JUICE_STATE_FAILED:
@@ -451,6 +452,20 @@ static void process_continue_send(p2p_engine_t *eng)
     }
 }
 
+static void process_quic_start(p2p_engine_t *eng)
+{
+    for (int i = 0; i < eng->peer_count; i++) {
+        p2p_peer_ctx_t *peer = &eng->peers[i];
+        if (!peer->needs_quic_start)
+            continue;
+        peer->needs_quic_start = 0;
+        if (peer->state < P2P_PEER_STATE_ICE_CONNECTED)
+            continue;
+        if (p2p_peer_start_quic(peer) != 0)
+            fprintf(stderr, "[p2p] QUIC start failed for %s\n", peer->peer_id);
+    }
+}
+
 static void process_quic_restart(p2p_engine_t *eng)
 {
     for (int i = 0; i < eng->peer_count; i++) {
@@ -531,6 +546,7 @@ static void *engine_thread_func(void *arg)
             fprintf(stderr, "[loop-dbg] alive t=%llu\n", (unsigned long long)loop_now);
         }
         process_recv_queue(eng);
+        process_quic_start(eng);
         process_continue_send(eng);
         process_manual_idle_check(eng);
         process_quic_restart(eng);
