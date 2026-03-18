@@ -62,8 +62,6 @@ static ssize_t xqc_write_socket_cb(const unsigned char *buf, size_t size,
     int ret = juice_send((juice_agent_t *)peer->ice_agent, (const char *)buf, size);
     if (ret == JUICE_ERR_SUCCESS)
         return (ssize_t)size;
-    fprintf(stderr, "[p2p-dbg] write_socket EAGAIN: peer=%s size=%zu juice_ret=%d\n",
-            peer->peer_id, size, ret);
     schedule_continue_send(peer);
     return XQC_SOCKET_EAGAIN;
 }
@@ -78,8 +76,6 @@ static ssize_t xqc_pkt_filter_cb(const unsigned char *buf, size_t size,
     int ret = juice_send((juice_agent_t *)peer->ice_agent, (const char *)buf, size);
     if (ret == JUICE_ERR_SUCCESS)
         return (ssize_t)size;
-    fprintf(stderr, "[p2p-dbg] pkt_filter EAGAIN: peer=%s size=%zu juice_ret=%d\n",
-            peer->peer_id, size, ret);
     schedule_continue_send(peer);
     return XQC_SOCKET_EAGAIN;
 }
@@ -131,8 +127,14 @@ static void xqc_log_write_cb(xqc_log_level_t lvl, const void *buf,
     size_t size, void *engine_user_data)
 {
     const char *level_str[] = {"RPT", "FAT", "ERR", "WRN", "STA", "INF", "DBG"};
-    if (lvl <= XQC_LOG_INFO)
-        fprintf(stderr, "[xquic][%s] %.*s\n", level_str[lvl], (int)size, (const char *)buf);
+    if (lvl > XQC_LOG_INFO)
+        return;
+    if (lvl == XQC_LOG_ERROR) {
+        const char *s = (const char *)buf;
+        if (memmem(s, size, "pkt_filter_cb", 13) || memmem(s, size, "write_socket", 12))
+            return;
+    }
+    fprintf(stderr, "[xquic][%s] %.*s\n", level_str[lvl], (int)size, (const char *)buf);
 }
 
 static int xqc_conn_create_notify_cb(xqc_connection_t *conn,
@@ -352,8 +354,9 @@ static void ice_on_state_changed(juice_agent_t *agent, juice_state_t state, void
         peer->state = P2P_PEER_STATE_ICE_CONNECTING;
         break;
     case JUICE_STATE_CONNECTED:
-        if (peer->state < P2P_PEER_STATE_ICE_CONNECTING)
-            peer->state = P2P_PEER_STATE_ICE_CONNECTING;
+        if (peer->state < P2P_PEER_STATE_ICE_CONNECTED)
+            peer->state = P2P_PEER_STATE_ICE_CONNECTED;
+        schedule_continue_send(peer);
         break;
     case JUICE_STATE_COMPLETED:
         if (peer->state < P2P_PEER_STATE_ICE_CONNECTED)
@@ -419,7 +422,7 @@ static void process_recv_queue(p2p_engine_t *eng)
         if (pkt.agent_idx < 0 || pkt.agent_idx >= P2P_MAX_SUBSCRIBERS)
             continue;
         p2p_peer_ctx_t *peer = &eng->peers[pkt.agent_idx];
-        if (peer->state < P2P_PEER_STATE_ICE_CONNECTED)
+        if (peer->state < P2P_PEER_STATE_ICE_CONNECTING)
             continue;
         xqc_engine_packet_process(eng->xqc_engine, pkt.data, pkt.size,
             (struct sockaddr *)&peer->virtual_local_addr, sizeof(peer->virtual_local_addr),
@@ -1144,7 +1147,7 @@ int p2p_peer_start_quic(p2p_peer_ctx_t *peer)
         settings.cc_params.init_cwnd = 32;
         settings.cc_params.min_cwnd = 4;
         settings.idle_time_out = 15000;
-        settings.init_idle_time_out = 15000;
+        settings.init_idle_time_out = 3000;
         settings.sndq_packets_used_max = 200000;
 
         xqc_conn_ssl_config_t conn_ssl;

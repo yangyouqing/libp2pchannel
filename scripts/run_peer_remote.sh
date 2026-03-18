@@ -79,20 +79,24 @@ info "Room:      $ROOM_ID"
 info "Peer ID:   $PEER_ID"
 echo ""
 
-info "Checking signaling health..."
-HEALTH=$(curl -sk --connect-timeout 5 "https://${SIGNALING}/health" 2>/dev/null || echo "{}")
-if echo "$HEALTH" | grep -q '"status":"ok"'; then
-    pass "Signaling healthy: $HEALTH"
-else
-    fail "Signaling server unreachable at ${SIGNALING}: $HEALTH"
-fi
+info "Checking signaling health & requesting JWT token (parallel)..."
+HEALTH_TMP=$(mktemp)
+curl -sk --connect-timeout 5 "https://${SIGNALING}/health" >"$HEALTH_TMP" 2>/dev/null &
+HEALTH_PID=$!
 
-info "Requesting JWT token..."
 TOKEN_JSON=$(curl -sk --connect-timeout 10 "https://${SIGNALING}/v1/token?peer_id=${PEER_ID}" \
     -H "Authorization: Bearer ${ADMIN_SECRET}" 2>/dev/null)
 TOKEN=$(echo "$TOKEN_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])" 2>/dev/null || true)
 [[ -n "$TOKEN" ]] || fail "Failed to get JWT token: $TOKEN_JSON"
 pass "Token obtained for ${PEER_ID}"
+
+wait $HEALTH_PID || true
+HEALTH=$(cat "$HEALTH_TMP"); rm -f "$HEALTH_TMP"
+if echo "$HEALTH" | grep -q '"status":"ok"'; then
+    pass "Signaling healthy: $HEALTH"
+else
+    fail "Signaling server unreachable at ${SIGNALING}: $HEALTH"
+fi
 
 export LD_LIBRARY_PATH="$BUILD_DIR/src/p2p${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 

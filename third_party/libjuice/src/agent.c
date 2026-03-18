@@ -688,7 +688,7 @@ int agent_send(juice_agent_t *agent, const char *data, size_t size, int ds) {
 	// Try not to lock in the send path
 	agent_stun_entry_t *selected_entry = atomic_load(&agent->selected_entry);
 	if (!selected_entry) {
-		JLOG_ERROR("Send while ICE is not connected");
+		JLOG_DEBUG("Send while ICE is not connected");
 		return -1;
 	}
 

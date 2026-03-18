@@ -1,4 +1,6 @@
 #include "p2p_signaling.h"
+#include "p2p_adapter.h"
+#include "p2p_platform.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -474,6 +476,19 @@ static void *sse_thread_func(void *arg)
 /*  Public API                                                        */
 /* ------------------------------------------------------------------ */
 
+typedef struct {
+    p2p_tls_ctx_t  *ctx;
+    const char     *host;
+    uint16_t        port;
+    p2p_tls_conn_t *result;
+} sig_tls_open_args_t;
+
+static void *sig_tls_open_thread_fn(void *arg) {
+    sig_tls_open_args_t *a = (sig_tls_open_args_t *)arg;
+    a->result = p2p_tls_connect(a->ctx, a->host, a->port);
+    return NULL;
+}
+
 int p2p_signaling_connect(p2p_signaling_client_t *c, const p2p_signaling_config_t *config)
 {
     if (!c || !config || !config->server_url || !config->peer_id) return -1;
@@ -493,32 +508,42 @@ int p2p_signaling_connect(p2p_signaling_client_t *c, const p2p_signaling_config_
     c->user_data = config->user_data;
     p2p_mutex_init(&c->post_mutex);
 
-    /* Create TLS context */
+    uint64_t t0 = p2p_now_us();
+
+    /* Create two independent TLS contexts (thread-safe parallel handshake) */
     c->tls_ctx = p2p_tls_ctx_create();
-    if (!c->tls_ctx) {
+    c->tls_ctx_sse = p2p_tls_ctx_create();
+    if (!c->tls_ctx || !c->tls_ctx_sse) {
         fprintf(stderr, "[sig] TLS context creation failed\n");
+        if (c->tls_ctx) { p2p_tls_ctx_destroy(c->tls_ctx); c->tls_ctx = NULL; }
+        if (c->tls_ctx_sse) { p2p_tls_ctx_destroy(c->tls_ctx_sse); c->tls_ctx_sse = NULL; }
         return -1;
     }
 
-    /* Open POST connection */
+    /* Open POST and SSE TLS connections in parallel */
+    sig_tls_open_args_t sse_args = { c->tls_ctx_sse, c->server_host, c->server_port, NULL };
+    p2p_thread_t tls_open_thread;
+    p2p_thread_create(&tls_open_thread, sig_tls_open_thread_fn, &sse_args);
+
     c->post_conn = p2p_tls_connect(c->tls_ctx, c->server_host, c->server_port);
-    if (!c->post_conn) {
-        fprintf(stderr, "[sig] POST TLS connect to %s:%u failed\n",
-                c->server_host, c->server_port);
-        p2p_tls_ctx_destroy(c->tls_ctx);
-        c->tls_ctx = NULL;
-        return -1;
-    }
 
-    /* Open SSE connection */
-    c->sse_conn = p2p_tls_connect(c->tls_ctx, c->server_host, c->server_port);
-    if (!c->sse_conn) {
-        fprintf(stderr, "[sig] SSE TLS connect to %s:%u failed\n",
-                c->server_host, c->server_port);
-        p2p_tls_close(c->post_conn);
-        c->post_conn = NULL;
-        p2p_tls_ctx_destroy(c->tls_ctx);
-        c->tls_ctx = NULL;
+    p2p_thread_join(tls_open_thread);
+    c->sse_conn = sse_args.result;
+
+    uint64_t t1 = p2p_now_us();
+    fprintf(stderr, "[sig] TLS connect (parallel): %.1fms\n", (t1 - t0) / 1000.0);
+
+    if (!c->post_conn || !c->sse_conn) {
+        if (!c->post_conn)
+            fprintf(stderr, "[sig] POST TLS connect to %s:%u failed\n",
+                    c->server_host, c->server_port);
+        if (!c->sse_conn)
+            fprintf(stderr, "[sig] SSE TLS connect to %s:%u failed\n",
+                    c->server_host, c->server_port);
+        if (c->post_conn) { p2p_tls_close(c->post_conn); c->post_conn = NULL; }
+        if (c->sse_conn)  { p2p_tls_close(c->sse_conn);  c->sse_conn  = NULL; }
+        p2p_tls_ctx_destroy(c->tls_ctx); c->tls_ctx = NULL;
+        p2p_tls_ctx_destroy(c->tls_ctx_sse); c->tls_ctx_sse = NULL;
         return -1;
     }
 
@@ -530,13 +555,19 @@ int p2p_signaling_connect(p2p_signaling_client_t *c, const p2p_signaling_config_
     snprintf(host_hdr, sizeof(host_hdr), "%s:%u", c->server_host, c->server_port);
 
     fprintf(stderr, "[sig] SSE path: %s (token len=%zu)\n", sse_path, strlen(c->token));
+    uint64_t t2 = p2p_now_us();
     if (p2p_https_get_sse(c->sse_conn, host_hdr, sse_path) != 0) {
         fprintf(stderr, "[sig] SSE handshake failed\n");
         p2p_tls_close(c->sse_conn);   c->sse_conn  = NULL;
         p2p_tls_close(c->post_conn);  c->post_conn = NULL;
         p2p_tls_ctx_destroy(c->tls_ctx); c->tls_ctx = NULL;
+        p2p_tls_ctx_destroy(c->tls_ctx_sse); c->tls_ctx_sse = NULL;
         return -1;
     }
+
+    uint64_t t3 = p2p_now_us();
+    fprintf(stderr, "[sig] SSE GET: %.1fms  total connect: %.1fms\n",
+            (t3 - t2) / 1000.0, (t3 - t0) / 1000.0);
 
     c->connected = 1;
     c->running   = 1;
@@ -559,8 +590,16 @@ int p2p_signaling_connect(p2p_signaling_client_t *c, const p2p_signaling_config_
         p2p_tls_close(c->sse_conn);   c->sse_conn  = NULL;
         p2p_tls_close(c->post_conn);  c->post_conn = NULL;
         p2p_tls_ctx_destroy(c->tls_ctx); c->tls_ctx = NULL;
+        p2p_tls_ctx_destroy(c->tls_ctx_sse); c->tls_ctx_sse = NULL;
         return -1;
     }
+
+    /* Fire on_connected BEFORE starting SSE reader so that
+     * join_room (sync POST) completes without contention.
+     * Server-pushed events (publisher_ready etc.) will be buffered
+     * in the TLS read buffer and read immediately by the SSE thread. */
+    if (c->callbacks.on_connected)
+        c->callbacks.on_connected(c, c->user_data);
 
     /* Start SSE reader thread */
     if (p2p_thread_create(&c->sse_thread, sse_thread_func, c) != 0) {
@@ -575,11 +614,9 @@ int p2p_signaling_connect(p2p_signaling_client_t *c, const p2p_signaling_config_
         p2p_tls_close(c->sse_conn);   c->sse_conn  = NULL;
         p2p_tls_close(c->post_conn);  c->post_conn = NULL;
         p2p_tls_ctx_destroy(c->tls_ctx); c->tls_ctx = NULL;
+        p2p_tls_ctx_destroy(c->tls_ctx_sse); c->tls_ctx_sse = NULL;
         return -1;
     }
-
-    if (c->callbacks.on_connected)
-        c->callbacks.on_connected(c, c->user_data);
 
     return 0;
 }
@@ -619,6 +656,10 @@ void p2p_signaling_disconnect(p2p_signaling_client_t *c)
     if (c->tls_ctx) {
         p2p_tls_ctx_destroy(c->tls_ctx);
         c->tls_ctx = NULL;
+    }
+    if (c->tls_ctx_sse) {
+        p2p_tls_ctx_destroy(c->tls_ctx_sse);
+        c->tls_ctx_sse = NULL;
     }
     p2p_mutex_destroy(&c->post_mutex);
     c->connected = 0;

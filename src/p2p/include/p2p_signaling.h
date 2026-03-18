@@ -104,8 +104,9 @@ struct p2p_signaling_client_s {
     int                         connected;
     int                         running;
 
-    /* TLS connections: one for SSE, one for POST */
+    /* TLS connections: one for SSE, one for POST (separate contexts for thread safety) */
     p2p_tls_ctx_t              *tls_ctx;
+    p2p_tls_ctx_t              *tls_ctx_sse;
     p2p_tls_conn_t             *sse_conn;
     p2p_tls_conn_t             *post_conn;
     p2p_mutex_t                 post_mutex;   /* serialize POST requests */

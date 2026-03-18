@@ -281,7 +281,10 @@ static void process_complete_frame(peer_ctx_t *ctx, reasm_buf_t *rb)
             if (!ctx->got_first_frame) {
                 ctx->first_frame_time = p2p_capture_now_us();
                 ctx->got_first_frame = 1;
-                fprintf(stderr, "[peer] first video frame decoded: %dx%d\n", w, h);
+                int first_ms = ctx->signaling_connect_time ?
+                    (int)((ctx->first_frame_time - ctx->signaling_connect_time) / 1000) : -1;
+                fprintf(stderr, "[peer][t=%.3fs] first video frame decoded: %dx%d (first_frame=%dms)\n",
+                        ctx->first_frame_time / 1e6, w, h, first_ms);
             }
 
             if (!ctx->video_jitter_inited) {
@@ -517,11 +520,16 @@ static void on_sig_connected(p2p_signaling_client_t *client, void *user_data)
 {
     peer_ctx_t *ctx = (peer_ctx_t *)user_data;
     ctx->signaling_connect_time = p2p_capture_now_us();
-    fprintf(stderr, "[peer] signaling connected, joining room %s\n", ctx->room_id);
+    fprintf(stderr, "[peer][t=%.3fs] signaling connected, joining room %s\n",
+            ctx->signaling_connect_time / 1e6, ctx->room_id);
 
     for (int attempt = 0; attempt < 10; attempt++) {
-        if (p2p_signaling_join_room(client, ctx->room_id) == 0)
+        uint64_t t0 = p2p_capture_now_us();
+        if (p2p_signaling_join_room(client, ctx->room_id) == 0) {
+            fprintf(stderr, "[peer][t=%.3fs] join_room OK (%.1fms)\n",
+                    p2p_capture_now_us() / 1e6, (p2p_capture_now_us() - t0) / 1000.0);
             return;
+        }
         int delay = (attempt < 3) ? 2 : 5;
         fprintf(stderr, "[peer] join_room failed (attempt %d/10), retrying in %ds...\n",
                 attempt + 1, delay);
@@ -541,7 +549,8 @@ static void on_sig_ice_offer(p2p_signaling_client_t *client,
                              const char *from_peer, const char *sdp, void *user_data)
 {
     peer_ctx_t *ctx = (peer_ctx_t *)user_data;
-    fprintf(stderr, "[peer] got ICE offer from publisher '%s'\n", from_peer);
+    fprintf(stderr, "[peer][t=%.3fs] got ICE offer from publisher '%s'\n",
+            p2p_capture_now_us() / 1e6, from_peer);
 
     p2p_peer_ctx_t *peer = p2p_engine_find_peer(&ctx->engine, from_peer);
     if (!peer) {
@@ -593,9 +602,13 @@ static void on_sig_publisher_ready(p2p_signaling_client_t *client,
 {
     peer_ctx_t *ctx = (peer_ctx_t *)user_data;
     (void)ctx;
-    fprintf(stderr, "[peer] publisher_ready: %s, sending request_offer\n", publisher_id);
+    uint64_t t0 = p2p_capture_now_us();
+    fprintf(stderr, "[peer][t=%.3fs] publisher_ready: %s, sending request_offer\n",
+            t0 / 1e6, publisher_id);
     if (publisher_id && p2p_signaling_send_request_offer(client, publisher_id) == 0) {
-        fprintf(stderr, "[peer] request_offer sent to %s\n", publisher_id);
+        fprintf(stderr, "[peer][t=%.3fs] request_offer sent to %s (%.1fms)\n",
+                p2p_capture_now_us() / 1e6, publisher_id,
+                (p2p_capture_now_us() - t0) / 1000.0);
     }
 }
 
