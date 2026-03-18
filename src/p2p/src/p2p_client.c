@@ -515,6 +515,15 @@ static void on_sig_request_offer(p2p_signaling_client_t *client,
     on_sig_peer_joined(client, from_peer, user_data);
 }
 
+static void on_sig_turn_credentials(p2p_signaling_client_t *client,
+                                    const char *username, const char *password,
+                                    const char *server, uint16_t port,
+                                    uint32_t ttl, void *user_data)
+{
+    client_ctx_t *ctx = (client_ctx_t *)user_data;
+    p2p_engine_update_turn(&ctx->engine, server, port, username, password);
+}
+
 static void on_sig_disconnected(p2p_signaling_client_t *client, void *user_data)
 {
     fprintf(stderr, "[client] signaling disconnected\n");
@@ -706,6 +715,7 @@ int main(int argc, char *argv[])
             .on_ice_answer = on_sig_ice_answer,
             .on_ice_candidate = on_sig_ice_candidate,
             .on_gathering_done = on_sig_gathering_done,
+            .on_turn_credentials = on_sig_turn_credentials,
             .on_request_offer = on_sig_request_offer,
         },
         .user_data = ctx

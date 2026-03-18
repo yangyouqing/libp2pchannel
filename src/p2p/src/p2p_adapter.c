@@ -613,9 +613,13 @@ int p2p_engine_init(p2p_engine_t *eng, const p2p_engine_config_t *config)
         snprintf(eng->stun_host, sizeof(eng->stun_host), "%s", config->stun_server_host);
     eng->stun_port = config->stun_server_port ? config->stun_server_port : 3478;
 
-    if (config->turn_server_host)
+    if (config->turn_server_host) {
         snprintf(eng->turn_host, sizeof(eng->turn_host), "%s", config->turn_server_host);
-    eng->turn_port = config->turn_server_port ? config->turn_server_port : 3478;
+    } else if (config->stun_server_host) {
+        /* Default: use STUN server as TURN server (coturn serves both) */
+        snprintf(eng->turn_host, sizeof(eng->turn_host), "%s", config->stun_server_host);
+    }
+    eng->turn_port = config->turn_server_port ? config->turn_server_port : eng->stun_port;
     if (config->turn_username)
         snprintf(eng->turn_username, sizeof(eng->turn_username), "%s", config->turn_username);
     if (config->turn_password)
@@ -738,6 +742,23 @@ int p2p_engine_start(p2p_engine_t *eng)
         return -1;
     }
     return 0;
+}
+
+void p2p_engine_update_turn(p2p_engine_t *eng,
+                            const char *host, uint16_t port,
+                            const char *username, const char *password)
+{
+    if (!eng) return;
+    if (host && host[0])
+        snprintf(eng->turn_host, sizeof(eng->turn_host), "%s", host);
+    if (port)
+        eng->turn_port = port;
+    if (username)
+        snprintf(eng->turn_username, sizeof(eng->turn_username), "%s", username);
+    if (password)
+        snprintf(eng->turn_password, sizeof(eng->turn_password), "%s", password);
+    fprintf(stderr, "[p2p] TURN updated: %s:%u user=%s\n",
+            eng->turn_host, eng->turn_port, eng->turn_username);
 }
 
 void p2p_engine_stop(p2p_engine_t *eng)

@@ -545,6 +545,15 @@ static void on_sig_room_created(p2p_signaling_client_t *client,
     fprintf(stderr, "[peer] joined room '%s'\n", room_id);
 }
 
+static void on_sig_turn_credentials(p2p_signaling_client_t *client,
+                                    const char *username, const char *password,
+                                    const char *server, uint16_t port,
+                                    uint32_t ttl, void *user_data)
+{
+    peer_ctx_t *ctx = (peer_ctx_t *)user_data;
+    p2p_engine_update_turn(&ctx->engine, server, port, username, password);
+}
+
 static void on_sig_ice_offer(p2p_signaling_client_t *client,
                              const char *from_peer, const char *sdp, void *user_data)
 {
@@ -842,6 +851,7 @@ int main(int argc, char *argv[])
             .on_ice_offer = on_sig_ice_offer,
             .on_ice_candidate = on_sig_ice_candidate,
             .on_gathering_done = on_sig_gathering_done,
+            .on_turn_credentials = on_sig_turn_credentials,
             .on_publisher_ready = on_sig_publisher_ready,
         },
         .user_data = ctx

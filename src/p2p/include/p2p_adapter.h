@@ -230,6 +230,11 @@ void p2p_engine_destroy(p2p_engine_t *engine);
 int  p2p_engine_start(p2p_engine_t *engine);
 void p2p_engine_stop(p2p_engine_t *engine);
 
+/* ---- TURN credentials (can be updated at runtime, e.g. from signaling) ---- */
+void p2p_engine_update_turn(p2p_engine_t *engine,
+                            const char *host, uint16_t port,
+                            const char *username, const char *password);
+
 /* ---- Peer management ---- */
 p2p_peer_ctx_t *p2p_engine_add_peer(p2p_engine_t *engine, const char *peer_id);
 void p2p_engine_remove_peer(p2p_engine_t *engine, int peer_index);
