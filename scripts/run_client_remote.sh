@@ -7,7 +7,7 @@
 #
 # Options:
 #   --server IP            Remote server public IP   (default: 106.54.30.119)
-#   --room ROOM            Room ID                   (default: remote-test)
+#   --room ROOM            Room ID                   (default: random 6-digit)
 #   --peer-id ID           Publisher peer ID          (default: pub1)
 #   --video-dev DEV        V4L2 video device          (default: auto-detect)
 #   --audio-dev DEV        ALSA audio device          (default: default)
@@ -25,7 +25,7 @@ BUILD_DIR="$PROJECT_DIR/build"
 SERVER_IP="106.54.30.119"
 SIGNALING_PORT="30443"
 STUN_PORT="3478"
-ROOM_ID="remote-test"
+ROOM_ID=""
 PEER_ID="pub1"
 ADMIN_SECRET="MOTMaqfVspj7DQvWKlTCIdih"
 DURATION=0
@@ -65,6 +65,12 @@ done
 
 [[ -z "$VIDEO_DEV" ]] && VIDEO_DEV=$(detect_video)
 
+# Random 6-digit room_id if not specified
+if [[ -z "$ROOM_ID" ]]; then
+    ROOM_ID=$(printf "%06d" $((RANDOM % 1000000)))
+    info "Generated random room: $ROOM_ID"
+fi
+
 SIGNALING="${SERVER_IP}:${SIGNALING_PORT}"
 STUN="${SERVER_IP}:${STUN_PORT}"
 LOG_DIR="$BUILD_DIR/k8s_test_logs"
@@ -86,10 +92,13 @@ echo ""
 echo "========================================"
 echo "  P2P Client (Publisher) -> Remote K8s"
 echo "========================================"
+echo ""
+echo -e "  ${GREEN}>>> Room ID: $ROOM_ID <<<${NC}  (share this with subscriber)"
+echo ""
 info "Server:    $SERVER_IP"
 info "Signaling: $SIGNALING"
 info "STUN/TURN: $STUN"
-info "Room:      $ROOM_ID"
+info "Room:      $ROOM_ID  (tell subscriber to enter this)"
 info "Peer ID:   $PEER_ID"
 info "Video:     $VIDEO_DEV"
 info "Audio:     $AUDIO_DEV"

@@ -7,7 +7,7 @@
 #
 # Options:
 #   --server IP            Remote server public IP   (default: 106.54.30.119)
-#   --room ROOM            Room ID                   (default: remote-test)
+#   --room ROOM            Room ID                   (default: prompt for input)
 #   --peer-id ID           Subscriber peer ID         (default: sub1)
 #   --admin-secret SECRET  Admin secret for JWT token
 #   --duration SEC         Run duration in seconds    (default: 0 = infinite)
@@ -23,7 +23,7 @@ BUILD_DIR="$PROJECT_DIR/build"
 SERVER_IP="106.54.30.119"
 SIGNALING_PORT="30443"
 STUN_PORT="3478"
-ROOM_ID="remote-test"
+ROOM_ID=""
 PEER_ID="sub1"
 ADMIN_SECRET="MOTMaqfVspj7DQvWKlTCIdih"
 DURATION=0
@@ -46,6 +46,18 @@ while [[ $# -gt 0 ]]; do
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+# Prompt for room number if not specified
+if [[ -z "$ROOM_ID" ]]; then
+    echo ""
+    if [[ -t 0 ]]; then
+        read -p "Enter room number (6 digits, from publisher): " ROOM_ID
+    fi
+    ROOM_ID=$(echo "$ROOM_ID" | tr -d '[:space:]')
+    if [[ -z "$ROOM_ID" ]]; then
+        fail "Room number required. Use --room ROOM or run interactively."
+    fi
+fi
 
 SIGNALING="${SERVER_IP}:${SIGNALING_PORT}"
 STUN="${SERVER_IP}:${STUN_PORT}"
