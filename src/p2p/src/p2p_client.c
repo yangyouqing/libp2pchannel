@@ -426,10 +426,16 @@ static void on_sig_peer_joined(p2p_signaling_client_t *client,
     client_ctx_t *ctx = (client_ctx_t *)user_data;
     fprintf(stderr, "[client] subscriber '%s' joined, starting ICE exchange\n", peer_id);
 
-    /* If a stale peer with the same ID exists, remove it first */
     p2p_peer_ctx_t *old = p2p_engine_find_peer(&ctx->engine, peer_id);
     if (old) {
-        fprintf(stderr, "[client] removing stale peer '%s' before re-adding\n", peer_id);
+        uint64_t age_us = p2p_now_us() - old->created_us;
+        if (age_us < 10000000ULL && old->state < P2P_PEER_STATE_FAILED) {
+            fprintf(stderr, "[client] ignoring duplicate join for '%s' (age=%.1fs, state=%d)\n",
+                    peer_id, age_us / 1e6, old->state);
+            return;
+        }
+        fprintf(stderr, "[client] removing stale peer '%s' before re-adding (age=%.1fs)\n",
+                peer_id, age_us / 1e6);
         p2p_engine_remove_peer(&ctx->engine, old->index);
     }
 
@@ -499,7 +505,13 @@ static void on_sig_peer_left(p2p_signaling_client_t *client,
 static void on_sig_request_offer(p2p_signaling_client_t *client,
                                  const char *from_peer, void *user_data)
 {
-    /* Fallback when peer_joined was not received - treat like peer_joined */
+    client_ctx_t *ctx = (client_ctx_t *)user_data;
+    p2p_peer_ctx_t *existing = p2p_engine_find_peer(&ctx->engine, from_peer);
+    if (existing && existing->state < P2P_PEER_STATE_FAILED) {
+        fprintf(stderr, "[client] request_offer from %s ignored (ICE already in progress, state=%d)\n",
+                from_peer, existing->state);
+        return;
+    }
     on_sig_peer_joined(client, from_peer, user_data);
 }
 

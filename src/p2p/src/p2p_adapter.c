@@ -813,6 +813,7 @@ p2p_peer_ctx_t *p2p_engine_add_peer(p2p_engine_t *eng, const char *peer_id)
                 tcp_mode == JUICE_ICE_TCP_MODE_PASSIVE ? "passive" : "active", peer_id);
     }
 
+    peer->created_us = p2p_now_us();
     eng->peer_count++;
     return peer;
 }

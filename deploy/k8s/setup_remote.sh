@@ -17,6 +17,7 @@ info()  { echo -e "\033[0;36m[setup]\033[0m $1"; }
 pass()  { echo -e "\033[0;32m[  OK ]\033[0m $1"; }
 fail()  { echo -e "\033[0;31m[FAIL]\033[0m $1"; }
 
+
 # ── 1. System prerequisites ──────────────────────────────────────────
 info "Installing prerequisites..."
 apt-get update -qq
@@ -37,6 +38,7 @@ fi
 
 # Wait for node to be ready
 info "Waiting for k3s node to be ready..."
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 for i in $(seq 1 60); do
     if kubectl get nodes 2>/dev/null | grep -q " Ready"; then
         break

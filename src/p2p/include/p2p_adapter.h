@@ -143,6 +143,9 @@ typedef struct p2p_peer_ctx_s {
     /* Timestamp of last received ICE packet (microseconds) for manual idle check */
     volatile uint64_t       last_ice_recv_us;
 
+    /* Timestamp of peer creation (microseconds) for dedup */
+    uint64_t                created_us;
+
     /* Datagram send queue for pacing */
     p2p_dgram_send_queue_t  send_queue;
 } p2p_peer_ctx_t;
