@@ -523,7 +523,7 @@ static int tc_m3_pub_sub_data_transfer(const test_env_t *env)
         for (int i = 0; i < 20; i++) {
             uint8_t payload[32];
             memset(payload, 0xDD, sizeof(payload));
-            p2p_peer_send_data(pub_peer, P2P_FRAME_TYPE_VIDEO, 0,
+            p2p_peer_send_data_via_quic(pub_peer, P2P_FRAME_TYPE_VIDEO, 0,
                                i, now_us(), payload, sizeof(payload));
             p2p_sleep_ms(10);
         }
@@ -575,7 +575,7 @@ static int tc_m4_pub_send_audio(const test_env_t *env)
         for (int i = 0; i < 20; i++) {
             uint8_t payload[32];
             memset(payload, 0xEE, sizeof(payload));
-            p2p_peer_send_data(pub_peer, P2P_FRAME_TYPE_AUDIO, 0,
+            p2p_peer_send_data_via_quic(pub_peer, P2P_FRAME_TYPE_AUDIO, 0,
                                i, now_us(), payload, sizeof(payload));
             p2p_sleep_ms(10);
         }

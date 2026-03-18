@@ -102,7 +102,7 @@ XQUIC_BUILD="$BUILD_DIR/xquic"
 XQUIC_LIB="$XQUIC_BUILD/libxquic-static.a"
 
 if [[ ! -f "$XQUIC_LIB" ]]; then
-    log "Building xquic (with mbedTLS)..."
+    log "Building xquic (with mbedTLS + MOQ)..."
     cmake -B "$XQUIC_BUILD" -S "$XQUIC_SRC" \
         -DSSL_TYPE=mbedtls \
         -DMBEDTLS_PATH="$MBEDTLS_SRC" \
@@ -111,6 +111,7 @@ if [[ ! -f "$XQUIC_LIB" ]]; then
         -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
         -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
         -DXQC_ENABLE_TESTING=OFF \
+        -DXQC_ENABLE_MOQ=ON \
         ${EXTRA_C_FLAGS:+-DCMAKE_C_FLAGS="$EXTRA_C_FLAGS"}
     cmake --build "$XQUIC_BUILD" --target xquic-static -j"$JOBS"
     log "xquic built -> $XQUIC_BUILD/"

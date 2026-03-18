@@ -154,9 +154,8 @@ static void on_video_frame(const uint8_t *data, size_t size,
     uint32_t seq = p2p_atomic_fetch_add((volatile P2P_ATOMIC_INT *)&ctx->video_seq, 1);
     uint8_t flags = is_key ? P2P_FRAME_FLAG_KEY : 0;
 
-    int nfrags = (out_size + P2P_FRAME_MAX_FRAG - 1) / P2P_FRAME_MAX_FRAG;
-    fprintf(stderr, "[TX] seq=%u %s size=%d frags=%d\n",
-            seq, is_key ? "IDR" : "P", out_size, nfrags);
+    fprintf(stderr, "[TX] seq=%u %s size=%d\n",
+            seq, is_key ? "IDR" : "P", out_size);
 
     /* Cache IDR for new subscribers */
     if (is_key) {

@@ -22,7 +22,6 @@ static void make_virtual_addr(struct sockaddr_in *addr, uint16_t port)
     addr->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 }
 
-/* Map juice_state_t -> p2p_ice_state_t */
 static p2p_ice_state_t map_juice_state(juice_state_t js)
 {
     switch (js) {
@@ -34,6 +33,12 @@ static p2p_ice_state_t map_juice_state(juice_state_t js)
     case JUICE_STATE_DISCONNECTED: return P2P_ICE_STATE_DISCONNECTED;
     default:                       return P2P_ICE_STATE_DISCONNECTED;
     }
+}
+
+static p2p_peer_ctx_t *peer_from_user_session(xqc_moq_user_session_t *us)
+{
+    if (!us) return NULL;
+    return *(p2p_peer_ctx_t **)(us->data);
 }
 
 /* ---------- xquic transport callbacks ---------- */
@@ -55,7 +60,8 @@ static void schedule_continue_send(p2p_peer_ctx_t *peer)
 static ssize_t xqc_write_socket_cb(const unsigned char *buf, size_t size,
     const struct sockaddr *peer_addr, socklen_t peer_addrlen, void *conn_user_data)
 {
-    p2p_peer_ctx_t *peer = (p2p_peer_ctx_t *)conn_user_data;
+    xqc_moq_user_session_t *us = (xqc_moq_user_session_t *)conn_user_data;
+    p2p_peer_ctx_t *peer = peer_from_user_session(us);
     if (!peer || !peer->ice_agent)
         return XQC_SOCKET_EAGAIN;
 
@@ -78,12 +84,6 @@ static ssize_t xqc_pkt_filter_cb(const unsigned char *buf, size_t size,
         return (ssize_t)size;
     schedule_continue_send(peer);
     return XQC_SOCKET_EAGAIN;
-}
-
-static int xqc_server_accept_cb(xqc_engine_t *engine, xqc_connection_t *conn,
-    const xqc_cid_t *cid, void *user_data)
-{
-    return 0;
 }
 
 static ssize_t xqc_stateless_reset_cb(const unsigned char *buf, size_t size,
@@ -137,35 +137,319 @@ static void xqc_log_write_cb(xqc_log_level_t lvl, const void *buf,
     fprintf(stderr, "[xquic][%s] %.*s\n", level_str[lvl], (int)size, (const char *)buf);
 }
 
+/* ---------- MOQ session callbacks ---------- */
+
+static void moq_on_session_setup_cb(xqc_moq_user_session_t *us, char *extdata)
+{
+    p2p_peer_ctx_t *peer = peer_from_user_session(us);
+    if (!peer || !peer->engine) return;
+
+    peer->video_subscribe_id = -1;
+    peer->audio_subscribe_id = -1;
+
+    if (peer->engine->role == P2P_ROLE_SUBSCRIBER)
+        return;
+
+    /* Publisher: create video + audio tracks for this peer's session */
+    xqc_moq_selection_params_t vparams;
+    memset(&vparams, 0, sizeof(vparams));
+    vparams.codec = "h264";
+    vparams.mime_type = "video/h264";
+    vparams.bitrate = 2000000;
+    vparams.framerate = 30;
+    vparams.width = 1280;
+    vparams.height = 720;
+    peer->video_track = xqc_moq_track_create(peer->moq_session, "p2p", "video",
+                                              XQC_MOQ_TRACK_VIDEO, &vparams,
+                                              XQC_MOQ_CONTAINER_LOC, XQC_MOQ_TRACK_FOR_PUB);
+    if (!peer->video_track)
+        fprintf(stderr, "[p2p-moq] failed to create video track for %s\n", peer->peer_id);
+
+    xqc_moq_selection_params_t aparams;
+    memset(&aparams, 0, sizeof(aparams));
+    aparams.codec = "opus";
+    aparams.mime_type = "audio/opus";
+    aparams.bitrate = 64000;
+    aparams.samplerate = 48000;
+    aparams.channel_config = "2";
+    peer->audio_track = xqc_moq_track_create(peer->moq_session, "p2p", "audio",
+                                              XQC_MOQ_TRACK_AUDIO, &aparams,
+                                              XQC_MOQ_CONTAINER_LOC, XQC_MOQ_TRACK_FOR_PUB);
+    if (!peer->audio_track)
+        fprintf(stderr, "[p2p-moq] failed to create audio track for %s\n", peer->peer_id);
+
+    fprintf(stderr, "[p2p-moq] session setup (publisher) for %s\n", peer->peer_id);
+}
+
+static void moq_on_datachannel_cb(xqc_moq_user_session_t *us)
+{
+    p2p_peer_ctx_t *peer = peer_from_user_session(us);
+    if (peer) {
+        peer->moq_datachannel_ready = 1;
+        fprintf(stderr, "[p2p-moq] datachannel ready for %s\n", peer->peer_id);
+    }
+}
+
+static void moq_on_datachannel_msg_cb(xqc_moq_user_session_t *us, uint8_t *msg, size_t msg_len)
+{
+    p2p_peer_ctx_t *peer = peer_from_user_session(us);
+    if (!peer || !peer->engine) return;
+    if (!peer->engine->callbacks.on_peer_data_recv) return;
+    if (msg_len < 1) return;
+
+    uint8_t type = msg[0];
+    p2p_frame_header_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.type = type;
+
+    if (msg_len > 1) {
+        hdr.total_len = (uint32_t)(msg_len - 1);
+        hdr.frag_len = (uint32_t)(msg_len - 1);
+        peer->engine->callbacks.on_peer_data_recv(peer, &hdr, msg + 1,
+                                                   peer->engine->user_data);
+    } else {
+        peer->engine->callbacks.on_peer_data_recv(peer, &hdr, NULL,
+                                                   peer->engine->user_data);
+    }
+}
+
+static void moq_on_subscribe_cb(xqc_moq_user_session_t *us, uint64_t subscribe_id,
+    xqc_moq_track_t *track, xqc_moq_subscribe_msg_t *msg)
+{
+    p2p_peer_ctx_t *peer = peer_from_user_session(us);
+    if (!peer || !peer->moq_session) return;
+
+    if (msg->track_name && strcmp(msg->track_name, "video") == 0) {
+        peer->video_subscribe_id = (int64_t)subscribe_id;
+        fprintf(stderr, "[p2p-moq] video subscribed (id=%llu) by %s\n",
+                (unsigned long long)subscribe_id, peer->peer_id);
+    } else if (msg->track_name && strcmp(msg->track_name, "audio") == 0) {
+        peer->audio_subscribe_id = (int64_t)subscribe_id;
+        fprintf(stderr, "[p2p-moq] audio subscribed (id=%llu) by %s\n",
+                (unsigned long long)subscribe_id, peer->peer_id);
+    }
+
+    xqc_moq_subscribe_ok_msg_t ok;
+    memset(&ok, 0, sizeof(ok));
+    ok.subscribe_id = subscribe_id;
+    ok.expire_ms = 0;
+    ok.content_exist = 1;
+    xqc_moq_write_subscribe_ok(peer->moq_session, &ok);
+}
+
+static void moq_on_request_keyframe_cb(xqc_moq_user_session_t *us,
+    uint64_t subscribe_id, xqc_moq_track_t *track)
+{
+    p2p_peer_ctx_t *peer = peer_from_user_session(us);
+    if (!peer || !peer->engine) return;
+    if (!peer->engine->callbacks.on_peer_data_recv) return;
+
+    p2p_frame_header_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.type = P2P_FRAME_TYPE_IDR_REQ;
+    peer->engine->callbacks.on_peer_data_recv(peer, &hdr, NULL,
+                                               peer->engine->user_data);
+}
+
+static void moq_on_bitrate_change_cb(xqc_moq_user_session_t *us, uint64_t bitrate)
+{
+    (void)us; (void)bitrate;
+}
+
+static void moq_on_subscribe_ok_cb(xqc_moq_user_session_t *us,
+    xqc_moq_subscribe_ok_msg_t *subscribe_ok)
+{
+    p2p_peer_ctx_t *peer = peer_from_user_session(us);
+    if (peer) {
+        fprintf(stderr, "[p2p-moq] subscribe OK (id=%llu) for %s\n",
+                (unsigned long long)subscribe_ok->subscribe_id, peer->peer_id);
+    }
+}
+
+static void moq_on_subscribe_error_cb(xqc_moq_user_session_t *us,
+    xqc_moq_subscribe_error_msg_t *subscribe_error)
+{
+    p2p_peer_ctx_t *peer = peer_from_user_session(us);
+    fprintf(stderr, "[p2p-moq] subscribe ERROR (id=%llu code=%llu) for %s\n",
+            (unsigned long long)subscribe_error->subscribe_id,
+            (unsigned long long)subscribe_error->error_code,
+            peer ? peer->peer_id : "?");
+}
+
+static void moq_on_catalog_cb(xqc_moq_user_session_t *us,
+    xqc_moq_track_info_t **track_info_array, xqc_int_t array_size)
+{
+    p2p_peer_ctx_t *peer = peer_from_user_session(us);
+    if (!peer || !peer->moq_session) return;
+
+    for (xqc_int_t i = 0; i < array_size; i++) {
+        xqc_moq_track_info_t *ti = track_info_array[i];
+        fprintf(stderr, "[p2p-moq] catalog track: %s/%s type=%d\n",
+                ti->track_namespace, ti->track_name, ti->track_type);
+        xqc_moq_subscribe_latest(peer->moq_session, ti->track_namespace, ti->track_name);
+    }
+}
+
+static void moq_on_video_cb(xqc_moq_user_session_t *us, uint64_t subscribe_id,
+    xqc_moq_video_frame_t *vf)
+{
+    p2p_peer_ctx_t *peer = peer_from_user_session(us);
+    if (!peer || !peer->engine) return;
+
+    if (peer->video_subscribe_id < 0)
+        peer->video_subscribe_id = (int64_t)subscribe_id;
+
+    if (!peer->engine->callbacks.on_peer_data_recv) return;
+
+    p2p_frame_header_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.type = P2P_FRAME_TYPE_VIDEO;
+    hdr.flags = (vf->type == XQC_MOQ_VIDEO_KEY) ? P2P_FRAME_FLAG_KEY : 0;
+    hdr.seq = (uint32_t)vf->seq_num;
+    hdr.timestamp_us = vf->timestamp_us;
+    hdr.total_len = (uint32_t)vf->video_len;
+    hdr.frag_offset = 0;
+    hdr.frag_len = (uint32_t)vf->video_len;
+
+    peer->engine->callbacks.on_peer_data_recv(peer, &hdr, vf->video_data,
+                                               peer->engine->user_data);
+}
+
+static void moq_on_audio_cb(xqc_moq_user_session_t *us, uint64_t subscribe_id,
+    xqc_moq_audio_frame_t *af)
+{
+    p2p_peer_ctx_t *peer = peer_from_user_session(us);
+    if (!peer || !peer->engine) return;
+
+    if (peer->audio_subscribe_id < 0)
+        peer->audio_subscribe_id = (int64_t)subscribe_id;
+
+    if (!peer->engine->callbacks.on_peer_data_recv) return;
+
+    p2p_frame_header_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.type = P2P_FRAME_TYPE_AUDIO;
+    hdr.seq = (uint32_t)af->seq_num;
+    hdr.timestamp_us = af->timestamp_us;
+    hdr.total_len = (uint32_t)af->audio_len;
+    hdr.frag_offset = 0;
+    hdr.frag_len = (uint32_t)af->audio_len;
+
+    peer->engine->callbacks.on_peer_data_recv(peer, &hdr, af->audio_data,
+                                               peer->engine->user_data);
+}
+
+static xqc_moq_session_callbacks_t make_moq_session_callbacks(void)
+{
+    xqc_moq_session_callbacks_t cbs;
+    memset(&cbs, 0, sizeof(cbs));
+    cbs.on_session_setup    = moq_on_session_setup_cb;
+    cbs.on_datachannel      = moq_on_datachannel_cb;
+    cbs.on_datachannel_msg  = moq_on_datachannel_msg_cb;
+    cbs.on_subscribe        = moq_on_subscribe_cb;
+    cbs.on_request_keyframe = moq_on_request_keyframe_cb;
+    cbs.on_bitrate_change   = moq_on_bitrate_change_cb;
+    cbs.on_subscribe_ok     = moq_on_subscribe_ok_cb;
+    cbs.on_subscribe_error  = moq_on_subscribe_error_cb;
+    cbs.on_catalog          = moq_on_catalog_cb;
+    cbs.on_video            = moq_on_video_cb;
+    cbs.on_audio            = moq_on_audio_cb;
+    return cbs;
+}
+
+/* ---------- Allocate per-peer MOQ user session ---------- */
+
+static xqc_moq_user_session_t *alloc_moq_user_session(p2p_peer_ctx_t *peer)
+{
+    xqc_moq_user_session_t *us = calloc(1, sizeof(xqc_moq_user_session_t) + sizeof(p2p_peer_ctx_t *));
+    if (!us) return NULL;
+    *(p2p_peer_ctx_t **)(us->data) = peer;
+    return us;
+}
+
+/* ---------- xquic connection callbacks ---------- */
+
+static int xqc_server_accept_cb(xqc_engine_t *engine, xqc_connection_t *conn,
+    const xqc_cid_t *cid, void *user_data)
+{
+    /* user_data here is the conn_user_data from xqc_engine_packet_process,
+     * which is peer->moq_user_session (NOT the engine user_data) */
+    xqc_moq_user_session_t *us = (xqc_moq_user_session_t *)user_data;
+    p2p_peer_ctx_t *peer = peer_from_user_session(us);
+    if (!peer) {
+        fprintf(stderr, "[p2p-moq] server_accept: cannot resolve peer from user_session\n");
+        return -1;
+    }
+
+    xqc_moq_session_callbacks_t cbs = make_moq_session_callbacks();
+    xqc_moq_role_t role = XQC_MOQ_PUBSUB;
+    peer->moq_session = xqc_moq_session_create(conn, us,
+                                                XQC_MOQ_TRANSPORT_QUIC, role, cbs, NULL);
+    if (!peer->moq_session) {
+        fprintf(stderr, "[p2p-moq] server_accept: session_create failed for %s\n",
+                peer->peer_id);
+        return -1;
+    }
+    xqc_moq_configure_bitrate(peer->moq_session, 1000000, 8000000, 100000);
+
+    return 0;
+}
+
 static int xqc_conn_create_notify_cb(xqc_connection_t *conn,
     const xqc_cid_t *cid, void *conn_user_data, void *conn_proto_data)
 {
-    p2p_peer_ctx_t *peer = (p2p_peer_ctx_t *)conn_user_data;
-    if (peer) {
-        if (peer->xqc_conn && peer->xqc_conn != conn) {
-            fprintf(stderr, "[p2p] new conn for %s, old conn will time out naturally\n",
+    xqc_moq_user_session_t *us = (xqc_moq_user_session_t *)conn_user_data;
+    p2p_peer_ctx_t *peer = peer_from_user_session(us);
+    if (!peer) return 0;
+
+    /* Subscriber (client) creates MOQ session here;
+       Publisher (server) already created it in server_accept */
+    if (!peer->moq_session) {
+        xqc_moq_session_callbacks_t cbs = make_moq_session_callbacks();
+        xqc_moq_role_t role = XQC_MOQ_PUBSUB;
+        peer->moq_session = xqc_moq_session_create(conn, us,
+                                                    XQC_MOQ_TRANSPORT_QUIC, role, cbs, NULL);
+        if (!peer->moq_session) {
+            fprintf(stderr, "[p2p-moq] conn_create: session_create failed for %s\n",
                     peer->peer_id);
+            return -1;
         }
-        peer->ctrl_stream = NULL;
-        peer->last_ice_recv_us = 0;
-        peer->cid = *cid;
-        __sync_synchronize();
-        peer->xqc_conn = conn;
-        xqc_conn_set_pkt_filter_callback(conn, xqc_pkt_filter_cb, peer);
-        xqc_datagram_set_user_data(conn, peer);
+        xqc_moq_configure_bitrate(peer->moq_session, 1000000, 8000000, 100000);
     }
+
+    if (peer->xqc_conn && peer->xqc_conn != conn) {
+        fprintf(stderr, "[p2p] new conn for %s, old conn will time out naturally\n",
+                peer->peer_id);
+    }
+
+    peer->last_ice_recv_us = 0;
+    peer->cid = *cid;
+    __sync_synchronize();
+    peer->xqc_conn = conn;
+    xqc_conn_set_pkt_filter_callback(conn, xqc_pkt_filter_cb, peer);
+
     return 0;
 }
 
 static int xqc_conn_close_notify_cb(xqc_connection_t *conn,
     const xqc_cid_t *cid, void *conn_user_data, void *conn_proto_data)
 {
-    p2p_peer_ctx_t *peer = (p2p_peer_ctx_t *)conn_user_data;
+    xqc_moq_user_session_t *us = (xqc_moq_user_session_t *)conn_user_data;
+    p2p_peer_ctx_t *peer = peer_from_user_session(us);
     if (!peer) return 0;
 
+    /* Destroy MOQ session */
+    if (peer->moq_session) {
+        xqc_moq_session_destroy(peer->moq_session);
+        peer->moq_session = NULL;
+    }
+    peer->video_track = NULL;
+    peer->audio_track = NULL;
+    peer->video_subscribe_id = -1;
+    peer->audio_subscribe_id = -1;
+    peer->moq_datachannel_ready = 0;
+
     if (peer->xqc_conn == conn) {
-        /* Set state BEFORE nulling xqc_conn to prevent capture thread
-         * from passing state check then using a stale conn pointer */
         int ice_alive = 0;
         if (peer->ice_agent) {
             juice_state_t js = juice_get_state((juice_agent_t *)peer->ice_agent);
@@ -176,7 +460,6 @@ static int xqc_conn_close_notify_cb(xqc_connection_t *conn,
             peer->state = P2P_PEER_STATE_ICE_CONNECTED;
             __sync_synchronize();
             peer->xqc_conn = NULL;
-            peer->ctrl_stream = NULL;
             peer->quic_restart_fail_count++;
             if (peer->engine && peer->engine->role == P2P_ROLE_SUBSCRIBER) {
                 if (peer->quic_restart_fail_count > 3) {
@@ -198,7 +481,6 @@ static int xqc_conn_close_notify_cb(xqc_connection_t *conn,
             peer->state = P2P_PEER_STATE_FAILED;
             __sync_synchronize();
             peer->xqc_conn = NULL;
-            peer->ctrl_stream = NULL;
             peer->needs_quic_restart = 0;
             peer->needs_ice_restart = 1;
             fprintf(stderr, "[p2p] QUIC closed with %s, ICE dead, need full reconnect\n",
@@ -216,7 +498,8 @@ static int xqc_conn_close_notify_cb(xqc_connection_t *conn,
 static void xqc_conn_handshake_finished_cb(xqc_connection_t *conn,
     void *conn_user_data, void *conn_proto_data)
 {
-    p2p_peer_ctx_t *peer = (p2p_peer_ctx_t *)conn_user_data;
+    xqc_moq_user_session_t *us = (xqc_moq_user_session_t *)conn_user_data;
+    p2p_peer_ctx_t *peer = peer_from_user_session(us);
     if (!peer) return;
     peer->state = P2P_PEER_STATE_QUIC_CONNECTED;
     peer->last_ice_recv_us = p2p_now_us();
@@ -224,119 +507,6 @@ static void xqc_conn_handshake_finished_cb(xqc_connection_t *conn,
     fprintf(stderr, "[p2p] QUIC handshake finished with peer %s\n", peer->peer_id);
     if (peer->engine && peer->engine->callbacks.on_peer_quic_connected)
         peer->engine->callbacks.on_peer_quic_connected(peer, peer->engine->user_data);
-}
-
-/* ---------- xquic STREAM callbacks (reliable control channel) ---------- */
-
-static p2p_peer_ctx_t *stream_get_peer(xqc_stream_t *stream, void *strm_user_data)
-{
-    if (strm_user_data)
-        return (p2p_peer_ctx_t *)strm_user_data;
-    void *conn_ud = xqc_get_conn_user_data_by_stream(stream);
-    return (p2p_peer_ctx_t *)conn_ud;
-}
-
-static xqc_int_t xqc_stream_read_notify_cb(xqc_stream_t *stream, void *strm_user_data)
-{
-    p2p_peer_ctx_t *peer = stream_get_peer(stream, strm_user_data);
-    if (!peer || !peer->engine) return 0;
-
-    if (!peer->ctrl_stream)
-        peer->ctrl_stream = stream;
-
-    unsigned char buf[64];
-    uint8_t fin = 0;
-    ssize_t nread;
-
-    while ((nread = xqc_stream_recv(stream, buf, sizeof(buf), &fin)) > 0) {
-        for (ssize_t i = 0; i < nread; i++) {
-            uint8_t type = buf[i];
-            if (peer->engine->callbacks.on_peer_data_recv) {
-                p2p_frame_header_t ctrl_hdr;
-                memset(&ctrl_hdr, 0, sizeof(ctrl_hdr));
-                ctrl_hdr.type = type;
-                peer->engine->callbacks.on_peer_data_recv(peer, &ctrl_hdr, NULL,
-                                                           peer->engine->user_data);
-            }
-        }
-    }
-    return 0;
-}
-
-static xqc_int_t xqc_stream_write_notify_cb(xqc_stream_t *stream, void *strm_user_data)
-{
-    (void)stream; (void)strm_user_data;
-    return 0;
-}
-
-static xqc_int_t xqc_stream_create_notify_cb(xqc_stream_t *stream, void *strm_user_data)
-{
-    p2p_peer_ctx_t *peer = stream_get_peer(stream, strm_user_data);
-    if (peer && !peer->ctrl_stream) {
-        peer->ctrl_stream = stream;
-        fprintf(stderr, "[p2p] control stream created for peer %s\n",
-                peer->peer_id);
-    }
-    return 0;
-}
-
-static xqc_int_t xqc_stream_close_notify_cb(xqc_stream_t *stream, void *strm_user_data)
-{
-    p2p_peer_ctx_t *peer = stream_get_peer(stream, strm_user_data);
-    if (peer && peer->ctrl_stream == stream)
-        peer->ctrl_stream = NULL;
-    return 0;
-}
-
-/* ---------- xquic DATAGRAM callbacks ---------- */
-
-static void on_dgram_read(xqc_connection_t *conn, void *user_data,
-                           const void *data, size_t data_len, uint64_t unix_ts)
-{
-    p2p_peer_ctx_t *peer = (p2p_peer_ctx_t *)xqc_datagram_get_user_data(conn);
-    if (!peer || !peer->engine) return;
-
-    if (data_len < P2P_FRAME_HDR_SIZE) return;
-    if (!peer->engine->callbacks.on_peer_data_recv) return;
-
-    const p2p_frame_header_t *hdr = (const p2p_frame_header_t *)data;
-    size_t payload_avail = data_len - P2P_FRAME_HDR_SIZE;
-
-    if (hdr->frag_len > payload_avail) {
-        fprintf(stderr, "[p2p-dgram] CORRUPT: frag_len=%u > payload_avail=%zu, dropping\n",
-                hdr->frag_len, payload_avail);
-        return;
-    }
-
-    const uint8_t *payload = (const uint8_t *)data + P2P_FRAME_HDR_SIZE;
-    peer->engine->callbacks.on_peer_data_recv(peer, hdr, payload,
-                                               peer->engine->user_data);
-}
-
-static void on_dgram_write(xqc_connection_t *conn, void *user_data)
-{
-    p2p_peer_ctx_t *peer = (p2p_peer_ctx_t *)xqc_datagram_get_user_data(conn);
-    if (!peer) return;
-    p2p_peer_flush_send_queue(peer);
-}
-
-static xqc_int_t on_dgram_lost(xqc_connection_t *conn,
-    uint64_t dgram_id, void *user_data)
-{
-    (void)conn; (void)dgram_id; (void)user_data;
-    return 0;
-}
-
-static void on_dgram_acked(xqc_connection_t *conn,
-    uint64_t dgram_id, void *user_data)
-{
-    (void)conn; (void)dgram_id; (void)user_data;
-}
-
-static void on_dgram_mss_updated(xqc_connection_t *conn,
-    size_t mss, void *user_data)
-{
-    fprintf(stderr, "[p2p] DATAGRAM MSS updated: %zu\n", mss);
 }
 
 /* ---------- libjuice ICE callbacks ---------- */
@@ -361,7 +531,6 @@ static void ice_on_state_changed(juice_agent_t *agent, juice_state_t state, void
     case JUICE_STATE_COMPLETED:
         if (peer->state < P2P_PEER_STATE_ICE_CONNECTED)
             peer->state = P2P_PEER_STATE_ICE_CONNECTED;
-        /* Defer xqc_connect to engine thread (xquic is not thread-safe) */
         peer->needs_quic_start = 1;
         schedule_continue_send(peer);
         break;
@@ -402,7 +571,7 @@ static void ice_on_recv(juice_agent_t *agent, const char *data, size_t size, voi
 
     uint64_t now = p2p_now_us();
     if (size > 0)
-        peer->last_ice_recv_us = now;  /* any packet = peer alive (STUN, QUIC, etc.) */
+        peer->last_ice_recv_us = now;
     int ret = p2p_packet_queue_push(&peer->engine->recv_queue,
                                     (const uint8_t *)data, size, now, peer->index);
     if (ret < 0) {
@@ -411,6 +580,60 @@ static void ice_on_recv(juice_agent_t *agent, const char *data, size_t size, voi
             fprintf(stderr, "[p2p] recv_queue FULL, dropped %d packets so far (peer=%s)\n",
                     drop_cnt, peer->peer_id);
     }
+}
+
+/* ---------- Frame send queue helpers ---------- */
+
+static int frame_queue_push(p2p_peer_ctx_t *peer, uint8_t type, uint8_t flags,
+                            uint32_t seq, uint64_t timestamp_us,
+                            const uint8_t *data, uint32_t data_len)
+{
+    p2p_frame_send_queue_t *q = &peer->frame_queue;
+    p2p_mutex_lock(&q->mutex);
+
+    if (peer->state != P2P_PEER_STATE_QUIC_CONNECTED) {
+        p2p_mutex_unlock(&q->mutex);
+        return -1;
+    }
+
+    /* Queue is full: drop oldest */
+    if (q->count >= P2P_FRAME_QUEUE_CAP) {
+        p2p_frame_entry_t *old = &q->entries[q->head];
+        free(old->data);
+        old->data = NULL;
+        q->head = (q->head + 1) % P2P_FRAME_QUEUE_CAP;
+        q->count--;
+    }
+
+    int idx = (q->head + q->count) % P2P_FRAME_QUEUE_CAP;
+    p2p_frame_entry_t *e = &q->entries[idx];
+    e->type = type;
+    e->flags = flags;
+    e->seq = seq;
+    e->timestamp_us = timestamp_us;
+    e->data = (uint8_t *)malloc(data_len);
+    if (!e->data) {
+        p2p_mutex_unlock(&q->mutex);
+        return -1;
+    }
+    memcpy(e->data, data, data_len);
+    e->data_len = data_len;
+    q->count++;
+
+    p2p_mutex_unlock(&q->mutex);
+    return 0;
+}
+
+static void frame_queue_clear(p2p_frame_send_queue_t *q)
+{
+    p2p_mutex_lock(&q->mutex);
+    while (q->count > 0) {
+        free(q->entries[q->head].data);
+        q->entries[q->head].data = NULL;
+        q->head = (q->head + 1) % P2P_FRAME_QUEUE_CAP;
+        q->count--;
+    }
+    p2p_mutex_unlock(&q->mutex);
 }
 
 /* ---------- xquic engine thread ---------- */
@@ -428,7 +651,7 @@ static void process_recv_queue(p2p_engine_t *eng)
         xqc_engine_packet_process(eng->xqc_engine, pkt.data, pkt.size,
             (struct sockaddr *)&peer->virtual_local_addr, sizeof(peer->virtual_local_addr),
             (struct sockaddr *)&peer->virtual_peer_addr, sizeof(peer->virtual_peer_addr),
-            pkt.recv_time_us, peer);
+            pkt.recv_time_us, peer->moq_user_session);
         batch++;
     }
     if (batch > 0) {
@@ -482,7 +705,6 @@ static void process_quic_restart(p2p_engine_t *eng)
         }
 
         if (peer->needs_quic_restart && peer->state == P2P_PEER_STATE_ICE_CONNECTED) {
-            /* Double-check ICE is truly alive before attempting QUIC */
             if (peer->ice_agent) {
                 juice_state_t js = juice_get_state((juice_agent_t *)peer->ice_agent);
                 if (js != JUICE_STATE_CONNECTED && js != JUICE_STATE_COMPLETED) {
@@ -501,7 +723,7 @@ static void process_quic_restart(p2p_engine_t *eng)
     }
 }
 
-#define P2P_MANUAL_IDLE_TIMEOUT_US  (60ULL * 1000000)  /* 60s: avoid false timeout when sub has no packet loss */
+#define P2P_MANUAL_IDLE_TIMEOUT_US  (60ULL * 1000000)
 
 static void process_manual_idle_check(p2p_engine_t *eng)
 {
@@ -527,10 +749,22 @@ static void process_manual_idle_check(p2p_engine_t *eng)
                     peer->peer_id, (unsigned long long)(elapsed / 1000));
             xqc_conn_close(eng->xqc_engine, &peer->cid);
             peer->xqc_conn = NULL;
-            peer->ctrl_stream = NULL;
             peer->state = P2P_PEER_STATE_ICE_CONNECTED;
             peer->last_ice_recv_us = 0;
         }
+    }
+}
+
+/* Flush frame queues: dequeue frames and call MOQ write APIs */
+static void process_frame_queues(p2p_engine_t *eng)
+{
+    for (int i = 0; i < P2P_MAX_SUBSCRIBERS; i++) {
+        p2p_peer_ctx_t *peer = &eng->peers[i];
+        if (!peer->moq_session || peer->state != P2P_PEER_STATE_QUIC_CONNECTED)
+            continue;
+        if (peer->frame_queue.count <= 0)
+            continue;
+        p2p_peer_flush_send_queue(peer);
     }
 }
 
@@ -550,14 +784,7 @@ static void *engine_thread_func(void *arg)
         process_continue_send(eng);
         process_manual_idle_check(eng);
         process_quic_restart(eng);
-
-        /* Flush queued datagrams (enqueued by capture thread) */
-        for (int i = 0; i < P2P_MAX_SUBSCRIBERS; i++) {
-            p2p_peer_ctx_t *p = &eng->peers[i];
-            if (p->xqc_conn && p->state == P2P_PEER_STATE_QUIC_CONNECTED
-                && p->send_queue.count > 0)
-                p2p_peer_flush_send_queue(p);
-        }
+        process_frame_queues(eng);
 
         /* Deferred peer removal (safe point after all iteration) */
         for (int i = 0; i < P2P_MAX_SUBSCRIBERS; i++) {
@@ -616,7 +843,6 @@ int p2p_engine_init(p2p_engine_t *eng, const p2p_engine_config_t *config)
     if (config->turn_server_host) {
         snprintf(eng->turn_host, sizeof(eng->turn_host), "%s", config->turn_server_host);
     } else if (config->stun_server_host) {
-        /* Default: use STUN server as TURN server (coturn serves both) */
         snprintf(eng->turn_host, sizeof(eng->turn_host), "%s", config->stun_server_host);
     }
     eng->turn_port = config->turn_server_port ? config->turn_server_port : eng->stun_port;
@@ -642,6 +868,9 @@ int p2p_engine_init(p2p_engine_t *eng, const p2p_engine_config_t *config)
         eng->peers[i].index = i;
         eng->peers[i].engine = eng;
         eng->peers[i].state = P2P_PEER_STATE_IDLE;
+        eng->peers[i].video_subscribe_id = -1;
+        eng->peers[i].audio_subscribe_id = -1;
+        p2p_mutex_init(&eng->peers[i].frame_queue.mutex);
         make_virtual_addr(&eng->peers[i].virtual_local_addr, P2P_VIRTUAL_PORT_BASE);
         make_virtual_addr(&eng->peers[i].virtual_peer_addr, P2P_VIRTUAL_PORT_BASE + 1 + i);
     }
@@ -685,40 +914,19 @@ int p2p_engine_init(p2p_engine_t *eng, const p2p_engine_config_t *config)
         return -1;
     }
 
-    /* Register ALPN with connection + stream + datagram callbacks */
+    /* Register MOQ ALPN with connection callbacks */
     xqc_conn_callbacks_t conn_cbs;
     memset(&conn_cbs, 0, sizeof(conn_cbs));
     conn_cbs.conn_create_notify = xqc_conn_create_notify_cb;
     conn_cbs.conn_close_notify = xqc_conn_close_notify_cb;
     conn_cbs.conn_handshake_finished = xqc_conn_handshake_finished_cb;
 
-    xqc_app_proto_callbacks_t ap_cbs;
-    memset(&ap_cbs, 0, sizeof(ap_cbs));
-    ap_cbs.conn_cbs = conn_cbs;
-
-    ap_cbs.stream_cbs.stream_read_notify   = xqc_stream_read_notify_cb;
-    ap_cbs.stream_cbs.stream_write_notify  = xqc_stream_write_notify_cb;
-    ap_cbs.stream_cbs.stream_create_notify = xqc_stream_create_notify_cb;
-    ap_cbs.stream_cbs.stream_close_notify  = xqc_stream_close_notify_cb;
-
-    ap_cbs.dgram_cbs.datagram_read_notify        = on_dgram_read;
-    ap_cbs.dgram_cbs.datagram_write_notify       = on_dgram_write;
-    ap_cbs.dgram_cbs.datagram_lost_notify        = on_dgram_lost;
-    ap_cbs.dgram_cbs.datagram_acked_notify       = on_dgram_acked;
-    ap_cbs.dgram_cbs.datagram_mss_updated_notify = on_dgram_mss_updated;
-
-    if (xqc_engine_register_alpn(eng->xqc_engine, "p2p-av", 6, &ap_cbs, eng) != 0) {
-        fprintf(stderr, "p2p_engine_init: xqc_engine_register_alpn failed\n");
-        xqc_engine_destroy(eng->xqc_engine);
-        eng->xqc_engine = NULL;
-        return -1;
-    }
+    xqc_moq_init_alpn(eng->xqc_engine, &conn_cbs, XQC_MOQ_TRANSPORT_QUIC);
 
     if (config->role == P2P_ROLE_PUBLISHER) {
         xqc_conn_settings_t srv_settings;
         memset(&srv_settings, 0, sizeof(srv_settings));
         srv_settings.max_udp_payload_size = P2P_ICE_MTU;
-        srv_settings.max_datagram_frame_size = 65535;
         srv_settings.pacing_on = 1;
         srv_settings.cong_ctrl_callback = xqc_bbr_cb;
         srv_settings.cc_params.customize_on = 1;
@@ -780,7 +988,10 @@ void p2p_engine_destroy(p2p_engine_t *eng)
             juice_destroy((juice_agent_t *)eng->peers[i].ice_agent);
             eng->peers[i].ice_agent = NULL;
         }
-        p2p_mutex_destroy(&eng->peers[i].send_queue.mutex);
+        frame_queue_clear(&eng->peers[i].frame_queue);
+        p2p_mutex_destroy(&eng->peers[i].frame_queue.mutex);
+        free(eng->peers[i].moq_user_session);
+        eng->peers[i].moq_user_session = NULL;
     }
 
     if (eng->xqc_engine) {
@@ -853,6 +1064,20 @@ p2p_peer_ctx_t *p2p_engine_add_peer(p2p_engine_t *eng, const char *peer_id)
                 tcp_mode == JUICE_ICE_TCP_MODE_PASSIVE ? "passive" : "active", peer_id);
     }
 
+    /* Pre-allocate MOQ user session so server_accept_cb can find the peer
+     * even if QUIC Initial arrives before process_quic_start runs */
+    if (!peer->moq_user_session) {
+        peer->moq_user_session = alloc_moq_user_session(peer);
+        if (!peer->moq_user_session) {
+            fprintf(stderr, "p2p_engine_add_peer: alloc_moq_user_session failed\n");
+            juice_destroy((juice_agent_t *)peer->ice_agent);
+            peer->ice_agent = NULL;
+            return NULL;
+        }
+    } else {
+        *(p2p_peer_ctx_t **)(peer->moq_user_session->data) = peer;
+    }
+
     peer->created_us = p2p_now_us();
     eng->peer_count++;
     return peer;
@@ -863,7 +1088,10 @@ void p2p_engine_remove_peer(p2p_engine_t *eng, int peer_index)
     if (!eng || peer_index < 0 || peer_index >= P2P_MAX_SUBSCRIBERS) return;
     p2p_peer_ctx_t *peer = &eng->peers[peer_index];
 
-    peer->ctrl_stream = NULL;
+    if (peer->moq_session && peer->xqc_conn && eng->xqc_engine) {
+        xqc_moq_session_destroy(peer->moq_session);
+        peer->moq_session = NULL;
+    }
 
     if (peer->xqc_conn && eng->xqc_engine)
         xqc_conn_close(eng->xqc_engine, &peer->cid);
@@ -873,6 +1101,15 @@ void p2p_engine_remove_peer(p2p_engine_t *eng, int peer_index)
         juice_destroy((juice_agent_t *)peer->ice_agent);
         peer->ice_agent = NULL;
     }
+
+    frame_queue_clear(&peer->frame_queue);
+
+    peer->video_track = NULL;
+    peer->audio_track = NULL;
+    peer->video_subscribe_id = -1;
+    peer->audio_subscribe_id = -1;
+    peer->moq_datachannel_ready = 0;
+    peer->moq_session = NULL;
 
     peer->state = P2P_PEER_STATE_IDLE;
     memset(peer->peer_id, 0, sizeof(peer->peer_id));
@@ -941,56 +1178,52 @@ int p2p_get_peer_ice_info(p2p_peer_ctx_t *peer, p2p_ice_info_t *info)
     return 0;
 }
 
-/* ---- AV data via xquic DATAGRAM ---- */
+/* ---- AV data sending via MOQ ---- */
 
 int p2p_peer_flush_send_queue(p2p_peer_ctx_t *peer)
 {
-    if (!peer || !peer->xqc_conn) return -1;
-    p2p_dgram_send_queue_t *q = &peer->send_queue;
+    if (!peer || !peer->moq_session) return -1;
+
+    p2p_frame_send_queue_t *q = &peer->frame_queue;
     p2p_mutex_lock(&q->mutex);
+
     while (q->count > 0) {
-        if (!peer->xqc_conn) {
-            p2p_mutex_unlock(&q->mutex);
-            return -1;
+        p2p_frame_entry_t *e = &q->entries[q->head];
+
+        if (e->type == P2P_FRAME_TYPE_VIDEO && peer->video_subscribe_id >= 0 && peer->video_track) {
+            xqc_moq_video_frame_t vf;
+            vf.type = (e->flags & P2P_FRAME_FLAG_KEY) ? XQC_MOQ_VIDEO_KEY : XQC_MOQ_VIDEO_DELTA;
+            vf.seq_num = e->seq;
+            vf.timestamp_us = e->timestamp_us;
+            vf.video_data = e->data;
+            vf.video_len = e->data_len;
+            xqc_moq_write_video_frame(peer->moq_session,
+                                       (uint64_t)peer->video_subscribe_id,
+                                       peer->video_track, &vf);
+        } else if (e->type == P2P_FRAME_TYPE_AUDIO && peer->audio_subscribe_id >= 0 && peer->audio_track) {
+            xqc_moq_audio_frame_t af;
+            af.seq_num = e->seq;
+            af.timestamp_us = e->timestamp_us;
+            af.audio_data = e->data;
+            af.audio_len = e->data_len;
+            xqc_moq_write_audio_frame(peer->moq_session,
+                                       (uint64_t)peer->audio_subscribe_id,
+                                       peer->audio_track, &af);
+        } else if (e->type == P2P_FRAME_TYPE_DATA && peer->moq_datachannel_ready) {
+            uint8_t *dc_msg = (uint8_t *)malloc(1 + e->data_len);
+            if (dc_msg) {
+                dc_msg[0] = P2P_FRAME_TYPE_DATA;
+                memcpy(dc_msg + 1, e->data, e->data_len);
+                xqc_moq_write_datachannel(peer->moq_session, dc_msg, 1 + e->data_len);
+                free(dc_msg);
+            }
         }
-        p2p_dgram_entry_t *e = &q->entries[q->head];
-        uint64_t dgram_id = 0;
-        xqc_int_t ret = xqc_datagram_send(peer->xqc_conn, e->data, e->len,
-                                           &dgram_id, (xqc_data_qos_level_t)e->qos);
-        if (ret == -XQC_EAGAIN) {
-            p2p_mutex_unlock(&q->mutex);
-            return 0;
-        }
-        if (ret < 0) {
-            /* drop on error */
-        }
-        q->head = (q->head + 1) % P2P_SEND_QUEUE_CAP;
+
+        free(e->data);
+        e->data = NULL;
+        q->head = (q->head + 1) % P2P_FRAME_QUEUE_CAP;
         q->count--;
     }
-    p2p_mutex_unlock(&q->mutex);
-    return 1;
-}
-
-static int enqueue_dgram(p2p_peer_ctx_t *peer, const uint8_t *data, uint16_t len, int qos)
-{
-    p2p_dgram_send_queue_t *q = &peer->send_queue;
-    p2p_mutex_lock(&q->mutex);
-
-    if (!peer->xqc_conn || peer->state != P2P_PEER_STATE_QUIC_CONNECTED) {
-        p2p_mutex_unlock(&q->mutex);
-        return -1;
-    }
-
-    /* Queue is full: drop oldest */
-    if (q->count >= P2P_SEND_QUEUE_CAP) {
-        q->head = (q->head + 1) % P2P_SEND_QUEUE_CAP;
-        q->count--;
-    }
-    int idx = (q->head + q->count) % P2P_SEND_QUEUE_CAP;
-    memcpy(q->entries[idx].data, data, len);
-    q->entries[idx].len = len;
-    q->entries[idx].qos = qos;
-    q->count++;
 
     p2p_mutex_unlock(&q->mutex);
     return 1;
@@ -1002,53 +1235,11 @@ int p2p_peer_send_data_via_quic(p2p_peer_ctx_t *peer, uint8_t type, uint8_t flag
 {
     if (!peer) return -1;
     if (peer->state != P2P_PEER_STATE_QUIC_CONNECTED) return -1;
-    __sync_synchronize();
-    xqc_connection_t *conn = peer->xqc_conn;
-    if (!conn) return -1;
 
-    size_t mss = xqc_datagram_get_mss(conn);
-    if (mss == 0) {
-        /* Peer doesn't support DATAGRAM, fall back to legacy */
-        return p2p_peer_send_data(peer, type, flags, seq, timestamp_us, payload, payload_len);
-    }
+    int ret = frame_queue_push(peer, type, flags, seq, timestamp_us, payload, payload_len);
+    if (ret < 0) return -1;
 
-    uint16_t max_frag = (mss > P2P_FRAME_HDR_SIZE)
-                      ? (uint16_t)(mss - P2P_FRAME_HDR_SIZE) : 0;
-    if (max_frag == 0) return -1;
-
-    /* Limit fragment size to our buffer */
-    if (max_frag > P2P_FRAME_MAX_FRAG) max_frag = P2P_FRAME_MAX_FRAG;
-
-    int qos = (type == P2P_FRAME_TYPE_VIDEO && (flags & P2P_FRAME_FLAG_KEY))
-              ? XQC_DATA_QOS_HIGHEST
-              : (type == P2P_FRAME_TYPE_AUDIO)
-                ? XQC_DATA_QOS_HIGH
-                : XQC_DATA_QOS_MEDIUM;
-
-    uint8_t buf[P2P_ICE_MTU];
-    uint32_t offset = 0;
-
-    while (offset < payload_len) {
-        uint32_t remaining = payload_len - offset;
-        uint16_t frag_len = (remaining > max_frag) ? max_frag : (uint16_t)remaining;
-
-        p2p_frame_header_t *hdr = (p2p_frame_header_t *)buf;
-        hdr->type = type;
-        hdr->flags = (offset == 0) ? flags : 0;
-        hdr->seq = seq;
-        hdr->timestamp_us = timestamp_us;
-        hdr->total_len = payload_len;
-        hdr->frag_offset = offset;
-        hdr->frag_len = frag_len;
-        memcpy(buf + P2P_FRAME_HDR_SIZE, payload + offset, frag_len);
-
-        int ret = enqueue_dgram(peer, buf, (uint16_t)(P2P_FRAME_HDR_SIZE + frag_len), qos);
-        if (ret < 0) return -1;
-
-        offset += frag_len;
-    }
-
-    /* Kick the xquic engine to process sends */
+    /* Kick the engine thread to flush */
     if (peer->engine && peer->engine->xqc_engine) {
         p2p_mutex_lock(&peer->engine->timer_mutex);
         peer->engine->next_wakeup_us = p2p_now_us();
@@ -1059,76 +1250,17 @@ int p2p_peer_send_data_via_quic(p2p_peer_ctx_t *peer, uint8_t type, uint8_t flag
     return 0;
 }
 
-/* ---- Legacy direct framing (bypass xquic) ---- */
+/* ---- Control messages via MOQ ---- */
 
-int p2p_peer_send_data(p2p_peer_ctx_t *peer, uint8_t type, uint8_t flags,
-                       uint32_t seq, uint64_t timestamp_us,
-                       const uint8_t *payload, uint32_t payload_len)
+static int p2p_peer_send_control_datachannel(p2p_peer_ctx_t *peer, uint8_t type)
 {
-    if (!peer || !peer->ice_agent) return -1;
-    if (peer->state < P2P_PEER_STATE_ICE_CONNECTED ||
+    if (!peer || !peer->moq_session) return -1;
+    if (peer->state < P2P_PEER_STATE_QUIC_CONNECTED ||
         peer->state >= P2P_PEER_STATE_FAILED) return -1;
 
-    uint8_t buf[P2P_ICE_MTU];
-    uint32_t offset = 0;
+    uint8_t msg = type;
+    xqc_int_t ret = xqc_moq_write_datachannel(peer->moq_session, &msg, 1);
 
-    while (offset < payload_len) {
-        uint32_t remaining = payload_len - offset;
-        uint16_t frag_len = (remaining > P2P_FRAME_MAX_FRAG)
-                          ? P2P_FRAME_MAX_FRAG : (uint16_t)remaining;
-
-        p2p_frame_header_t *hdr = (p2p_frame_header_t *)buf;
-        hdr->type = type;
-        hdr->flags = (offset == 0) ? flags : 0;
-        hdr->seq = seq;
-        hdr->timestamp_us = timestamp_us;
-        hdr->total_len = payload_len;
-        hdr->frag_offset = offset;
-        hdr->frag_len = frag_len;
-
-        memcpy(buf + P2P_FRAME_HDR_SIZE, payload + offset, frag_len);
-
-        int ret = juice_send((juice_agent_t *)peer->ice_agent,
-                             (const char *)buf,
-                             P2P_FRAME_HDR_SIZE + frag_len);
-        if (ret != JUICE_ERR_SUCCESS) {
-            fprintf(stderr, "[TX-ERR] juice_send failed seq=%u frag_off=%u ret=%d\n",
-                    seq, offset, ret);
-            return -1;
-        }
-
-        offset += frag_len;
-    }
-    return 0;
-}
-
-/* ---- Control messages via xquic reliable STREAM ---- */
-
-static int p2p_peer_send_control_reliable(p2p_peer_ctx_t *peer, uint8_t type)
-{
-    if (!peer) return -1;
-    xqc_connection_t *conn = peer->xqc_conn;
-    if (!conn || peer->state < P2P_PEER_STATE_QUIC_CONNECTED ||
-        peer->state >= P2P_PEER_STATE_FAILED) return -1;
-
-    /* Create control stream on first use */
-    if (!peer->ctrl_stream) {
-        peer->ctrl_stream = xqc_stream_create(peer->engine->xqc_engine,
-                                               &peer->cid, NULL, peer);
-        if (!peer->ctrl_stream) {
-            fprintf(stderr, "[p2p] failed to create control stream for %s\n", peer->peer_id);
-            return -1;
-        }
-    }
-
-    unsigned char msg = type;
-    ssize_t sent = xqc_stream_send(peer->ctrl_stream, &msg, 1, 0);
-    if (sent < 0) {
-        fprintf(stderr, "[p2p] xqc_stream_send control %d failed: %zd\n", type, sent);
-        return -1;
-    }
-
-    /* Wake engine to flush */
     if (peer->engine) {
         p2p_mutex_lock(&peer->engine->timer_mutex);
         peer->engine->next_wakeup_us = p2p_now_us();
@@ -1136,28 +1268,32 @@ static int p2p_peer_send_control_reliable(p2p_peer_ctx_t *peer, uint8_t type)
         p2p_mutex_unlock(&peer->engine->timer_mutex);
     }
 
-    return 0;
+    return (ret >= 0) ? 0 : -1;
 }
 
 int p2p_peer_send_idr_request(p2p_peer_ctx_t *peer)
 {
-    return p2p_peer_send_control_reliable(peer, P2P_FRAME_TYPE_IDR_REQ);
+    if (!peer || !peer->moq_session) return -1;
+    if (peer->video_subscribe_id >= 0)
+        return xqc_moq_request_keyframe(peer->moq_session,
+                                         (uint64_t)peer->video_subscribe_id);
+    return p2p_peer_send_control_datachannel(peer, P2P_FRAME_TYPE_IDR_REQ);
 }
 
 int p2p_peer_send_video_stop(p2p_peer_ctx_t *peer)
-{ return p2p_peer_send_control_reliable(peer, P2P_FRAME_TYPE_VIDEO_STOP); }
+{ return p2p_peer_send_control_datachannel(peer, P2P_FRAME_TYPE_VIDEO_STOP); }
 
 int p2p_peer_send_video_start(p2p_peer_ctx_t *peer)
-{ return p2p_peer_send_control_reliable(peer, P2P_FRAME_TYPE_VIDEO_START); }
+{ return p2p_peer_send_control_datachannel(peer, P2P_FRAME_TYPE_VIDEO_START); }
 
 int p2p_peer_send_audio_stop(p2p_peer_ctx_t *peer)
-{ return p2p_peer_send_control_reliable(peer, P2P_FRAME_TYPE_AUDIO_STOP); }
+{ return p2p_peer_send_control_datachannel(peer, P2P_FRAME_TYPE_AUDIO_STOP); }
 
 int p2p_peer_send_audio_start(p2p_peer_ctx_t *peer)
-{ return p2p_peer_send_control_reliable(peer, P2P_FRAME_TYPE_AUDIO_START); }
+{ return p2p_peer_send_control_datachannel(peer, P2P_FRAME_TYPE_AUDIO_START); }
 
 int p2p_peer_send_ping(p2p_peer_ctx_t *peer)
-{ return p2p_peer_send_control_reliable(peer, P2P_FRAME_TYPE_PING); }
+{ return p2p_peer_send_control_datachannel(peer, P2P_FRAME_TYPE_PING); }
 
 /* ---- QUIC connection ---- */
 
@@ -1167,9 +1303,25 @@ int p2p_peer_start_quic(p2p_peer_ctx_t *peer)
     if (peer->state >= P2P_PEER_STATE_QUIC_HANDSHAKING) return 0;
     p2p_engine_t *eng = peer->engine;
 
-    /* Initialize send queue */
-    memset(&peer->send_queue, 0, sizeof(peer->send_queue));
-    p2p_mutex_init(&peer->send_queue.mutex);
+    /* Clear frame send queue (mutex already initialized in engine_init) */
+    frame_queue_clear(&peer->frame_queue);
+
+    /* Reset MOQ state for new connection */
+    peer->moq_session = NULL;
+    peer->video_track = NULL;
+    peer->audio_track = NULL;
+    peer->video_subscribe_id = -1;
+    peer->audio_subscribe_id = -1;
+    peer->moq_datachannel_ready = 0;
+
+    /* moq_user_session is pre-allocated in add_peer; refresh pointer for reconnect */
+    if (!peer->moq_user_session) {
+        peer->moq_user_session = alloc_moq_user_session(peer);
+        if (!peer->moq_user_session) return -1;
+    } else {
+        *(p2p_peer_ctx_t **)(peer->moq_user_session->data) = peer;
+        peer->moq_user_session->session = NULL;
+    }
 
     if (eng->role == P2P_ROLE_SUBSCRIBER) {
         peer->state = P2P_PEER_STATE_QUIC_HANDSHAKING;
@@ -1177,7 +1329,6 @@ int p2p_peer_start_quic(p2p_peer_ctx_t *peer)
         xqc_conn_settings_t settings;
         memset(&settings, 0, sizeof(settings));
         settings.max_udp_payload_size = P2P_ICE_MTU;
-        settings.max_datagram_frame_size = 65535;
         settings.pacing_on = 1;
         settings.cong_ctrl_callback = xqc_bbr_cb;
         settings.cc_params.customize_on = 1;
@@ -1194,13 +1345,13 @@ int p2p_peer_start_quic(p2p_peer_ctx_t *peer)
             NULL, 0, "p2p-server", 0, &conn_ssl,
             (struct sockaddr *)&peer->virtual_peer_addr,
             sizeof(peer->virtual_peer_addr),
-            "p2p-av", peer);
+            XQC_ALPN_MOQ_QUIC, peer->moq_user_session);
         if (!cid) {
             peer->state = P2P_PEER_STATE_FAILED;
             return -1;
         }
         peer->cid = *cid;
-        fprintf(stderr, "[p2p] QUIC connect initiated to peer %s (BBR+pacing+datagram)\n",
+        fprintf(stderr, "[p2p] QUIC connect initiated to peer %s (MOQ+BBR)\n",
                 peer->peer_id);
     }
 

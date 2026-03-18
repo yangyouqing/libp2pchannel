@@ -183,7 +183,7 @@ int main(int argc, char **argv)
 
         /* Send a test AV frame via the QUIC datagram path */
         uint8_t test_payload[] = "Hello P2P World!";
-        p2p_peer_send_data(pub_peer, P2P_FRAME_TYPE_DATA, 0,
+        p2p_peer_send_data_via_quic(pub_peer, P2P_FRAME_TYPE_DATA, 0,
                            0, p2p_now_us(),
                            test_payload, sizeof(test_payload));
         printf("[PUB] Sent test frame\n");

@@ -113,6 +113,7 @@ foreach(_tls_tgt p2pav p2pav_static)
 
     # xquic (includes always PUBLIC; link visibility varies)
     target_include_directories(${_tls_tgt} PUBLIC "${_XQUIC_SRC_DIR}/include")
+    target_include_directories(${_tls_tgt} PUBLIC "${_XQUIC_SRC_DIR}/include/moq")
     if(EXISTS "${_XQUIC_BUILD_DIR}/include")
         target_include_directories(${_tls_tgt} PUBLIC "${_XQUIC_BUILD_DIR}/include")
     endif()

@@ -106,7 +106,7 @@ echo ""
 
 info "Checking signaling health & requesting JWT token (parallel)..."
 HEALTH_TMP=$(mktemp)
-curl -sk --connect-timeout 5 "https://${SIGNALING}/health" >"$HEALTH_TMP" 2>/dev/null &
+curl -sk --connect-timeout 15 --max-time 20 "https://${SIGNALING}/health" >"$HEALTH_TMP" 2>/dev/null &
 HEALTH_PID=$!
 
 TOKEN_JSON=$(curl -sk --connect-timeout 10 "https://${SIGNALING}/v1/token?peer_id=${PEER_ID}" \

@@ -2,7 +2,7 @@
 #define P2P_ADAPTER_H
 
 #include <xquic/xquic.h>
-#include <xquic/xqc_http3.h>
+#include <moq/xqc_moq.h>
 
 #include "p2p_packet_queue.h"
 
@@ -17,21 +17,26 @@ extern "C" {
 #define P2P_MAX_SUBSCRIBERS   10
 #define P2P_VIRTUAL_PORT_BASE 20000
 #define P2P_ICE_MTU           1200
-#define P2P_SEND_QUEUE_CAP    128
+#define P2P_FRAME_QUEUE_CAP   32
 #define P2P_VIDEO_JITTER_SIZE 8
 
-/* Framing header for AV data sent via xquic DATAGRAM */
-#define P2P_FRAME_TYPE_VIDEO  0x01
-#define P2P_FRAME_TYPE_AUDIO  0x02
-#define P2P_FRAME_TYPE_IDR_REQ 0x03
-#define P2P_FRAME_TYPE_DATA   0x04
-#define P2P_FRAME_TYPE_VIDEO_STOP   0x05
-#define P2P_FRAME_TYPE_VIDEO_START  0x06
-#define P2P_FRAME_TYPE_AUDIO_STOP   0x07
-#define P2P_FRAME_TYPE_AUDIO_START  0x08
-#define P2P_FRAME_TYPE_PING         0x09
-#define P2P_FRAME_FLAG_KEY    0x01
+/* Control message types (sent via MOQ datachannel) */
+#define P2P_FRAME_TYPE_VIDEO       0x01
+#define P2P_FRAME_TYPE_AUDIO       0x02
+#define P2P_FRAME_TYPE_IDR_REQ     0x03
+#define P2P_FRAME_TYPE_DATA        0x04
+#define P2P_FRAME_TYPE_VIDEO_STOP  0x05
+#define P2P_FRAME_TYPE_VIDEO_START 0x06
+#define P2P_FRAME_TYPE_AUDIO_STOP  0x07
+#define P2P_FRAME_TYPE_AUDIO_START 0x08
+#define P2P_FRAME_TYPE_PING        0x09
+#define P2P_FRAME_FLAG_KEY         0x01
 
+/*
+ * Frame header for callback dispatch (in-memory only, not a wire format).
+ * MOQ delivers complete frames; the header bridges MOQ callbacks to the
+ * existing upper-layer reassembly code.
+ */
 typedef struct __attribute__((packed)) {
     uint8_t  type;
     uint8_t  flags;
@@ -39,11 +44,10 @@ typedef struct __attribute__((packed)) {
     uint64_t timestamp_us;
     uint32_t total_len;
     uint32_t frag_offset;
-    uint16_t frag_len;
-} p2p_frame_header_t;       /* 22 bytes, followed by frag_len bytes of payload */
+    uint32_t frag_len;
+} p2p_frame_header_t;
 
 #define P2P_FRAME_HDR_SIZE sizeof(p2p_frame_header_t)
-#define P2P_FRAME_MAX_FRAG (P2P_ICE_MTU - P2P_FRAME_HDR_SIZE)
 
 typedef enum {
     P2P_ROLE_PUBLISHER,
@@ -73,18 +77,21 @@ typedef enum {
 
 struct p2p_engine_s;
 
-/* Per-peer datagram send queue (for pacing via xquic) */
+/* Frame-level send queue (capture thread enqueues, engine thread dequeues → MOQ write) */
 typedef struct {
-    uint8_t  data[P2P_ICE_MTU];
-    uint16_t len;
-    int      qos;
-} p2p_dgram_entry_t;
+    uint8_t  type;
+    uint8_t  flags;
+    uint32_t seq;
+    uint64_t timestamp_us;
+    uint8_t *data;
+    uint32_t data_len;
+} p2p_frame_entry_t;
 
 typedef struct {
-    p2p_dgram_entry_t entries[P2P_SEND_QUEUE_CAP];
-    int head, tail, count;
+    p2p_frame_entry_t entries[P2P_FRAME_QUEUE_CAP];
+    int head, count;
     p2p_mutex_t mutex;
-} p2p_dgram_send_queue_t;
+} p2p_frame_send_queue_t;
 
 /*
  * Per-peer context.  On the Publisher side one of these exists for each
@@ -102,8 +109,14 @@ typedef struct p2p_peer_ctx_s {
     xqc_cid_t               cid;
     xqc_connection_t       *xqc_conn;
 
-    /* xquic reliable control stream */
-    xqc_stream_t           *ctrl_stream;
+    /* MOQ session state */
+    xqc_moq_session_t         *moq_session;
+    xqc_moq_user_session_t    *moq_user_session;
+    xqc_moq_track_t            *video_track;
+    xqc_moq_track_t            *audio_track;
+    int64_t                     video_subscribe_id;
+    int64_t                     audio_subscribe_id;
+    volatile int                moq_datachannel_ready;
 
     /* Virtual addressing for xquic */
     struct sockaddr_in      virtual_local_addr;
@@ -149,8 +162,8 @@ typedef struct p2p_peer_ctx_s {
     /* Timestamp of peer creation (microseconds) for dedup */
     uint64_t                created_us;
 
-    /* Datagram send queue for pacing */
-    p2p_dgram_send_queue_t  send_queue;
+    /* Frame send queue (capture thread → engine thread → MOQ write) */
+    p2p_frame_send_queue_t  frame_queue;
 } p2p_peer_ctx_t;
 
 /*
@@ -222,6 +235,9 @@ typedef struct p2p_engine_s {
 
     /* ICE-TCP */
     int                     enable_tcp;
+
+    /* Temp storage for server_accept → peer mapping (engine thread only) */
+    p2p_peer_ctx_t         *pending_accept_peer;
 } p2p_engine_t;
 
 /* ---- Lifecycle ---- */
@@ -260,7 +276,7 @@ int  p2p_get_peer_ice_info(p2p_peer_ctx_t *peer, p2p_ice_info_t *info);
 /* ---- QUIC connection (called after ICE connected) ---- */
 int  p2p_peer_start_quic(p2p_peer_ctx_t *peer);
 
-/* ---- AV data sending via xquic DATAGRAM (congestion controlled + paced) ---- */
+/* ---- AV data sending via MOQ (congestion controlled) ---- */
 
 int  p2p_peer_send_data_via_quic(p2p_peer_ctx_t *peer, uint8_t type, uint8_t flags,
                                  uint32_t seq, uint64_t timestamp_us,
@@ -268,13 +284,7 @@ int  p2p_peer_send_data_via_quic(p2p_peer_ctx_t *peer, uint8_t type, uint8_t fla
 
 int  p2p_peer_flush_send_queue(p2p_peer_ctx_t *peer);
 
-/* ---- Legacy direct framing (bypasses xquic, no congestion control) ---- */
-
-int  p2p_peer_send_data(p2p_peer_ctx_t *peer, uint8_t type, uint8_t flags,
-                        uint32_t seq, uint64_t timestamp_us,
-                        const uint8_t *payload, uint32_t payload_len);
-
-/* ---- Control messages via xquic reliable STREAM ---- */
+/* ---- Control messages via MOQ ---- */
 
 int  p2p_peer_send_idr_request(p2p_peer_ctx_t *peer);
 int  p2p_peer_send_video_stop(p2p_peer_ctx_t *peer);

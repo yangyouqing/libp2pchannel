@@ -130,7 +130,7 @@ static void send_video_frame(p2p_peer_ctx_t *peer, uint32_t seq)
     if (peer->video_paused) return;
     uint8_t dummy[512];
     memset(dummy, 0x42, sizeof(dummy));
-    p2p_peer_send_data(peer, P2P_FRAME_TYPE_VIDEO, 0, seq, seq * 33333ULL,
+    p2p_peer_send_data_via_quic(peer, P2P_FRAME_TYPE_VIDEO, 0, seq, seq * 33333ULL,
                        dummy, sizeof(dummy));
 }
 
