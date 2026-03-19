@@ -361,10 +361,11 @@ static void on_ice_state(p2p_peer_ctx_t *peer, p2p_ice_state_t state, void *user
     } else if (state == P2P_ICE_STATE_COMPLETED) {
         fprintf(stderr, "[client] ICE completed with %s\n", peer->peer_id);
     } else if (state == P2P_ICE_STATE_FAILED || state == P2P_ICE_STATE_DISCONNECTED) {
-        fprintf(stderr, "[client] peer %s ICE %s\n",
+        fprintf(stderr, "[client] peer %s ICE %s, marking for removal\n",
                 peer->peer_id,
                 state == P2P_ICE_STATE_FAILED ? "failed" : "disconnected");
         fprintf(stderr, "[client] active peers: %d\n", count_active_peers(ctx));
+        peer->needs_removal = 1;
     }
 }
 

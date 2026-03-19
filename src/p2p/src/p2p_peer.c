@@ -545,8 +545,10 @@ static void on_ice_state(p2p_peer_ctx_t *peer, p2p_ice_state_t state, void *user
         fprintf(stderr, "[peer] ICE connected with publisher %s (awaiting QUIC)\n",
                 peer->peer_id);
     } else if (state == P2P_ICE_STATE_FAILED || state == P2P_ICE_STATE_DISCONNECTED) {
-        fprintf(stderr, "[peer] ICE FAILED with %s, will re-join room\n", peer->peer_id);
-        (void)ctx;
+        fprintf(stderr, "[peer] ICE FAILED with %s, scheduling full reconnect\n", peer->peer_id);
+        peer->needs_removal = 1;
+        memset(ctx->pending_peer_id, 0, sizeof(ctx->pending_peer_id));
+        ctx->needs_full_reconnect = 1;
     }
 }
 
@@ -961,10 +963,10 @@ int main(int argc, char *argv[])
         const int panel_y = VIDEO_H;
         const int btn_y = panel_y + 4;
 
-        /* Button hit test: Video toggle, Audio toggle (ignore spurious clicks for 3s after init) */
+        /* Button hit test: Video toggle, Audio toggle (ignore spurious clicks for 10s after init) */
         uint64_t now_us = p2p_capture_now_us();
         if (ev.mouse_down && ev.mouse_button == 1 &&
-            (now_us - ctx->sdl_init_time_us) > 3000000ULL) {
+            (now_us - ctx->sdl_init_time_us) > 10000000ULL) {
             if (ev.mouse_x >= btn1_x && ev.mouse_x < btn1_x + btn_w &&
                 ev.mouse_y >= btn_y && ev.mouse_y < btn_y + btn_h) {
                 ctx->video_enabled = !ctx->video_enabled;
