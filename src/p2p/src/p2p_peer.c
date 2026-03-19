@@ -167,6 +167,7 @@ typedef struct {
     uint32_t             video_frames_incomplete;
     int                  waiting_for_keyframe;
     uint64_t             last_idr_req_us;
+    uint64_t             last_video_recv_us;   /* for IDR timeout retry & watchdog */
     uint64_t             last_rx_stat_us;
     uint32_t             rx_frag_total;
     uint32_t             rx_frag_dup;
@@ -174,6 +175,9 @@ typedef struct {
     /* Audio RX stats */
     uint32_t             audio_frames_rx;
     uint32_t             audio_frames_played;
+    uint32_t             last_audio_seq;
+    int                  has_last_audio_seq;
+    uint32_t             audio_frames_lost;
 
     /* Timing */
     uint64_t             first_frame_time;
@@ -295,7 +299,7 @@ static void process_complete_frame(peer_ctx_t *ctx, reasm_buf_t *rb)
 
             p2p_video_jitter_push(&ctx->video_jitter,
                                   y, u, v, lsy, lsu, lsv, w, h,
-                                  rb->timestamp_us);
+                                  rb->timestamp_us, rb->seq);
         }
     } else if (rb->type == P2P_FRAME_TYPE_AUDIO) {
         ctx->audio_frames_rx++;
@@ -320,9 +324,10 @@ static void process_complete_frame(peer_ctx_t *ctx, reasm_buf_t *rb)
             /* Queue audio directly to SDL -- no single-frame buffer */
             if (ctx->sdl_audio.device_id > 0) {
                 uint32_t queued = SDL_GetQueuedAudioSize(ctx->sdl_audio.device_id);
-                uint32_t max_queue = 48000 * sizeof(int16_t) * 1 / 5;
+                uint32_t max_queue = 48000 * sizeof(int16_t) * 2 / 5;  /* 400ms (was 200ms) */
                 if (queued > max_queue) {
-                    SDL_ClearQueuedAudio(ctx->sdl_audio.device_id);
+                    /* Skip this frame instead of clearing all - reduces audio gap */
+                    return;
                 }
                 SDL_QueueAudio(ctx->sdl_audio.device_id,
                                samples, num_samples * sizeof(int16_t));
@@ -332,10 +337,25 @@ static void process_complete_frame(peer_ctx_t *ctx, reasm_buf_t *rb)
     }
 }
 
+#define IDR_REQ_THROTTLE_US   200000   /* 200ms between requests */
+#define IDR_REQ_RETRY_US      1000000  /* 1s: retry if still waiting */
+#define IDR_WAIT_TIMEOUT_US   5000000  /* 5s: reset waiting state */
+
 static void request_idr_if_needed(peer_ctx_t *ctx, p2p_peer_ctx_t *peer)
 {
     uint64_t now = p2p_capture_now_us();
-    if (now - ctx->last_idr_req_us < 200000)
+    uint64_t since_last_req = now - ctx->last_idr_req_us;
+
+    if (ctx->waiting_for_keyframe) {
+        if (since_last_req >= IDR_REQ_RETRY_US) {
+            ctx->last_idr_req_us = now;
+            p2p_peer_send_idr_request(peer);
+            fprintf(stderr, "[RX] IDR retry (waiting %.1fs)\n", since_last_req / 1e6);
+        }
+        return;
+    }
+
+    if (since_last_req < IDR_REQ_THROTTLE_US)
         return;
     ctx->last_idr_req_us = now;
     ctx->waiting_for_keyframe = 1;
@@ -348,11 +368,11 @@ static void rx_print_stats(peer_ctx_t *ctx)
     uint64_t now = p2p_capture_now_us();
     if (now - ctx->last_rx_stat_us < 5000000ULL) return;
     ctx->last_rx_stat_us = now;
-    fprintf(stderr, "[RX-STAT] v_ok=%u v_lost=%u v_inc=%u frags=%u dup=%u | a_rx=%u a_play=%u\n",
+    fprintf(stderr, "[RX-STAT] v_ok=%u v_lost=%u v_inc=%u frags=%u dup=%u | a_rx=%u a_lost=%u a_play=%u\n",
             ctx->video_frames_ok, ctx->video_frames_lost,
             ctx->video_frames_incomplete,
             ctx->rx_frag_total, ctx->rx_frag_dup,
-            ctx->audio_frames_rx, ctx->audio_frames_played);
+            ctx->audio_frames_rx, ctx->audio_frames_lost, ctx->audio_frames_played);
 }
 
 static void on_data_recv(p2p_peer_ctx_t *peer, const p2p_frame_header_t *hdr,
@@ -410,6 +430,19 @@ static void on_data_recv(p2p_peer_ctx_t *peer, const p2p_frame_header_t *hdr,
         }
 
         rx_print_stats(ctx);
+    } else if (hdr->type == P2P_FRAME_TYPE_AUDIO) {
+        /* Audio loss detection */
+        if (ctx->has_last_audio_seq && hdr->frag_offset == 0) {
+            uint32_t expected = ctx->last_audio_seq + 1;
+            if (hdr->seq > expected) {
+                uint32_t gap = hdr->seq - expected;
+                ctx->audio_frames_lost += gap;
+            }
+        }
+        if (hdr->frag_offset == 0) {
+            ctx->last_audio_seq = hdr->seq;
+            ctx->has_last_audio_seq = 1;
+        }
     }
 
     /* New frame or different sequence -> reset reassembly */
@@ -455,6 +488,7 @@ static void on_data_recv(p2p_peer_ctx_t *peer, const p2p_frame_header_t *hdr,
     /* Frame complete? */
     if (rb->received >= rb->total_len) {
         if (hdr->type == P2P_FRAME_TYPE_VIDEO) {
+            ctx->last_video_recv_us = p2p_capture_now_us();
             fprintf(stderr, "[RX] seq=%u %s size=%u OK\n",
                     rb->seq, (rb->flags & P2P_FRAME_FLAG_KEY) ? "IDR" : "P", rb->total_len);
             ctx->video_frames_ok++;
@@ -945,10 +979,38 @@ int main(int argc, char *argv[])
         /* Keepalive: send PING to publisher every 10s to prevent idle timeout */
         uint64_t now_us = p2p_capture_now_us();
         p2p_peer_ctx_t *pub = p2p_engine_find_peer(&ctx->engine, ctx->pending_peer_id);
-        if (pub && pub->state == P2P_PEER_STATE_QUIC_CONNECTED &&
-            (ctx->last_keepalive_us == 0 || now_us - ctx->last_keepalive_us >= 10000000ULL)) {
-            if (p2p_peer_send_ping(pub) == 0)
-                ctx->last_keepalive_us = now_us;
+
+        if (pub && pub->state == P2P_PEER_STATE_QUIC_CONNECTED) {
+            if (ctx->last_keepalive_us == 0 || now_us - ctx->last_keepalive_us >= 10000000ULL) {
+                if (p2p_peer_send_ping(pub) == 0)
+                    ctx->last_keepalive_us = now_us;
+            }
+
+            /* Watchdog: no video for 5s -> request IDR */
+            if (ctx->last_video_recv_us > 0 && ctx->video_enabled &&
+                (now_us - ctx->last_video_recv_us) >= 5000000ULL) {
+                request_idr_if_needed(ctx, pub);
+            }
+            /* IDR wait timeout: reset after 5s to avoid permanent block */
+            if (ctx->waiting_for_keyframe &&
+                (now_us - ctx->last_idr_req_us) >= IDR_WAIT_TIMEOUT_US) {
+                ctx->waiting_for_keyframe = 0;
+                fprintf(stderr, "[RX] IDR wait timeout (5s), resuming with P-frames\n");
+            }
+            /* No video for 15s -> trigger QUIC reconnect */
+            if (ctx->last_video_recv_us > 0 && ctx->video_enabled &&
+                (now_us - ctx->last_video_recv_us) >= 15000000ULL) {
+                fprintf(stderr, "[RX] no video 15s, triggering QUIC reconnect\n");
+                ctx->last_video_recv_us = 0;  /* avoid repeated trigger */
+                pub->needs_quic_restart = 1;
+            }
+            /* No video for 30s -> full reconnect */
+            if (ctx->last_video_recv_us > 0 && ctx->video_enabled &&
+                (now_us - ctx->last_video_recv_us) >= 30000000ULL) {
+                fprintf(stderr, "[RX] no video 30s, triggering full reconnect\n");
+                ctx->last_video_recv_us = 0;
+                ctx->needs_full_reconnect = 1;
+            }
         }
 
         /* Refresh stats every 500ms */

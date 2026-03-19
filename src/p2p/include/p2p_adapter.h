@@ -178,6 +178,7 @@ typedef struct {
     void (*on_peer_data_recv)(p2p_peer_ctx_t *peer, const p2p_frame_header_t *hdr,
                               const uint8_t *payload, void *user_data);
     void (*on_peer_ice_restart_needed)(p2p_peer_ctx_t *peer, void *user_data);
+    void (*on_peer_bitrate_change)(p2p_peer_ctx_t *peer, uint64_t bitrate_bps, void *user_data);
 } p2p_adapter_callbacks_t;
 
 typedef struct {
@@ -300,6 +301,7 @@ typedef struct {
     int lsy, lsu, lsv;
     int w, h;
     uint64_t timestamp_us;
+    uint32_t seq;   /* for reordering out-of-order frames */
     int valid;
 } p2p_jitter_frame_t;
 
@@ -317,7 +319,7 @@ void p2p_video_jitter_destroy(p2p_video_jitter_buf_t *jb);
 void p2p_video_jitter_push(p2p_video_jitter_buf_t *jb,
                            uint8_t *y, uint8_t *u, uint8_t *v,
                            int lsy, int lsu, int lsv, int w, int h,
-                           uint64_t timestamp_us);
+                           uint64_t timestamp_us, uint32_t seq);
 int  p2p_video_jitter_pop(p2p_video_jitter_buf_t *jb, p2p_jitter_frame_t *out);
 
 /* ---- Logging (hides libjuice log level from callers) ---- */

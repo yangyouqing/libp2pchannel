@@ -160,10 +160,13 @@ static void on_video_frame(const uint8_t *data, size_t size,
     /* Cache IDR for new subscribers */
     if (is_key) {
         p2p_mutex_lock(&ctx->idr_mutex);
-        ctx->idr_cache = realloc(ctx->idr_cache, out_size);
-        if (ctx->idr_cache) {
+        uint8_t *new_cache = (uint8_t *)realloc(ctx->idr_cache, out_size);
+        if (new_cache) {
+            ctx->idr_cache = new_cache;
             memcpy(ctx->idr_cache, out_data, out_size);
             ctx->idr_cache_size = out_size;
+        } else {
+            ctx->idr_cache_size = 0;
         }
         p2p_mutex_unlock(&ctx->idr_mutex);
     }
@@ -375,6 +378,16 @@ static void on_ice_restart_needed_pub(p2p_peer_ctx_t *peer, void *user_data)
     (void)user_data;
     fprintf(stderr, "[client] ICE restart needed for %s, marking for removal\n", peer->peer_id);
     peer->needs_removal = 1;
+}
+
+static void on_bitrate_change(p2p_peer_ctx_t *peer, uint64_t bitrate_bps, void *user_data)
+{
+    client_ctx_t *ctx = (client_ctx_t *)user_data;
+    int bps = (int)(bitrate_bps > 0 ? bitrate_bps : 1000000);
+    if (bps < 200000) bps = 200000;
+    if (bps > 8000000) bps = 8000000;
+    if (p2p_video_encoder_set_bitrate(&ctx->venc, bps) == 0)
+        fprintf(stderr, "[client] bitrate adjusted to %d bps for %s\n", bps, peer->peer_id);
 }
 
 static void on_quic_connected(p2p_peer_ctx_t *peer, void *user_data)
@@ -690,6 +703,7 @@ int main(int argc, char *argv[])
             .on_peer_quic_connected = on_quic_connected,
             .on_peer_data_recv = on_data_recv,
             .on_peer_ice_restart_needed = on_ice_restart_needed_pub,
+            .on_peer_bitrate_change = on_bitrate_change,
         },
         .user_data = ctx
     };

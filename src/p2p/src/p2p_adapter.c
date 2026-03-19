@@ -253,7 +253,10 @@ static void moq_on_request_keyframe_cb(xqc_moq_user_session_t *us,
 
 static void moq_on_bitrate_change_cb(xqc_moq_user_session_t *us, uint64_t bitrate)
 {
-    (void)us; (void)bitrate;
+    p2p_peer_ctx_t *peer = peer_from_user_session(us);
+    if (!peer || !peer->engine) return;
+    if (peer->engine->callbacks.on_peer_bitrate_change)
+        peer->engine->callbacks.on_peer_bitrate_change(peer, bitrate, peer->engine->user_data);
 }
 
 static void moq_on_subscribe_ok_cb(xqc_moq_user_session_t *us,
@@ -591,7 +594,8 @@ static int frame_queue_push(p2p_peer_ctx_t *peer, uint8_t type, uint8_t flags,
     p2p_frame_send_queue_t *q = &peer->frame_queue;
     p2p_mutex_lock(&q->mutex);
 
-    if (peer->state != P2P_PEER_STATE_QUIC_CONNECTED) {
+    int st = *(volatile int *)&peer->state;
+    if (st != P2P_PEER_STATE_QUIC_CONNECTED) {
         p2p_mutex_unlock(&q->mutex);
         return -1;
     }
@@ -1383,21 +1387,38 @@ void p2p_video_jitter_destroy(p2p_video_jitter_buf_t *jb)
 void p2p_video_jitter_push(p2p_video_jitter_buf_t *jb,
                            uint8_t *y, uint8_t *u, uint8_t *v,
                            int lsy, int lsu, int lsv, int w, int h,
-                           uint64_t timestamp_us)
+                           uint64_t timestamp_us, uint32_t seq)
 {
     if (!jb) return;
     p2p_mutex_lock(&jb->mutex);
 
     if (jb->count >= P2P_VIDEO_JITTER_SIZE) {
-        p2p_jitter_frame_t *old = &jb->frames[jb->read_idx];
+        /* Drop frame with largest seq (most "future" - we're too far behind) */
+        int drop_idx = -1;
+        uint32_t max_seq = 0;
+        for (int i = 0; i < P2P_VIDEO_JITTER_SIZE; i++) {
+            if (!jb->frames[i].valid) continue;
+            if (drop_idx < 0 || (uint32_t)(jb->frames[i].seq - max_seq) < 0x80000000u)
+                max_seq = jb->frames[i].seq, drop_idx = i;
+        }
+        p2p_jitter_frame_t *old = &jb->frames[drop_idx];
         free(old->y); free(old->u); free(old->v);
         old->y = old->u = old->v = NULL;
         old->valid = 0;
-        jb->read_idx = (jb->read_idx + 1) % P2P_VIDEO_JITTER_SIZE;
         jb->count--;
     }
 
-    p2p_jitter_frame_t *f = &jb->frames[jb->write_idx];
+    /* Find empty slot */
+    int slot = -1;
+    for (int i = 0; i < P2P_VIDEO_JITTER_SIZE; i++) {
+        if (!jb->frames[i].valid) { slot = i; break; }
+    }
+    if (slot < 0) {
+        p2p_mutex_unlock(&jb->mutex);
+        return;
+    }
+
+    p2p_jitter_frame_t *f = &jb->frames[slot];
     int y_size = lsy * h;
     int uv_h = h / 2;
     int u_size = lsu * uv_h;
@@ -1412,11 +1433,10 @@ void p2p_video_jitter_push(p2p_video_jitter_buf_t *jb,
     f->lsy = lsy; f->lsu = lsu; f->lsv = lsv;
     f->w = w; f->h = h;
     f->timestamp_us = timestamp_us;
+    f->seq = seq;
     f->valid = 1;
 
-    jb->write_idx = (jb->write_idx + 1) % P2P_VIDEO_JITTER_SIZE;
     jb->count++;
-
     p2p_mutex_unlock(&jb->mutex);
 }
 
@@ -1431,18 +1451,27 @@ int p2p_video_jitter_pop(p2p_video_jitter_buf_t *jb, p2p_jitter_frame_t *out)
     }
 
     uint64_t now = p2p_now_us();
-    p2p_jitter_frame_t *f = &jb->frames[jb->read_idx];
+    /* Find frame with smallest seq that's ready (reorder out-of-order frames) */
+    int best = -1;
+    uint32_t best_seq = 0xFFFFFFFFu;
+    for (int i = 0; i < P2P_VIDEO_JITTER_SIZE; i++) {
+        if (!jb->frames[i].valid) continue;
+        p2p_jitter_frame_t *f = &jb->frames[i];
+        int ready = (jb->count >= 2) ||
+            (f->timestamp_us > 0 && (now - f->timestamp_us) >= jb->target_delay_us);
+        if (ready && (best < 0 || (uint32_t)(best_seq - f->seq) < 0x80000000u))
+            best_seq = f->seq, best = i;
+    }
 
-    if (jb->count < 2 && f->timestamp_us > 0 &&
-        (now - f->timestamp_us) < jb->target_delay_us) {
+    if (best < 0) {
         p2p_mutex_unlock(&jb->mutex);
         return 0;
     }
 
+    p2p_jitter_frame_t *f = &jb->frames[best];
     *out = *f;
     f->y = f->u = f->v = NULL;
     f->valid = 0;
-    jb->read_idx = (jb->read_idx + 1) % P2P_VIDEO_JITTER_SIZE;
     jb->count--;
 
     p2p_mutex_unlock(&jb->mutex);
