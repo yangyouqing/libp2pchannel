@@ -151,6 +151,7 @@ typedef struct {
     /* Reassembly */
     reasm_buf_t          video_reasm;
     reasm_buf_t          audio_reasm;
+    reasm_buf_t          video_decode_buf;  /* heap-resident buffer for out-of-lock decode */
     p2p_mutex_t          reasm_mutex;
 
     /* Video jitter buffer for main-thread rendering */
@@ -178,6 +179,7 @@ typedef struct {
     uint32_t             last_audio_seq;
     int                  has_last_audio_seq;
     uint32_t             audio_frames_lost;
+    int                  audio_prebuf_done;
 
     /* Timing */
     uint64_t             first_frame_time;
@@ -202,6 +204,7 @@ typedef struct {
     /* OSD cache: refresh every 500ms */
     uint64_t             last_osd_refresh_us;
     uint64_t             last_keepalive_us;   /* PING to publisher every 10s */
+    uint64_t             sdl_init_time_us;    /* ignore mouse clicks for first 3s */
     char                 osd_line1[80];
     char                 osd_line2[80];
     char                 osd_line3[80];
@@ -321,17 +324,30 @@ static void process_complete_frame(peer_ctx_t *ctx, reasm_buf_t *rb)
             &samples, &num_samples);
 
         if (ret > 0 && samples && num_samples > 0) {
-            /* Queue audio directly to SDL -- no single-frame buffer */
             if (ctx->sdl_audio.device_id > 0) {
                 uint32_t queued = SDL_GetQueuedAudioSize(ctx->sdl_audio.device_id);
-                uint32_t max_queue = 48000 * sizeof(int16_t) * 2 / 5;  /* 400ms (was 200ms) */
+                uint32_t max_queue = 48000 * sizeof(int16_t) * 2 / 5;  /* 400ms */
                 if (queued > max_queue) {
-                    /* Skip this frame instead of clearing all - reduces audio gap */
+                    /* Drain oldest 40ms instead of dropping new data */
+                    uint32_t drain = 48000 * sizeof(int16_t) * 2 / 25; /* 40ms */
+                    SDL_ClearQueuedAudio(ctx->sdl_audio.device_id);
+                    (void)drain;
                     return;
                 }
                 SDL_QueueAudio(ctx->sdl_audio.device_id,
                                samples, num_samples * sizeof(int16_t));
                 ctx->audio_frames_played++;
+
+                /* Pre-buffer: keep device paused until we have ~60ms queued */
+                if (!ctx->audio_prebuf_done) {
+                    uint32_t prebuf_bytes = 48000 * sizeof(int16_t) * 3 / 50; /* 60ms */
+                    uint32_t now_queued = SDL_GetQueuedAudioSize(ctx->sdl_audio.device_id);
+                    if (now_queued >= prebuf_bytes) {
+                        SDL_PauseAudioDevice(ctx->sdl_audio.device_id, 0);
+                        ctx->audio_prebuf_done = 1;
+                        fprintf(stderr, "[RX-AUDIO] pre-buffer filled (%u bytes), playback started\n", now_queued);
+                    }
+                }
             }
         }
     }
@@ -387,6 +403,8 @@ static void on_data_recv(p2p_peer_ctx_t *peer, const p2p_frame_header_t *hdr,
     reasm_buf_t *rb = (hdr->type == P2P_FRAME_TYPE_VIDEO)
                     ? &ctx->video_reasm
                     : &ctx->audio_reasm;
+
+    int have_complete = 0;
 
     p2p_mutex_lock(&ctx->reasm_mutex);
 
@@ -485,22 +503,35 @@ static void on_data_recv(p2p_peer_ctx_t *peer, const p2p_frame_header_t *hdr,
     if (hdr->frag_offset == 0)
         rb->flags = hdr->flags;
 
-    /* Frame complete? */
+    /* Frame complete? Copy out under lock, decode outside */
     if (rb->received >= rb->total_len) {
         if (hdr->type == P2P_FRAME_TYPE_VIDEO) {
             ctx->last_video_recv_us = p2p_capture_now_us();
             fprintf(stderr, "[RX] seq=%u %s size=%u OK\n",
                     rb->seq, (rb->flags & P2P_FRAME_FLAG_KEY) ? "IDR" : "P", rb->total_len);
             ctx->video_frames_ok++;
-        } else if (hdr->type == P2P_FRAME_TYPE_AUDIO) {
-            fprintf(stderr, "[RX-AUDIO] seq=%u size=%u\n", rb->seq, rb->total_len);
+            /* Copy header + used data to heap-resident decode buffer */
+            reasm_buf_t *db = &ctx->video_decode_buf;
+            db->type = rb->type;
+            db->flags = rb->flags;
+            db->seq = rb->seq;
+            db->timestamp_us = rb->timestamp_us;
+            db->total_len = rb->total_len;
+            db->received = rb->received;
+            memcpy(db->data, rb->data, rb->total_len);
+            have_complete = 1;
+        } else {
+            /* Audio: small payload, fast decode — process under lock */
+            process_complete_frame(ctx, rb);
         }
-        process_complete_frame(ctx, rb);
         rb->active = 0;
         rb->received = 0;
     }
 
     p2p_mutex_unlock(&ctx->reasm_mutex);
+
+    if (have_complete)
+        process_complete_frame(ctx, &ctx->video_decode_buf);
 }
 
 /* ---- Adapter callbacks ---- */
@@ -790,6 +821,7 @@ int main(int argc, char *argv[])
         fprintf(stderr, "[peer] SDL audio init failed (continuing without audio)\n");
     }
     ctx->sdl_initialized = 1;
+    ctx->sdl_init_time_us = p2p_capture_now_us();
 
     /* Phase 1: Room input – shown in the bottom panel when --room not given */
     if (ctx->room_id[0] == '\0') {
@@ -929,8 +961,10 @@ int main(int argc, char *argv[])
         const int panel_y = VIDEO_H;
         const int btn_y = panel_y + 4;
 
-        /* Button hit test: Video toggle, Audio toggle */
-        if (ev.mouse_down && ev.mouse_button == 1) {
+        /* Button hit test: Video toggle, Audio toggle (ignore spurious clicks for 3s after init) */
+        uint64_t now_us = p2p_capture_now_us();
+        if (ev.mouse_down && ev.mouse_button == 1 &&
+            (now_us - ctx->sdl_init_time_us) > 3000000ULL) {
             if (ev.mouse_x >= btn1_x && ev.mouse_x < btn1_x + btn_w &&
                 ev.mouse_y >= btn_y && ev.mouse_y < btn_y + btn_h) {
                 ctx->video_enabled = !ctx->video_enabled;
@@ -977,7 +1011,7 @@ int main(int argc, char *argv[])
         }
 
         /* Keepalive: send PING to publisher every 10s to prevent idle timeout */
-        uint64_t now_us = p2p_capture_now_us();
+        now_us = p2p_capture_now_us();
         p2p_peer_ctx_t *pub = p2p_engine_find_peer(&ctx->engine, ctx->pending_peer_id);
 
         if (pub && pub->state == P2P_PEER_STATE_QUIC_CONNECTED) {

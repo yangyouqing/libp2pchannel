@@ -154,9 +154,6 @@ static void on_video_frame(const uint8_t *data, size_t size,
     uint32_t seq = p2p_atomic_fetch_add((volatile P2P_ATOMIC_INT *)&ctx->video_seq, 1);
     uint8_t flags = is_key ? P2P_FRAME_FLAG_KEY : 0;
 
-    fprintf(stderr, "[TX] seq=%u %s size=%d\n",
-            seq, is_key ? "IDR" : "P", out_size);
-
     /* Cache IDR for new subscribers */
     if (is_key) {
         p2p_mutex_lock(&ctx->idr_mutex);
@@ -224,8 +221,6 @@ static void on_audio_frame(const int16_t *samples, int num_samples,
 
         s_audio_enc_ok++;
         uint32_t seq = p2p_atomic_fetch_add((volatile P2P_ATOMIC_INT *)&ctx->audio_seq, 1);
-
-        fprintf(stderr, "[TX-AUDIO] seq=%u size=%d samples=%d\n", seq, out_size, frame_size);
 
         send_to_all_peers(ctx, P2P_FRAME_TYPE_AUDIO, 0, seq,
                           timestamp_us, out_data, out_size);

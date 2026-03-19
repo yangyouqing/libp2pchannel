@@ -204,7 +204,7 @@ int p2p_sdl_audio_init(p2p_sdl_audio_t *a, int sample_rate, int channels)
     want.freq = sample_rate > 0 ? sample_rate : 48000;
     want.format = AUDIO_S16SYS;
     want.channels = channels > 0 ? channels : 1;
-    want.samples = 960; /* ~20ms buffer at 48kHz */
+    want.samples = 2048; /* ~42ms buffer at 48kHz — reduces underrun risk */
 
     SDL_AudioDeviceID dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
     if (dev == 0) {
@@ -217,7 +217,7 @@ int p2p_sdl_audio_init(p2p_sdl_audio_t *a, int sample_rate, int channels)
     a->channels = have.channels;
     a->initialized = 1;
 
-    SDL_PauseAudioDevice(dev, 0);
+    /* Device starts paused; caller unpauses after pre-buffer is filled */
 
     fprintf(stderr, "[sdl] audio playback initialized: %dHz %dch\n",
             a->sample_rate, a->channels);
